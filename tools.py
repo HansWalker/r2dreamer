@@ -39,6 +39,40 @@ class Tee(io.TextIOBase):
         # Preserve tty detection for progress bars etc.
         return any(hasattr(stream, "isatty") and stream.isatty() for stream in self._streams)
 
+    def fileno(self):
+        # Some libraries, including Isaac Sim's faulthandler setup, require a
+        # real file descriptor from sys.stdout/sys.stderr.
+        for stream in self._streams:
+            if hasattr(stream, "fileno"):
+                try:
+                    return stream.fileno()
+                except io.UnsupportedOperation:
+                    continue
+        raise io.UnsupportedOperation("fileno")
+
+
+class ConsoleLogHandle:
+    def __init__(self, stdout, stderr, stdout_tee, stderr_tee, file):
+        self._stdout = stdout
+        self._stderr = stderr
+        self._stdout_tee = stdout_tee
+        self._stderr_tee = stderr_tee
+        self._file = file
+        self._closed = False
+
+    def close(self):
+        if self._closed:
+            return
+
+        import sys
+
+        if sys.stdout is self._stdout_tee:
+            sys.stdout = self._stdout
+        if sys.stderr is self._stderr_tee:
+            sys.stderr = self._stderr
+        self._file.close()
+        self._closed = True
+
 
 def setup_console_log(logdir, filename="console.log"):
     """Mirror stdout/stderr to a file under logdir.
@@ -56,9 +90,13 @@ def setup_console_log(logdir, filename="console.log"):
     # Line-buffered text file for timely flushing.
     path = logdir / filename
     f = path.open("a", buffering=1)
-    sys.stdout = Tee(sys.stdout, f)
-    sys.stderr = Tee(sys.stderr, f)
-    return f
+    stdout = sys.stdout
+    stderr = sys.stderr
+    stdout_tee = Tee(stdout, f)
+    stderr_tee = Tee(stderr, f)
+    sys.stdout = stdout_tee
+    sys.stderr = stderr_tee
+    return ConsoleLogHandle(stdout, stderr, stdout_tee, stderr_tee, f)
 
 
 def to_np(x):

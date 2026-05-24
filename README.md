@@ -1,16 +1,17 @@
-# R2-Dreamer: Redundancy-Reduced World Models without Decoders or Augmentation
+## R2-Dreamer: Redundancy-Reduced World Models without Decoders or Augmentation
 
-This repository provides a PyTorch implementation of [R2-Dreamer][r2dreamer] (ICLR 2026), a computationally efficient world model that achieves high performance on continuous control benchmarks. It also includes an efficient PyTorch DreamerV3 reproduction that trains **~5x faster** than a widely used [codebase][dreamerv3-torch], along with other baselines. Selecting R2-Dreamer via the config provides an additional **~1.6x speedup** over this baseline.
+This repository provides the official implementation of [R2-Dreamer][r2dreamer] (ICLR 2026), a decoder-free, augmentation-free world model with redundancy-reducing regularization on latent representations. It also includes an efficient PyTorch DreamerV3 reproduction that trains **~5x faster** than a widely used [codebase][dreamerv3-torch], along with other baselines. Selecting R2-Dreamer via the config provides an additional **~1.6x speedup** over this baseline.
 
 ## Instructions
 
 Install dependencies. This repository is tested with Ubuntu 24.04 and Python 3.11.
 
-If you prefer Docker, follow [`docs/docker.md`](docs/docker.md).
+Installing via a virtual env like [uv](https://docs.astral.sh/uv/) is recommended. If you prefer Docker, follow [`docs/docker.md`](docs/docker.md).
 
 ```bash
-# Installing via a virtual env like uv is recommended.
-pip install -r requirements.txt
+# Select the environments you need, or use "all" to install everything.
+# Available extras: dmc, atari, crafter, metaworld, memorymaze, isaaclab, all
+pip install -e ".[dmc,metaworld]"
 ```
 
 Run training on default settings:
@@ -78,6 +79,10 @@ pre-commit install
 # Manual pre-commit run on all files
 pre-commit run --all-files
 ```
+
+## Troubleshooting
+
+If you encounter installation or runtime issues, please refer to our [Troubleshooting Guide](docs/troubleshooting.md).
 
 ## Citation
 

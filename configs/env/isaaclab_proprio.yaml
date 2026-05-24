@@ -1,11 +1,11 @@
-task: "isaaclab_cartpole_balance"
+# IsaacLab requires device=cuda:0; use CUDA_VISIBLE_DEVICES to pick a physical GPU.
+task: "isaaclab_Isaac-Cartpole-Direct-v0"
 steps: 5.1e5
 env_num: 16
-eval_episode_num: 10
-action_repeat: 2
+eval_episode_num: 0  # Eval not yet supported for IsaacLab
+action_repeat: 1
 train_ratio: 512
-time_limit: 1000
-sim_dt: 0.01
+headless: True
 
 seed: ${seed}
 device: ${device}

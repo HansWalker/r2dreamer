@@ -22,7 +22,7 @@ buffer:
   batch_length: ${batch_length}
   max_size: 5e5
   device: ${device}
-  storage_device: 'cuda:0'
+  storage_device: ${device}
 
 trainer:
   steps: ${env.steps}

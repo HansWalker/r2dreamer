@@ -27,9 +27,10 @@ class OnlineTrainer:
     def eval(self, agent, train_step):
         """Run evaluation episodes.
 
-        Environment stepping is executed on CPU to avoid GPU<->CPU synchronizations
-        in the worker processes. Observations are moved back to GPU asynchronously
-        (H2D with non_blocking=True) right before policy inference.
+        For CPU-based environments (``ParallelEnv``), stepping is executed on
+        CPU and observations are moved to GPU asynchronously.  For GPU-resident
+        environments (``IsaacLabVecEnv``), no device transfer is needed —
+        ``.to()`` is a no-op when source and target devices match.
         """
         print("Evaluating the policy...")
         envs = self.eval_envs
@@ -47,17 +48,16 @@ class OnlineTrainer:
         act = agent_state["prev_action"].clone()
         while not once_done.all():
             steps += ~done * ~once_done
-            # Step environments on CPU.
-            # (B, A)
-            act_cpu = act.detach().to("cpu")
-            # (B,)
-            done_cpu = done.detach().to("cpu")
-            trans_cpu, done_cpu = envs.step(act_cpu, done_cpu)
-            # Move observations back to GPU asynchronously for the agent.
+            # Step environments.  Each env backend handles device placement
+            # internally (ParallelEnv converts to CPU, IsaacLabVecEnv keeps
+            # on GPU).  The .to() calls below are no-ops when the data is
+            # already on agent.device.
+            # (B, A), (B,)
+            trans, step_done = envs.step(act.detach(), done)
             # dict of (B, 1, *)
-            trans = trans_cpu.to(agent.device, non_blocking=True)
+            trans = trans.to(agent.device, non_blocking=True)
             # (B,)
-            done = done_cpu.to(agent.device)
+            done = step_done.to(agent.device)
 
             # Store transition.
             # We keep the observation and the action that produced it together.
@@ -100,9 +100,10 @@ class OnlineTrainer:
     def begin(self, agent):
         """Main online training loop.
 
-        The loop is designed to overlap CPU environment stepping and GPU model
-        execution. Environments are stepped on CPU, observations are pinned,
-        then transferred to GPU with non_blocking=True.
+        For CPU-based environments the loop overlaps CPU stepping and GPU
+        model execution via pinned-memory async H2D transfers.  For
+        GPU-resident environments (IsaacLab) no transfer is needed —
+        ``.to()`` is a no-op when the data is already on the target device.
         """
         envs = self.train_envs
         video_cache = []
@@ -114,14 +115,14 @@ class OnlineTrainer:
         lengths = torch.zeros(envs.env_num, dtype=torch.int32, device=agent.device)
         episode_ids = torch.arange(
             envs.env_num, dtype=torch.int32, device=agent.device
-        )  # Increment this to prevent sampling across episode boundaries
+        )  # Kept constant so short episodes (< batch_length) remain sampable; RSSM resets via is_first.
         train_metrics = {}
         agent_state = agent.get_initial_state(envs.env_num)
         # (B, A)
         act = agent_state["prev_action"].clone()
         while step < self.steps:
             # Evaluation
-            if self._should_eval(step) and self.eval_episode_num > 0:
+            if self._should_eval(step) and self.eval_episode_num > 0 and self.eval_envs is not None:
                 self.eval(agent, step)
             # Save metrics
             if done.any():
@@ -138,18 +139,16 @@ class OnlineTrainer:
             step += int((~done).sum()) * self._action_repeat  # step is based on env side
             lengths += ~done
 
-            # Step environments on CPU to avoid GPU<->CPU sync in the worker processes.
-            # (B, A)
-            act_cpu = act.detach().to("cpu")
-            # (B,)
-            done_cpu = done.detach().to("cpu")
-            trans_cpu, done_cpu = envs.step(act_cpu, done_cpu)
-
-            # Move observations back to GPU asynchronously for the agent.
+            # Step environments.  Each env backend handles device placement
+            # internally (ParallelEnv converts to CPU, IsaacLabVecEnv keeps
+            # on GPU).  The .to() calls below are no-ops when the data is
+            # already on agent.device.
+            # (B, A), (B,)
+            trans, step_done = envs.step(act.detach(), done)
             # dict of (B, 1, *)
-            trans = trans_cpu.to(agent.device, non_blocking=True)
+            trans = trans.to(agent.device, non_blocking=True)
             # (B,)
-            done = done_cpu.to(agent.device)
+            done = step_done.to(agent.device)
 
             # Policy inference on GPU.
             # "agent_state" is reset by the agent based on the "is_first" flag in trans.

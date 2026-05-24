@@ -1,12 +1,52 @@
+import atexit
+
 from . import parallel, wrappers
 
 
 def make_envs(config):
+    suite = config.task.split("_", 1)[0]
+
+    if suite == "isaaclab":
+        return _make_isaaclab_envs(config)
+
     def env_constructor(idx):
         return lambda: make_env(config, idx)
 
     train_envs = parallel.ParallelEnv(env_constructor, config.env_num, config.device)
-    eval_envs = parallel.ParallelEnv(env_constructor, config.eval_episode_num, config.device)
+    eval_envs = (
+        parallel.ParallelEnv(env_constructor, config.eval_episode_num, config.device)
+        if config.eval_episode_num > 0
+        else None
+    )
+    obs_space = train_envs.observation_space
+    act_space = train_envs.action_space
+    return train_envs, eval_envs, obs_space, act_space
+
+
+def _make_isaaclab_envs(config):
+    if int(config.eval_episode_num) > 0:
+        raise ValueError(
+            "IsaacLab environments do not support separate eval envs yet. Set eval_episode_num: 0 in the env config."
+        )
+
+    # AppLauncher must be created before any isaaclab.* module is imported.
+    from isaaclab.app import AppLauncher
+
+    headless = getattr(config, "headless", True)
+    launcher = AppLauncher(headless=headless, enable_cameras=True)
+    sim_app = launcher.app
+
+    from envs.isaaclab import IsaacLabVecEnv, create_isaaclab_env
+
+    raw_env = create_isaaclab_env(config)
+
+    train_envs = IsaacLabVecEnv(raw_env, simulation_app=sim_app, image_size=tuple(config.size))
+
+    # Ensure the SimulationApp is shut down cleanly on process exit.
+    atexit.register(train_envs.close)
+
+    eval_envs = None  # Not supported yet for IsaacLab.
+
     obs_space = train_envs.observation_space
     act_space = train_envs.action_space
     return train_envs, eval_envs, obs_space, act_space

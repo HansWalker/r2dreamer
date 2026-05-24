@@ -9,7 +9,26 @@ To build the Docker image, run the following command from the root of the reposi
 ```bash
 docker build -f Dockerfile -t r2dreamer:local .
 ```
-You can replace the `-t` argument with any image name you like. The command above will build and tag the image as `r2dreamer:local`.
+
+By default the image installs only the **DMC** environment backend. Use the `EXTRAS` build argument to select which backends to include:
+
+```bash
+# DMC only (default)
+docker build -t r2dreamer:dmc .
+
+# DMC + Atari
+docker build --build-arg EXTRAS="dmc,atari" -t r2dreamer:dmc-atari .
+
+# All environments
+docker build --build-arg EXTRAS=all -t r2dreamer:all .
+
+# IsaacLab only
+docker build --build-arg EXTRAS=isaaclab -t r2dreamer:isaaclab .
+```
+
+Available extras: `dmc`, `atari`, `crafter`, `metaworld`, `memorymaze`, `isaaclab`, `all`.
+
+You can replace the `-t` argument with any image name you like.
 
 Then start a container from the built image with:
 
@@ -28,7 +47,7 @@ You can then connect to the running container and execute your training scripts.
 # Connect to the running container
 docker exec -it r2dreamer-container bash
 
-# And then inside the container:
+# And then inside the container (make sure the env backend was included at build time):
 python3 train.py env=dmc_vision env.task=dmc_walker_walk
 
 # Alternatively, combine it with the docker exec command and use the -d flag to run in detached mode:

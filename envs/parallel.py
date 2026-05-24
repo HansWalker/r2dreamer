@@ -45,8 +45,14 @@ class ParallelEnv:
         This implementation intentionally steps the environment processes on CPU.
         The returned TensorDict is pinned in CPU memory so that the caller can
         transfer it to GPU asynchronously (H2D with non_blocking=True).
+
+        ``action`` and ``done`` may arrive on any device (CPU or CUDA).
+        They are moved to CPU internally before dispatching to workers.
         """
-        promise = [e.reset() if d else e.step(a) for e, a, d in zip(self.envs, tools.to_np(action), done)]
+        # Ensure inputs are on CPU for worker processes.
+        action_np = tools.to_np(action)  # handles any device via .detach().cpu().numpy()
+        done = done.cpu() if done.is_cuda else done
+        promise = [e.reset() if d else e.step(a) for e, a, d in zip(self.envs, action_np, done)]
         new_o, new_r, new_d = [], [], []
         for p, d in zip(promise, done):
             if d:
