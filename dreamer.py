@@ -242,6 +242,30 @@ class Dreamer(nn.Module):
         self.clone_and_freeze()
         return self
 
+    def _state_tuple(self, state):
+        if isinstance(state, (tuple, list)):
+            return tuple(state)
+        out = [state["stoch"], state["deter"]]
+        if "mamba_context" in state.keys():
+            out.append(state["mamba_context"])
+        return tuple(out)
+
+    def _warmup_initial(self, warmup, initial):
+        if warmup is None or warmup.shape[1] == 0:
+            return initial
+        with torch.no_grad():
+            warm_embed = self.encoder(warmup)
+            warm_stoch, warm_deter, _, warm_context = self.rssm.observe(
+                warm_embed,
+                warmup["action"],
+                initial,
+                warmup["is_first"],
+            )
+        out = [warm_stoch[:, -1].detach(), warm_deter[:, -1].detach()]
+        if warm_context is not None:
+            out.append(warm_context[:, -1].detach())
+        return tuple(out)
+
     @torch.no_grad()
     def act(self, obs, state, eval=False):
         """Policy inference step."""
@@ -255,15 +279,26 @@ class Dreamer(nn.Module):
             state["deter"],
             state["prev_action"],
         )
+        prev_context = state["mamba_context"] if "mamba_context" in state.keys() else None
         # (B, S, K), (B, D)
-        stoch, deter, _ = self._frozen_rssm.obs_step(prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
+        stoch, deter, _, context = self._frozen_rssm.obs_step(
+            prev_stoch,
+            prev_deter,
+            prev_action,
+            embed,
+            obs["is_first"],
+            prev_context,
+        )
         # (B, F)
         feat = self._frozen_rssm.get_feat(stoch, deter)
         action_dist = self._frozen_actor(feat)
         # (B, A)
         action = action_dist.mode if eval else action_dist.rsample()
+        next_state = {"stoch": stoch, "deter": deter, "prev_action": action}
+        if context is not None:
+            next_state["mamba_context"] = context
         return action, TensorDict(
-            {"stoch": stoch, "deter": deter, "prev_action": action},
+            next_state,
             batch_size=state.batch_size,
         )
 
@@ -271,13 +306,17 @@ class Dreamer(nn.Module):
     def get_initial_state(self, B):
         stoch, deter = self.rssm.initial(B)
         action = torch.zeros(B, self.act_dim, dtype=torch.float32, device=self.device)
-        return TensorDict({"stoch": stoch, "deter": deter, "prev_action": action}, batch_size=(B,))
+        state = {"stoch": stoch, "deter": deter, "prev_action": action}
+        context = self.rssm.initial_context(B)
+        if context is not None:
+            state["mamba_context"] = context
+        return TensorDict(state, batch_size=(B,))
 
     @torch.no_grad()
     def video_pred(self, data, initial):
         torch.compiler.cudagraph_mark_step_begin()
         p_data = self.preprocess(data)
-        return self._video_pred(p_data, initial)
+        return self._video_pred(p_data, self._state_tuple(initial))
 
     def _video_pred(self, data, initial):
         """Video prediction utility."""
@@ -288,7 +327,7 @@ class Dreamer(nn.Module):
         # (B, T, E)
         embed = self.encoder(data)
 
-        post_stoch, post_deter, _ = self.rssm.observe(
+        post_stoch, post_deter, _, post_context = self.rssm.observe(
             embed[:B, :5],
             data["action"][:B, :5],
             tuple(val[:B] for val in initial),
@@ -296,10 +335,12 @@ class Dreamer(nn.Module):
         )
         recon = self.decoder(post_stoch, post_deter)["image"].mode()[:B]
         init_stoch, init_deter = post_stoch[:, -1], post_deter[:, -1]
-        prior_stoch, prior_deter = self.rssm.imagine_with_action(
+        init_context = post_context[:, -1] if post_context is not None else None
+        prior_stoch, prior_deter, _ = self.rssm.imagine_with_action(
             init_stoch,
             init_deter,
             data["action"][:B, 5:],
+            init_context,
         )
         openl = self.decoder(prior_stoch, prior_deter)["image"].mode()
         model = torch.cat([recon[:, :5], openl], 1)
@@ -309,15 +350,16 @@ class Dreamer(nn.Module):
 
     def update(self, replay_buffer):
         """Sample a batch from replay and perform one optimization step."""
-        data, index, initial = replay_buffer.sample()
+        data, index, initial, warmup = replay_buffer.sample()
         torch.compiler.cudagraph_mark_step_begin()
         p_data = self.preprocess(data)
+        p_warmup = self.preprocess(warmup) if warmup is not None else None
         self._update_slow_target()
         if self.rep_loss == "dreamerpro":
             self.ema_update()
         metrics = {}
         with autocast(device_type=self.device.type, dtype=torch.float16):
-            (stoch, deter), mets = self._cal_grad(p_data, initial)
+            (stoch, deter), mets = self._cal_grad(p_data, initial, p_warmup)
         self._scaler.unscale_(self._optimizer)  # unscale grads in params
         if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
             self._prototypes.grad.zero_()
@@ -346,7 +388,7 @@ class Dreamer(nn.Module):
         replay_buffer.update(index, stoch.detach(), deter.detach())
         return metrics
 
-    def _cal_grad(self, data, initial):
+    def _cal_grad(self, data, initial, warmup=None):
         """Compute gradients for one batch.
 
         Notes
@@ -357,16 +399,19 @@ class Dreamer(nn.Module):
         3) Imagination rollouts for actor-critic updates
         4) Replay-based value learning
         """
-        # data: dict of (B, T, *), initial: (stoch: (B, S, K), deter: (B, D))
+        # data: dict of (B, T, *), initial: (stoch: (B, S, K), deter: (B, D), optional context)
         losses = {}
         metrics = {}
         B, T = data.shape
+        initial = self._warmup_initial(warmup, initial)
 
         # === World model: posterior rollout and KL losses ===
         # (B, T, E)
         embed = self.encoder(data)
         # (B, T, S, K), (B, T, D), (B, T, S, K)
-        post_stoch, post_deter, post_logit = self.rssm.observe(embed, data["action"], initial, data["is_first"])
+        post_stoch, post_deter, post_logit, post_context = self.rssm.observe(
+            embed, data["action"], initial, data["is_first"]
+        )
         # (B, T, S, K)
         _, prior_logit = self.rssm.prior(post_deter)
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
@@ -410,15 +455,12 @@ class Dreamer(nn.Module):
             # DreamerPro uses augmentation + EMA targets + Sinkhorn assignment.
             with torch.no_grad():
                 data_aug = self.augment_data(data)
-                initial_aug = (
-                    # (B, ...) -> (2B, ...)
-                    torch.cat([initial[0], initial[0]], dim=0),
-                    torch.cat([initial[1], initial[1]], dim=0),
-                )
+                # (B, ...) -> (2B, ...)
+                initial_aug = tuple(torch.cat([item, item], dim=0) for item in initial)
                 ema_proj = self.ema_proj(data_aug)
 
             embed_aug = self.encoder(data_aug)
-            post_stoch_aug, post_deter_aug, _ = self.rssm.observe(
+            post_stoch_aug, post_deter_aug, _, _ = self.rssm.observe(
                 embed_aug, data_aug["action"], initial_aug, data_aug["is_first"]
             )
             proto_losses = self.proto_loss(post_stoch_aug, post_deter_aug, embed_aug, ema_proj)
@@ -440,6 +482,8 @@ class Dreamer(nn.Module):
             post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
             post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
         )
+        if post_context is not None:
+            start = start + (post_context.reshape(-1, *post_context.shape[2:]).detach(),)
         # (B, T, ...) -> (B*T, ...)
         imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
         imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
@@ -532,10 +576,14 @@ class Dreamer(nn.Module):
     @torch.no_grad()
     def _imagine(self, start, imag_horizon):
         """Roll out the policy in latent space."""
-        # (B, S, K), (B, D)
+        # (B, S, K), (B, D), optional (B, C, D)
         feats = []
         actions = []
-        stoch, deter = start
+        if len(start) == 3:
+            stoch, deter, context = start
+        else:
+            stoch, deter = start
+            context = None
         for _ in range(imag_horizon):
             # (B, F)
             feat = self._frozen_rssm.get_feat(stoch, deter)
@@ -544,7 +592,7 @@ class Dreamer(nn.Module):
             # Append feat and its corresponding sampled action at the same time step.
             feats.append(feat)
             actions.append(action)
-            stoch, deter = self._frozen_rssm.img_step(stoch, deter, action)
+            stoch, deter, context = self._frozen_rssm.img_step(stoch, deter, action, context)
 
         # Stack along sequence dim T_imag.
         # (B, T_imag, F), (B, T_imag, A)

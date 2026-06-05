@@ -10,6 +10,8 @@ class Buffer:
         self.storage_device = torch.device(config.storage_device)
         self.batch_size = int(config.batch_size)
         self.batch_length = int(config.batch_length)
+        self.context = int(getattr(config, "context", 0))
+        self.sample_length = self.context + self.batch_length + 1
         self.num_eps = 0
         self._buffer = ReplayBuffer(
             storage=LazyTensorStorage(max_size=config.max_size, device=self.storage_device, ndim=2),
@@ -17,7 +19,7 @@ class Buffer:
                 num_slices=self.batch_size, end_key=None, traj_key="episode", truncated_key=None, strict_length=True
             ),
             prefetch=0,
-            batch_size=self.batch_size * (self.batch_length + 1),  # +1 for context
+            batch_size=self.batch_size * self.sample_length,  # +1 for latent seed row
         )
 
     def add_transition(self, data):
@@ -27,9 +29,9 @@ class Buffer:
 
     def sample(self):
         sample_td, info = self._buffer.sample(return_info=True)
-        # The sampler returns a flattened batch of length B*(T+1).
-        # (B*(T+1), ...) -> (B, T+1, ...)
-        sample_td = sample_td.view(-1, self.batch_length + 1)
+        # The sampler returns a flattened batch of length B*(C+T+1).
+        # (B*(C+T+1), ...) -> (B, C+T+1, ...)
+        sample_td = sample_td.view(-1, self.sample_length)
         src_dev = sample_td.device
         if src_dev.type == "cpu" and self.device.type == "cuda":
             sample_td = sample_td.pin_memory().to(self.device, non_blocking=True)
@@ -37,10 +39,16 @@ class Buffer:
             sample_td = sample_td.to(self.device, non_blocking=True)
         # The initial ones are used only to extract the latent vector
         initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0])
-        data = sample_td[:, 1:]
-        data.set_("action", sample_td["action"][:, :-1])  # action is 1 step back
-        index = [ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]]
-        return data, index, initial
+        warmup = sample_td[:, 1 : self.context + 1] if self.context else None
+        if warmup is not None:
+            warmup.set_("action", sample_td["action"][:, : self.context])  # action is 1 step back
+        data = sample_td[:, self.context + 1 :]
+        data.set_(
+            "action",
+            sample_td["action"][:, self.context : self.context + self.batch_length],
+        )  # action is 1 step back
+        index = [ind.view(-1, self.sample_length)[:, self.context + 1 :] for ind in info["index"]]
+        return data, index, initial, warmup
 
     def update(self, index, stoch, deter):
         # Flatten the data
