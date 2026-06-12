@@ -26,11 +26,11 @@
 - Use the same small experiment model dimensions for the GRU and Mamba3 comparison:
 
   ```yaml
-  deter: 512
-  hidden: 128
-  discrete: 16
-  depth: 16
-  units: 128
+  deter: 256
+  hidden: 80
+  discrete: 8
+  depth: 8
+  units: 80
   ```
 
 - Use `warmup: 0` for Mamba3 because the cache is stored in replay.

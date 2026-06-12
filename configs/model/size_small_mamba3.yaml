@@ -1,11 +1,11 @@
 defaults:
   - _base_
 
-deter: 512
-hidden: 128
-discrete: 16
-depth: 16
-units: 128
+deter: 256
+hidden: 80
+discrete: 8
+depth: 8
+units: 80
 act: 'SiLU'
 norm: True
 compile: False
