@@ -1,0 +1,15 @@
+defaults:
+  - _base_
+
+deter: 512
+hidden: 128
+discrete: 16
+depth: 16
+units: 128
+act: 'SiLU'
+norm: True
+compile: False
+
+rssm:
+  core: block_gru
+  warmup: 0

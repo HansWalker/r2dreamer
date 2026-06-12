@@ -23,7 +23,7 @@
 - Use the default dtype produced by the Mamba3/cache allocation path for cache tensors.
 - Do not use the raw Mamba3 cache directly as the Dreamer feature vector.
 - Use official Mamba3 step mode for training, acting, and imagination.
-- Use the same small debug model dimensions for the GRU and Mamba3 comparison:
+- Use the same small experiment model dimensions for the GRU and Mamba3 comparison:
 
   ```yaml
   deter: 512
@@ -103,8 +103,8 @@
 - Remove rolling-window-only fields:
   - `context_len`
   - `mlp_hidden_mult`
-- Update `size_debug_mamba3.yaml` to match the real-cache path.
-- Keep the GRU and Mamba3 debug configs identical except for RSSM core-specific fields.
+- Update `size_small_mamba3.yaml` to match the real-cache path.
+- Keep the GRU and Mamba3 small experiment configs identical except for RSSM core-specific fields.
 
 ## Smoke Checks
 

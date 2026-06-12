@@ -388,6 +388,62 @@ class Dreamer(nn.Module):
         replay_buffer.update(index, *(value.detach() for value in post_state))
         return metrics
 
+    def update_offline(self, warmup_data, data):
+        """Perform one optimization step from an offline zarr batch."""
+        torch.compiler.cudagraph_mark_step_begin()
+        p_data = self.preprocess(data)
+        initial = self._offline_initial(data.shape[0], warmup_data)
+        self._update_slow_target()
+        if self.rep_loss == "dreamerpro":
+            self.ema_update()
+        metrics = {}
+        with autocast(device_type=self.device.type, dtype=torch.float16):
+            _, mets = self._cal_grad(p_data, initial)
+        self._scaler.unscale_(self._optimizer)
+        if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
+            self._prototypes.grad.zero_()
+        if self._log_grads:
+            old_params = [p.data.clone().detach() for p in self._named_params.values()]
+            grads = [p.grad for p in self._named_params.values() if p.grad is not None]
+            mets["opt/grad_norm"] = tools.compute_global_norm(grads)
+            mets["opt/grad_rms"] = tools.compute_rms(grads)
+        self._agc(self._named_params.values())
+        self._scaler.step(self._optimizer)
+        self._scaler.update()
+        self._scheduler.step()
+        self._optimizer.zero_grad(set_to_none=True)
+        mets["opt/lr"] = self._scheduler.get_lr()[0]
+        mets["opt/grad_scale"] = self._scaler.get_scale()
+        if self._log_grads:
+            updates = [(new - old) for (new, old) in zip(self._named_params.values(), old_params)]
+            mets["opt/param_rms"] = tools.compute_rms(self._named_params.values())
+            mets["opt/update_rms"] = tools.compute_rms(updates)
+        metrics.update(mets)
+        self.clone_and_freeze()
+        return metrics
+
+    @torch.no_grad()
+    def _offline_initial(self, batch_size, warmup_data=None):
+        initial = self._initial_tuple(batch_size)
+        if warmup_data is None or warmup_data.shape[1] == 0:
+            return initial
+        p_warmup = self.preprocess(warmup_data)
+        embed = self.encoder(p_warmup)
+        post = self.rssm.observe(embed, p_warmup["action"], initial, p_warmup["is_first"])
+        stoch, deter = post[:2]
+        out = [stoch[:, -1].detach(), deter[:, -1].detach()]
+        if len(post) > 3:
+            out.extend(value[:, -1].detach().clone() for value in post[3:])
+        return tuple(out)
+
+    def _initial_tuple(self, batch_size):
+        stoch, deter = self.rssm.initial(batch_size)
+        initial = [stoch, deter]
+        cache = self.rssm.initial_context(batch_size)
+        if cache is not None:
+            initial.extend(cache)
+        return tuple(initial)
+
     def _cal_grad(self, data, initial):
         """Compute gradients for one batch.
 
