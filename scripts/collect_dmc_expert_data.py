@@ -186,6 +186,67 @@ def make_tdmpc2_cfg(
     return cfg_to_dataclass(cfg)
 
 
+def convert_tdmpc2_state_dict(target_state_dict: dict[str, Any], source_state_dict: dict[str, Any]) -> dict[str, Any]:
+    source_state_dict = dict(source_state_dict)
+    if "_detach_Qs_params.0.weight" not in source_state_dict:
+        name_map = ["weight", "bias", "ln.weight", "ln.bias"]
+        converted = dict(source_state_dict)
+        for key, value in list(source_state_dict.items()):
+            if key.startswith("_Qs.params."):
+                num = int(key[len("_Qs.params."):])
+                new_key = f"{num // 4}.{name_map[num % 4]}"
+                converted.pop(key, None)
+                converted[f"_Qs.params.{new_key}"] = value
+                converted[f"_detach_Qs_params.{new_key}"] = value
+            elif key.startswith("_target_Qs.params."):
+                num = int(key[len("_target_Qs.params."):])
+                new_key = f"{num // 4}.{name_map[num % 4]}"
+                converted.pop(key, None)
+                converted[f"_target_Qs_params.{new_key}"] = value
+
+        for prefix in ("_Qs.", "_detach_Qs_", "_target_Qs_"):
+            for key in ("__batch_size", "__device"):
+                meta_key = f"{prefix}params.{key}"
+                if meta_key in target_state_dict:
+                    converted[meta_key] = target_state_dict[meta_key]
+
+        for key in ("log_std_min", "log_std_dif", "_action_masks"):
+            if key in target_state_dict:
+                converted[key] = target_state_dict[key]
+        source_state_dict = converted
+
+    return {
+        key: value
+        for key, value in source_state_dict.items()
+        if key in target_state_dict
+    }
+
+
+def load_tdmpc2_checkpoint(agent, checkpoint_path: Path):
+    import torch
+
+    state_dict = torch.load(
+        checkpoint_path,
+        map_location=agent.device,
+        weights_only=False,
+    )
+    state_dict = state_dict["model"] if "model" in state_dict else state_dict
+    target_state_dict = agent.model.state_dict()
+    state_dict = convert_tdmpc2_state_dict(target_state_dict, state_dict)
+    incompatible = agent.model.load_state_dict(state_dict, strict=False)
+    missing = [
+        key
+        for key in incompatible.missing_keys
+        if not key.endswith((".__batch_size", ".__device"))
+    ]
+    unexpected = list(incompatible.unexpected_keys)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Could not load TD-MPC2 checkpoint cleanly. "
+            f"Missing keys: {missing}. Unexpected keys: {unexpected}."
+        )
+
+
 def load_agent(
     tdmpc2_root: Path,
     checkpoint_path: Path,
@@ -208,7 +269,7 @@ def load_agent(
     from tdmpc2 import TDMPC2
 
     agent = TDMPC2(cfg)
-    agent.load(str(checkpoint_path))
+    load_tdmpc2_checkpoint(agent, checkpoint_path)
     agent.eval()
     return agent
 
