@@ -2,9 +2,9 @@ tdmpc2_root: ${TDMPC2_DIR}
 output_dir: ${DMC_EXPERT_DATA_DIR}
 
 tasks:
-  - cartpole/swingup
+  - walker/walk
 
-num_episodes: 2
+num_episodes: 100
 checkpoint_seed: 1
 seed: 1
 
