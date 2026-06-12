@@ -30,8 +30,8 @@ offline:
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   warmup_length: 32
-  updates: 20000
-  eval_every: 1000
-  eval_episode_num: 5
+  updates: 500
+  eval_every: 0
+  eval_episode_num: 0
   log_every: 100
-  save_every: 1000
+  save_every: 100
