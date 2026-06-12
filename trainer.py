@@ -2,6 +2,13 @@ import torch
 
 import tools
 
+MAMBA_CACHE_KEYS = (
+    "mamba_angle_state",
+    "mamba_ssm_state",
+    "mamba_k_state",
+    "mamba_v_state",
+)
+
 
 class OnlineTrainer:
     def __init__(self, config, replay_buffer, logger, logdir, train_envs, eval_envs):
@@ -16,7 +23,6 @@ class OnlineTrainer:
         self.video_pred_log = bool(config.video_pred_log)
         self.params_hist_log = bool(config.params_hist_log)
         self.batch_length = int(config.batch_length)
-        self.context = int(getattr(config, "context", 0))
         batch_steps = int(config.batch_size * config.batch_length)
         # train_ratio is based on data steps rather than environment steps.
         self._updates_needed = tools.Every(batch_steps / config.train_ratio * config.action_repeat)
@@ -162,13 +168,16 @@ class OnlineTrainer:
             trans["action"] = act * ~done.unsqueeze(-1)
             trans["stoch"] = agent_state["stoch"]
             trans["deter"] = agent_state["deter"]
+            for key in MAMBA_CACHE_KEYS:
+                if key in agent_state.keys():
+                    trans[key] = agent_state[key]
             trans["episode"] = episode_ids  # Don't lift dim
             if "image" in trans:
                 video_cache.append(trans["image"][0])
             self.replay_buffer.add_transition(trans.detach())
             returns += trans["reward"][:, 0]
             # Update models after enough data has accumulated
-            if step // (envs.env_num * self._action_repeat) > self.batch_length + self.context + 1:
+            if step // (envs.env_num * self._action_repeat) > self.batch_length + 1:
                 if self._should_pretrain():
                     update_num = self.pretrain
                 else:
@@ -184,7 +193,7 @@ class OnlineTrainer:
                         self.logger.scalar(f"train/{name}", value)
                     self.logger.scalar("train/opt/updates", update_count)
                     if self.video_pred_log:
-                        data, _, initial, _ = self.replay_buffer.sample()
+                        data, _, initial = self.replay_buffer.sample()
                         self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():

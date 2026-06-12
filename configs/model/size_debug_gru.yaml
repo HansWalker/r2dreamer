@@ -8,6 +8,7 @@ depth: 16
 units: 128
 act: 'SiLU'
 norm: True
+compile: False
 
 rssm:
   core: block_gru

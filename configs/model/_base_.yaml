@@ -68,7 +68,6 @@ rssm:
   initial: 'learned'
   device: ${device}
   mamba3:
-    context_len: 16
     n_layers: 1
     d_state: 16
     expand: 1
@@ -76,7 +75,7 @@ rssm:
     is_mimo: False
     mimo_rank: 1
     chunk_size: 16
-    mlp_hidden_mult: 1
+    is_outproj_norm: False
 
 encoder:
   mlp_keys: ${env.encoder.mlp_keys}

@@ -3,6 +3,13 @@ from tensordict import TensorDict
 from torchrl.data.replay_buffers import LazyTensorStorage, ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SliceSampler
 
+MAMBA_CACHE_KEYS = (
+    "mamba_angle_state",
+    "mamba_ssm_state",
+    "mamba_k_state",
+    "mamba_v_state",
+)
+
 
 class Buffer:
     def __init__(self, config):
@@ -10,8 +17,7 @@ class Buffer:
         self.storage_device = torch.device(config.storage_device)
         self.batch_size = int(config.batch_size)
         self.batch_length = int(config.batch_length)
-        self.context = int(getattr(config, "context", 0))
-        self.sample_length = self.context + self.batch_length + 1
+        self.sample_length = self.batch_length + 1
         self.num_eps = 0
         self._buffer = ReplayBuffer(
             storage=LazyTensorStorage(max_size=config.max_size, device=self.storage_device, ndim=2),
@@ -29,8 +35,8 @@ class Buffer:
 
     def sample(self):
         sample_td, info = self._buffer.sample(return_info=True)
-        # The sampler returns a flattened batch of length B*(C+T+1).
-        # (B*(C+T+1), ...) -> (B, C+T+1, ...)
+        # The sampler returns a flattened batch of length B*(T+1).
+        # (B*(T+1), ...) -> (B, T+1, ...)
         sample_td = sample_td.view(-1, self.sample_length)
         src_dev = sample_td.device
         if src_dev.type == "cpu" and self.device.type == "cuda":
@@ -38,28 +44,43 @@ class Buffer:
         elif src_dev != self.device:
             sample_td = sample_td.to(self.device, non_blocking=True)
         # The initial ones are used only to extract the latent vector
-        initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0])
-        warmup = sample_td[:, 1 : self.context + 1] if self.context else None
-        if warmup is not None:
-            warmup.set_("action", sample_td["action"][:, : self.context])  # action is 1 step back
-        data = sample_td[:, self.context + 1 :]
-        data.set_(
-            "action",
-            sample_td["action"][:, self.context : self.context + self.batch_length],
-        )  # action is 1 step back
-        index = [ind.view(-1, self.sample_length)[:, self.context + 1 :] for ind in info["index"]]
-        return data, index, initial, warmup
+        initial = [sample_td["stoch"][:, 0], sample_td["deter"][:, 0]]
+        if all(key in sample_td.keys() for key in MAMBA_CACHE_KEYS):
+            initial.extend(sample_td[key][:, 0] for key in MAMBA_CACHE_KEYS)
+        initial = tuple(initial)
+        data = sample_td[:, 1:]
+        data.set_("action", sample_td["action"][:, :-1])  # action is 1 step back
+        index = [ind.view(-1, self.sample_length)[:, 1:] for ind in info["index"]]
+        return data, index, initial
 
-    def update(self, index, stoch, deter):
+    def update(
+        self,
+        index,
+        stoch,
+        deter,
+        mamba_angle_state=None,
+        mamba_ssm_state=None,
+        mamba_k_state=None,
+        mamba_v_state=None,
+    ):
         # Flatten the data
         index = [ind.reshape(-1) for ind in index]
         # (B, T, S, K) -> (B*T, S, K)
         stoch = stoch.reshape(-1, *stoch.shape[2:])
         # (B, T, D) -> (B*T, D)
         deter = deter.reshape(-1, *deter.shape[2:])
+        values = {"stoch": stoch, "deter": deter}
+        cache = (mamba_angle_state, mamba_ssm_state, mamba_k_state, mamba_v_state)
+        if all(value is not None for value in cache):
+            values.update(
+                {
+                    key: value.reshape(-1, *value.shape[2:])
+                    for key, value in zip(MAMBA_CACHE_KEYS, cache)
+                }
+            )
         # In storage, the length is the first dimension, and the batch (number of environments) is the second dimension.
         n = index[0].shape[0]
-        self._buffer[index[1], index[0]] = TensorDict({"stoch": stoch, "deter": deter}, batch_size=(n,))
+        self._buffer[index[1], index[0]] = TensorDict(values, batch_size=(n,))
 
     def count(self):
         if self._buffer.storage.shape is None:

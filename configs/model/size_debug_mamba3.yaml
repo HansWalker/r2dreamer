@@ -8,12 +8,12 @@ depth: 16
 units: 128
 act: 'SiLU'
 norm: True
+compile: False
 
 rssm:
   core: mamba3
-  warmup: 8
+  warmup: 0
   mamba3:
-    context_len: 16
     n_layers: 1
     d_state: 16
     expand: 1
@@ -21,4 +21,4 @@ rssm:
     is_mimo: False
     mimo_rank: 1
     chunk_size: 16
-    mlp_hidden_mult: 1
+    is_outproj_norm: False

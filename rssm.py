@@ -6,6 +6,13 @@ import distributions as dists
 from networks import BlockLinear, LambdaLayer
 from tools import rpad, weight_init_
 
+MAMBA_CACHE_KEYS = (
+    "mamba_angle_state",
+    "mamba_ssm_state",
+    "mamba_k_state",
+    "mamba_v_state",
+)
+
 try:
     from mamba_ssm.modules.mamba3 import Mamba3
 except Exception as exc:  # pragma: no cover - exercised only when dependency is absent
@@ -101,8 +108,7 @@ class Mamba3Layer(nn.Module):
         is_mimo,
         mimo_rank,
         chunk_size,
-        mlp_hidden,
-        act="SiLU",
+        is_outproj_norm=False,
     ):
         super().__init__()
         if Mamba3 is None:
@@ -110,8 +116,6 @@ class Mamba3Layer(nn.Module):
                 "RSSM core=mamba3 requires mamba_ssm.modules.mamba3.Mamba3. "
                 "Install a local Mamba package that includes Mamba3."
             ) from _MAMBA3_IMPORT_ERROR
-        act = getattr(torch.nn, act)
-        self.norm1 = nn.RMSNorm(deter, eps=1e-04, dtype=torch.float32)
         self.mamba = Mamba3(
             d_model=deter,
             d_state=d_state,
@@ -120,24 +124,22 @@ class Mamba3Layer(nn.Module):
             is_mimo=is_mimo,
             mimo_rank=mimo_rank,
             chunk_size=chunk_size,
+            is_outproj_norm=is_outproj_norm,
             layer_idx=layer_idx,
         )
-        self.norm2 = nn.RMSNorm(deter, eps=1e-04, dtype=torch.float32)
-        self.mlp = nn.Sequential(
-            nn.Linear(deter, mlp_hidden, bias=True),
-            act(),
-            nn.Linear(mlp_hidden, deter, bias=True),
+
+    def initial_context(self, batch_size, device=None, dtype=None):
+        return self.mamba.allocate_inference_cache(batch_size, max_seqlen=0, device=device, dtype=dtype)
+
+    def step(self, x, angle_state, ssm_state, k_state, v_state):
+        out, angle_state, ssm_state, k_state, v_state = self.mamba.step(
+            x,
+            angle_state,
+            ssm_state,
+            k_state,
+            v_state,
         )
-
-    def forward(self, x):
-        x = x + self.mamba(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-    def apply_weight_init(self):
-        weight_init_(self.norm1)
-        weight_init_(self.norm2)
-        self.mlp.apply(weight_init_)
+        return out, angle_state, ssm_state, k_state, v_state
 
 
 class Mamba3Deter(nn.Module):
@@ -147,7 +149,6 @@ class Mamba3Deter(nn.Module):
         stoch,
         act_dim,
         hidden,
-        context_len=16,
         n_layers=1,
         d_state=16,
         expand=1,
@@ -155,8 +156,7 @@ class Mamba3Deter(nn.Module):
         is_mimo=False,
         mimo_rank=1,
         chunk_size=16,
-        mlp_hidden_mult=1,
-        act="SiLU",
+        is_outproj_norm=False,
     ):
         super().__init__()
         if Mamba3 is None:
@@ -164,97 +164,55 @@ class Mamba3Deter(nn.Module):
                 "RSSM core=mamba3 requires mamba_ssm.modules.mamba3.Mamba3. "
                 "Install a local Mamba package that includes Mamba3."
             ) from _MAMBA3_IMPORT_ERROR
+        if int(n_layers) != 1:
+            raise ValueError("The first real-cache Mamba3 RSSM implementation supports n_layers=1 only.")
         inner = int(deter) * int(expand)
         if inner % int(headdim) != 0:
             raise ValueError(
                 f"Mamba3 requires deter * expand to be divisible by headdim, "
                 f"got deter={deter}, expand={expand}, headdim={headdim}."
             )
-        act_cls = getattr(torch.nn, act)
         self.deter = int(deter)
-        self.context_len = max(1, int(context_len))
-        self.chunk_size = max(1, int(chunk_size))
-        mlp_hidden = max(1, int(self.deter * float(mlp_hidden_mult)))
-        self._token = nn.Sequential(
-            nn.Linear(self.deter + int(stoch) + int(act_dim), int(hidden), bias=True),
-            nn.RMSNorm(int(hidden), eps=1e-04, dtype=torch.float32),
-            act_cls(),
-            nn.Linear(int(hidden), self.deter, bias=True),
-            nn.RMSNorm(self.deter, eps=1e-04, dtype=torch.float32),
-        )
-        self.layers = nn.ModuleList(
-            [
-                Mamba3Layer(
-                    deter=self.deter,
-                    layer_idx=i,
-                    d_state=int(d_state),
-                    expand=int(expand),
-                    headdim=int(headdim),
-                    is_mimo=bool(is_mimo),
-                    mimo_rank=int(mimo_rank),
-                    chunk_size=self.chunk_size,
-                    mlp_hidden=mlp_hidden,
-                    act=act,
-                )
-                for i in range(int(n_layers))
-            ]
-        )
-        self.out_norm = nn.RMSNorm(self.deter, eps=1e-04, dtype=torch.float32)
-
-    def initial_context(self, batch_size, device, dtype=torch.float32):
-        return torch.zeros(
-            batch_size,
-            self.context_len,
-            self.deter,
-            dtype=dtype,
-            device=device,
+        self._token = nn.Linear(self.deter + int(stoch) + int(act_dim), self.deter, bias=True)
+        self.layer = Mamba3Layer(
+            deter=self.deter,
+            layer_idx=0,
+            d_state=int(d_state),
+            expand=int(expand),
+            headdim=int(headdim),
+            is_mimo=bool(is_mimo),
+            mimo_rank=int(mimo_rank),
+            chunk_size=max(1, int(chunk_size)),
+            is_outproj_norm=bool(is_outproj_norm),
         )
 
-    def _run_mamba(self, context):
-        T = context.shape[1]
-        pad = (-T) % self.chunk_size
-        x = context
-        if pad:
-            zeros = torch.zeros(
-                x.shape[0], pad, x.shape[-1], dtype=x.dtype, device=x.device
-            )
-            x = torch.cat([x, zeros], dim=1)
-        for layer in self.layers:
-            x = layer(x)
-        x = self.out_norm(x)
-        return x[:, T - 1]
+    def initial_context(self, batch_size, device=None, dtype=None):
+        return self.layer.initial_context(batch_size, device=device, dtype=dtype)
 
-    def forward(self, stoch, deter, action, context=None):
-        # (B, S, K), (B, D), (B, A), optional (B, C, D)
+    def forward(self, stoch, deter, action, angle_state=None, ssm_state=None, k_state=None, v_state=None):
+        # (B, S, K), (B, D), (B, A), optional official Mamba3 cache tensors
         B = action.shape[0]
-        if context is None:
-            context = self.initial_context(B, deter.device, deter.dtype)
-        elif context.dtype != deter.dtype or context.device != deter.device:
-            context = context.to(device=deter.device, dtype=deter.dtype)
-        if context.shape[1] != self.context_len:
-            if context.shape[1] > self.context_len:
-                context = context[:, -self.context_len :]
-            else:
-                pad = self.initial_context(B, deter.device, deter.dtype)[
-                    :, : self.context_len - context.shape[1]
-                ]
-                context = torch.cat([pad, context], dim=1)
-
+        if angle_state is None or ssm_state is None or k_state is None or v_state is None:
+            angle_state, ssm_state, k_state, v_state = self.initial_context(B, device=deter.device)
+        else:
+            angle_state = angle_state.to(device=deter.device)
+            ssm_state = ssm_state.to(device=deter.device)
+            k_state = k_state.to(device=deter.device)
+            v_state = v_state.to(device=deter.device)
         stoch = stoch.reshape(B, -1)
         action = action / torch.clip(torch.abs(action), min=1.0).detach()
         token = self._token(torch.cat([deter, stoch, action], dim=-1))
-        if self.context_len == 1:
-            context = token.unsqueeze(1)
-        else:
-            context = torch.cat([context[:, 1:], token.unsqueeze(1)], dim=1)
-        deter = self._run_mamba(context)
-        return deter, context
+        deter, angle_state, ssm_state, k_state, v_state = self.layer.step(
+            token,
+            angle_state,
+            ssm_state,
+            k_state,
+            v_state,
+        )
+        return deter, angle_state, ssm_state, k_state, v_state
 
     def apply_weight_init(self):
-        self._token.apply(weight_init_)
-        for layer in self.layers:
-            layer.apply_weight_init()
-        weight_init_(self.out_norm)
+        weight_init_(self._token)
 
 
 class RSSM(nn.Module):
@@ -294,7 +252,6 @@ class RSSM(nn.Module):
                 self.flat_stoch,
                 act_dim,
                 self._hidden,
-                context_len=_cfg_get(mcfg, "context_len", 16),
                 n_layers=_cfg_get(mcfg, "n_layers", 1),
                 d_state=_cfg_get(mcfg, "d_state", 16),
                 expand=_cfg_get(mcfg, "expand", 1),
@@ -302,8 +259,7 @@ class RSSM(nn.Module):
                 is_mimo=_cfg_get(mcfg, "is_mimo", False),
                 mimo_rank=_cfg_get(mcfg, "mimo_rank", 1),
                 chunk_size=_cfg_get(mcfg, "chunk_size", 16),
-                mlp_hidden_mult=_cfg_get(mcfg, "mlp_hidden_mult", 1),
-                act=config.act,
+                is_outproj_norm=_cfg_get(mcfg, "is_outproj_norm", False),
             )
         else:
             raise ValueError(f"Unsupported RSSM core: {self._core}")
@@ -344,16 +300,41 @@ class RSSM(nn.Module):
     def uses_context(self):
         return self._core == "mamba3"
 
-    def initial_context(self, batch_size, dtype=torch.float32):
+    def initial_context(self, batch_size, dtype=None):
         if not self.uses_context:
             return None
-        return self._deter_net.initial_context(batch_size, self._device, dtype)
+        return self._deter_net.initial_context(batch_size, device=self._device, dtype=dtype)
 
     def _unpack_state(self, state):
-        if len(state) == 3:
-            return state
-        stoch, deter = state
-        return stoch, deter, None
+        if len(state) == 2:
+            stoch, deter = state
+            return stoch, deter, None
+        if len(state) == 6:
+            stoch, deter, angle_state, ssm_state, k_state, v_state = state
+            return stoch, deter, (angle_state, ssm_state, k_state, v_state)
+        raise ValueError(f"Expected RSSM state with 2 or 6 tensors, got {len(state)}.")
+
+    def _ensure_cache(self, cache, batch_size, device):
+        if not self.uses_context:
+            return None
+        if cache is None or any(tensor is None for tensor in cache):
+            return self._deter_net.initial_context(batch_size, device=device)
+        return tuple(tensor.to(device=device) for tensor in cache)
+
+    def _reset_cache(self, cache, reset):
+        if cache is None:
+            return None
+        return tuple(
+            torch.where(
+                rpad(reset, tensor.dim() - int(reset.dim())),
+                torch.zeros_like(tensor),
+                tensor,
+            )
+            for tensor in cache
+        )
+
+    def _stack_cache(self, caches):
+        return tuple(torch.stack(items, dim=1) for items in zip(*caches))
 
     def initial(self, batch_size):
         """Return an initial latent state."""
@@ -364,47 +345,67 @@ class RSSM(nn.Module):
 
     def observe(self, embed, action, initial, reset):
         """Posterior rollout using observations."""
-        # (B, T, E), (B, T, A), ((B, S, K), (B, D), optional context), (B, T)
+        # (B, T, E), (B, T, A), ((B, S, K), (B, D), optional cache tensors), (B, T)
         L = action.shape[1]
-        stoch, deter, context = self._unpack_state(initial)
+        stoch, deter, cache = self._unpack_state(initial)
+        if self.uses_context:
+            cache = self._ensure_cache(cache, stoch.shape[0], deter.device)
         stochs, deters, logits = [], [], []
-        contexts = [] if self.uses_context else None
+        caches = [] if self.uses_context else None
         for i in range(L):
             # (B, S, K), (B, D), (B, S, K)
-            stoch, deter, logit, context = self.obs_step(stoch, deter, action[:, i], embed[:, i], reset[:, i], context)
+            if self.uses_context:
+                stoch, deter, logit, *cache = self.obs_step(
+                    stoch, deter, action[:, i], embed[:, i], reset[:, i], *cache
+                )
+                cache = tuple(cache)
+            else:
+                stoch, deter, logit = self.obs_step(stoch, deter, action[:, i], embed[:, i], reset[:, i])
             stochs.append(stoch)
             deters.append(deter)
             logits.append(logit)
-            if contexts is not None:
-                contexts.append(context)
+            if caches is not None:
+                caches.append(tuple(tensor.clone() for tensor in cache))
         # (B, T, S, K), (B, T, D), (B, T, S, K)
         stochs = torch.stack(stochs, dim=1)
         deters = torch.stack(deters, dim=1)
         logits = torch.stack(logits, dim=1)
-        contexts = torch.stack(contexts, dim=1) if contexts is not None else None
-        return stochs, deters, logits, contexts
+        if caches is not None:
+            return stochs, deters, logits, *self._stack_cache(caches)
+        return stochs, deters, logits
 
-    def obs_step(self, stoch, deter, prev_action, embed, reset, context=None):
+    def obs_step(
+        self,
+        stoch,
+        deter,
+        prev_action,
+        embed,
+        reset,
+        mamba_angle_state=None,
+        mamba_ssm_state=None,
+        mamba_k_state=None,
+        mamba_v_state=None,
+    ):
         """Single posterior step."""
-        # (B, S, K), (B, D), (B, A), (B, E), (B,), optional (B, C, D)
+        # (B, S, K), (B, D), (B, A), (B, E), (B,), optional Mamba3 cache tensors
         stoch = torch.where(rpad(reset, stoch.dim() - int(reset.dim())), torch.zeros_like(stoch), stoch)
         deter = torch.where(rpad(reset, deter.dim() - int(reset.dim())), torch.zeros_like(deter), deter)
         prev_action = torch.where(
             rpad(reset, prev_action.dim() - int(reset.dim())), torch.zeros_like(prev_action), prev_action
         )
         if self.uses_context:
-            if context is None:
-                context = self._deter_net.initial_context(stoch.shape[0], deter.device, deter.dtype)
-            context = torch.where(
-                rpad(reset, context.dim() - int(reset.dim())),
-                torch.zeros_like(context),
-                context,
+            cache = self._ensure_cache(
+                (mamba_angle_state, mamba_ssm_state, mamba_k_state, mamba_v_state),
+                stoch.shape[0],
+                deter.device,
             )
+            cache = self._reset_cache(cache, reset)
 
         # Deterministic transition then posterior logits conditioned on embed.
         # (B, D)
         if self.uses_context:
-            deter, context = self._deter_net(stoch, deter, prev_action, context)
+            deter, *cache = self._deter_net(stoch, deter, prev_action, *cache)
+            cache = tuple(cache)
         else:
             deter = self._deter_net(stoch, deter, prev_action)
         # (B, D + E)
@@ -415,19 +416,38 @@ class RSSM(nn.Module):
         # Sample discrete stochastic state via straight-through Gumbel-Softmax.
         # (B, S, K)
         stoch = self.get_dist(logit).rsample()
-        return stoch, deter, logit, context
+        if self.uses_context:
+            return stoch, deter, logit, *cache
+        return stoch, deter, logit
 
-    def img_step(self, stoch, deter, prev_action, context=None):
+    def img_step(
+        self,
+        stoch,
+        deter,
+        prev_action,
+        mamba_angle_state=None,
+        mamba_ssm_state=None,
+        mamba_k_state=None,
+        mamba_v_state=None,
+    ):
         """Single prior step (no observation)."""
 
         # (B, D)
         if self.uses_context:
-            deter, context = self._deter_net(stoch, deter, prev_action, context)
+            cache = self._ensure_cache(
+                (mamba_angle_state, mamba_ssm_state, mamba_k_state, mamba_v_state),
+                stoch.shape[0],
+                deter.device,
+            )
+            deter, *cache = self._deter_net(stoch, deter, prev_action, *cache)
+            cache = tuple(cache)
         else:
             deter = self._deter_net(stoch, deter, prev_action)
         # (B, S, K)
         stoch, _ = self.prior(deter)
-        return stoch, deter, context
+        if self.uses_context:
+            return stoch, deter, *cache
+        return stoch, deter
 
     def prior(self, deter):
         """Compute prior distribution parameters and sample stoch."""
@@ -437,23 +457,40 @@ class RSSM(nn.Module):
         stoch = self.get_dist(logit).rsample()
         return stoch, logit
 
-    def imagine_with_action(self, stoch, deter, actions, context=None):
+    def imagine_with_action(
+        self,
+        stoch,
+        deter,
+        actions,
+        mamba_angle_state=None,
+        mamba_ssm_state=None,
+        mamba_k_state=None,
+        mamba_v_state=None,
+    ):
         """Roll out prior dynamics given a sequence of actions."""
-        # (B, S, K), (B, D), (B, T, A), optional (B, C, D)
+        # (B, S, K), (B, D), (B, T, A), optional Mamba3 cache tensors
         L = actions.shape[1]
         stochs, deters = [], []
-        contexts = [] if self.uses_context else None
+        cache = (mamba_angle_state, mamba_ssm_state, mamba_k_state, mamba_v_state)
+        caches = [] if self.uses_context else None
+        if self.uses_context:
+            cache = tuple(None if tensor is None else tensor.clone() for tensor in cache)
         for i in range(L):
-            stoch, deter, context = self.img_step(stoch, deter, actions[:, i], context)
+            if self.uses_context:
+                stoch, deter, *cache = self.img_step(stoch, deter, actions[:, i], *cache)
+                cache = tuple(cache)
+            else:
+                stoch, deter = self.img_step(stoch, deter, actions[:, i])
             stochs.append(stoch)
             deters.append(deter)
-            if contexts is not None:
-                contexts.append(context)
+            if caches is not None:
+                caches.append(tuple(tensor.clone() for tensor in cache))
         # (B, T, S, K), (B, T, D)
         stochs = torch.stack(stochs, dim=1)
         deters = torch.stack(deters, dim=1)
-        contexts = torch.stack(contexts, dim=1) if contexts is not None else None
-        return stochs, deters, contexts
+        if caches is not None:
+            return stochs, deters, *self._stack_cache(caches)
+        return stochs, deters
 
     def get_feat(self, stoch, deter):
         """Flatten stoch and concatenate with deter."""

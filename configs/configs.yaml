@@ -20,7 +20,6 @@ batch_length: 64
 buffer:
   batch_size: ${batch_size}
   batch_length: ${batch_length}
-  context: ${model.rssm.warmup}
   max_size: 5e5
   device: ${device}
   storage_device: ${device}
@@ -32,7 +31,6 @@ trainer:
   eval_episode_num: ${env.eval_episode_num}
   batch_size: ${batch_size}
   batch_length: ${batch_length}
-  context: ${buffer.context}
   train_ratio: ${env.train_ratio}
   video_pred_log: False
   params_hist_log: False
