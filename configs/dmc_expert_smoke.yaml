@@ -1,0 +1,17 @@
+tdmpc2_root: ${TDMPC2_DIR}
+output_dir: ${DMC_EXPERT_DATA_DIR}
+
+tasks:
+  - cartpole/swingup
+
+num_episodes: 2
+checkpoint_seed: 1
+seed: 1
+
+action_repeat: 2
+max_episode_steps: 500
+
+save_images: false
+image_size: 64
+
+resume: true

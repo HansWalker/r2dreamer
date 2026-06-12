@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,6 +64,7 @@ def load_config(path: Path) -> argparse.Namespace:
     with path.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
     config = {**defaults, **config}
+    config = {key: expand_config_value(value) for key, value in config.items()}
 
     if config["tdmpc2_root"] is None:
         raise ValueError(f"{path} must define tdmpc2_root")
@@ -73,6 +75,16 @@ def load_config(path: Path) -> argparse.Namespace:
     config["tdmpc2_root"] = Path(config["tdmpc2_root"])
     config["output_dir"] = Path(config["output_dir"])
     return argparse.Namespace(**config)
+
+
+def expand_config_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return os.path.expanduser(os.path.expandvars(value))
+    if isinstance(value, list):
+        return [expand_config_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: expand_config_value(item) for key, item in value.items()}
+    return value
 
 
 def tdmpc2_slug(domain: str, task: str) -> str:
@@ -186,8 +198,72 @@ def make_tdmpc2_cfg(
     return cfg_to_dataclass(cfg)
 
 
+def move_state_key(
+    state_dict: dict[str, Any],
+    target_state_dict: dict[str, Any],
+    old_key: str,
+    new_key: str,
+):
+    if old_key in state_dict and new_key in target_state_dict:
+        state_dict[new_key] = state_dict.pop(old_key)
+
+
+def convert_old_flat_mlp_state_dict(
+    target_state_dict: dict[str, Any],
+    source_state_dict: dict[str, Any],
+) -> dict[str, Any]:
+    converted = dict(source_state_dict)
+
+    if "_encoder.state.1.weight" in converted and "_encoder.state.1.ln.weight" not in converted:
+        for idx in range(16):
+            old_linear = 1 + 3 * idx
+            old_norm = 2 + 3 * idx
+            new_prefix = f"_encoder.state.{idx}"
+            move_state_key(converted, target_state_dict, f"_encoder.state.{old_linear}.weight", f"{new_prefix}.weight")
+            move_state_key(converted, target_state_dict, f"_encoder.state.{old_linear}.bias", f"{new_prefix}.bias")
+            move_state_key(converted, target_state_dict, f"_encoder.state.{old_norm}.weight", f"{new_prefix}.ln.weight")
+            move_state_key(converted, target_state_dict, f"_encoder.state.{old_norm}.bias", f"{new_prefix}.ln.bias")
+
+    if "_dynamics.0.0.weight" in converted:
+        final_norm_weight = converted.pop("_dynamics.1.weight", None)
+        final_norm_bias = converted.pop("_dynamics.1.bias", None)
+        for idx in range(16):
+            new_prefix = f"_dynamics.{idx}"
+            if f"{new_prefix}.weight" not in target_state_dict:
+                continue
+            old_linear = 3 * idx
+            old_norm = 3 * idx + 1
+            old_norm_weight = f"_dynamics.0.{old_norm}.weight"
+            has_old_norm = old_norm_weight in converted
+            move_state_key(converted, target_state_dict, f"_dynamics.0.{old_linear}.weight", f"{new_prefix}.weight")
+            move_state_key(converted, target_state_dict, f"_dynamics.0.{old_linear}.bias", f"{new_prefix}.bias")
+            move_state_key(converted, target_state_dict, old_norm_weight, f"{new_prefix}.ln.weight")
+            move_state_key(converted, target_state_dict, f"_dynamics.0.{old_norm}.bias", f"{new_prefix}.ln.bias")
+            if not has_old_norm and f"{new_prefix}.ln.weight" in target_state_dict:
+                if final_norm_weight is not None:
+                    converted[f"{new_prefix}.ln.weight"] = final_norm_weight
+                if final_norm_bias is not None:
+                    converted[f"{new_prefix}.ln.bias"] = final_norm_bias
+
+    for prefix in ("_reward", "_pi", "_termination"):
+        if f"{prefix}.1.weight" not in converted or f"{prefix}.0.ln.weight" in converted:
+            continue
+        for idx in range(16):
+            new_prefix = f"{prefix}.{idx}"
+            if f"{new_prefix}.weight" not in target_state_dict:
+                continue
+            old_linear = 3 * idx
+            old_norm = 3 * idx + 1
+            move_state_key(converted, target_state_dict, f"{prefix}.{old_linear}.weight", f"{new_prefix}.weight")
+            move_state_key(converted, target_state_dict, f"{prefix}.{old_linear}.bias", f"{new_prefix}.bias")
+            move_state_key(converted, target_state_dict, f"{prefix}.{old_norm}.weight", f"{new_prefix}.ln.weight")
+            move_state_key(converted, target_state_dict, f"{prefix}.{old_norm}.bias", f"{new_prefix}.ln.bias")
+
+    return converted
+
+
 def convert_tdmpc2_state_dict(target_state_dict: dict[str, Any], source_state_dict: dict[str, Any]) -> dict[str, Any]:
-    source_state_dict = dict(source_state_dict)
+    source_state_dict = convert_old_flat_mlp_state_dict(target_state_dict, source_state_dict)
     if "_detach_Qs_params.0.weight" not in source_state_dict:
         name_map = ["weight", "bias", "ln.weight", "ln.bias"]
         converted = dict(source_state_dict)
