@@ -1,4 +1,5 @@
 import atexit
+import json
 import pathlib
 import sys
 import warnings
@@ -18,12 +19,57 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 torch.set_float32_matmul_precision("high")
 
 
-def save_checkpoint(agent, logdir, name):
+def save_checkpoint(agent, logdir, name, update=None):
     items_to_save = {
         "agent_state_dict": agent.state_dict(),
         "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
     }
+    if update is not None:
+        items_to_save["update"] = int(update)
     torch.save(items_to_save, logdir / name)
+
+
+def latest_logged_update(logdir):
+    path = logdir / "metrics.jsonl"
+    if not path.exists():
+        return 0
+    latest = 0
+    with path.open("r") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "train/opt/updates" in row:
+                latest = max(latest, int(row["train/opt/updates"]))
+    return latest
+
+
+def maybe_resume_offline(agent, config, logdir):
+    if not bool(getattr(config.offline, "resume", False)):
+        return 0
+    checkpoint_path = logdir / str(getattr(config.offline, "resume_checkpoint", "latest.pt"))
+    if not checkpoint_path.exists():
+        print(f"Resume requested but checkpoint is missing: {checkpoint_path}. Starting from update 0.")
+        return 0
+
+    print(f"Resume offline training from: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=agent.device, weights_only=False)
+    try:
+        agent.load_state_dict(checkpoint["agent_state_dict"])
+        tools.recursively_load_optim_state_dict(agent, checkpoint.get("optims_state_dict", {}))
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Could not resume offline checkpoint. This usually means the checkpoint "
+            "was created with different model dimensions/config. Use the same model "
+            "config as the checkpoint or start a fresh logdir."
+        ) from exc
+    agent.clone_and_freeze()
+    update = int(checkpoint.get("update", 0)) or latest_logged_update(logdir)
+    print(f"Resumed at update {update}.")
+    return update
 
 
 def close_envs(envs):
@@ -90,6 +136,7 @@ def train_offline(config, logger, logdir):
 
     print("Create agent.")
     agent = Dreamer(config.model, replay.obs_space(), replay.act_space()).to(config.device)
+    start_update = maybe_resume_offline(agent, config, logdir)
 
     best_score = None
     train_metrics = {}
@@ -97,7 +144,12 @@ def train_offline(config, logger, logdir):
     eval_every = int(config.offline.eval_every)
     log_every = int(config.offline.log_every)
     save_every = int(config.offline.save_every)
-    for update in range(1, updates + 1):
+    if start_update >= updates:
+        print(f"Checkpoint is already at update {start_update}; target is {updates}. Nothing to train.")
+        save_checkpoint(agent, logdir, "latest.pt", update=start_update)
+        return
+
+    for update in range(start_update + 1, updates + 1):
         warmup_data, data = replay.sample()
         train_metrics = agent.update_offline(warmup_data, data)
 
@@ -109,7 +161,7 @@ def train_offline(config, logger, logdir):
             logger.write(update, fps=True)
 
         if eval_every and update % eval_every == 0:
-            save_checkpoint(agent, logdir, "latest.pt")
+            save_checkpoint(agent, logdir, "latest.pt", update=update)
             try:
                 score = evaluate_policy(agent, eval_envs, logger, update)
             except Exception as exc:
@@ -121,10 +173,10 @@ def train_offline(config, logger, logdir):
             else:
                 if score is not None and (best_score is None or score > best_score):
                     best_score = score
-                    save_checkpoint(agent, logdir, "best.pt")
+                    save_checkpoint(agent, logdir, "best.pt", update=update)
 
         if save_every and update % save_every == 0:
-            save_checkpoint(agent, logdir, "latest.pt")
+            save_checkpoint(agent, logdir, "latest.pt", update=update)
 
     if train_metrics:
         for name, value in train_metrics.items():
@@ -132,7 +184,7 @@ def train_offline(config, logger, logdir):
             logger.scalar(f"train/{name}", value)
         logger.scalar("train/opt/updates", updates)
         logger.write(updates, fps=True)
-    save_checkpoint(agent, logdir, "latest.pt")
+    save_checkpoint(agent, logdir, "latest.pt", update=updates)
     if int(config.offline.eval_episode_num) > 0:
         try:
             score = evaluate_policy(agent, eval_envs, logger, updates)
@@ -140,7 +192,7 @@ def train_offline(config, logger, logdir):
             print(f"Final evaluation failed: {type(exc).__name__}: {exc}")
             score = None
         if score is not None and (best_score is None or score > best_score):
-            save_checkpoint(agent, logdir, "best.pt")
+            save_checkpoint(agent, logdir, "best.pt", update=updates)
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="configs")
