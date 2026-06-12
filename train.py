@@ -26,6 +26,19 @@ def save_checkpoint(agent, logdir, name):
     torch.save(items_to_save, logdir / name)
 
 
+def close_envs(envs):
+    if envs is None:
+        return
+    close = getattr(envs, "close", None)
+    if callable(close):
+        close()
+        return
+    for env in getattr(envs, "envs", []):
+        close = getattr(env, "close", None)
+        if callable(close):
+            close()
+
+
 @torch.no_grad()
 def evaluate_policy(agent, eval_envs, logger, step):
     if eval_envs is None or eval_envs.env_num == 0:
@@ -65,7 +78,7 @@ def train_offline(config, logger, logdir):
 
     print("Create eval envs.")
     train_envs, eval_envs, _, _ = make_envs(config.env)
-    train_envs.close()
+    close_envs(train_envs)
 
     print("Create agent.")
     agent = Dreamer(config.model, replay.obs_space(), replay.act_space()).to(config.device)
