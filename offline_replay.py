@@ -80,6 +80,15 @@ class DMCExpertReplay:
     def act_space(self):
         low = np.asarray(self.root.attrs.get("action_min", [-1.0] * self.action_dim), dtype=np.float32)
         high = np.asarray(self.root.attrs.get("action_max", [1.0] * self.action_dim), dtype=np.float32)
+        if low.size == 1:
+            low = np.full((self.action_dim,), float(low.reshape(-1)[0]), dtype=np.float32)
+        if high.size == 1:
+            high = np.full((self.action_dim,), float(high.reshape(-1)[0]), dtype=np.float32)
+        if low.size != self.action_dim or high.size != self.action_dim:
+            raise ValueError(
+                f"Action bounds must be scalar or action_dim={self.action_dim}, "
+                f"got low={low.shape}, high={high.shape}."
+            )
         return gym.spaces.Box(low.reshape(-1), high.reshape(-1), dtype=np.float32)
 
     def sample(self):

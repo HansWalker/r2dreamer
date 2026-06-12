@@ -27,7 +27,7 @@ class Dreamer(nn.Module):
         self.horizon = int(config.horizon)
         self.lamb = float(config.lamb)
         self.return_ema = networks.ReturnEMA(device=self.device)
-        self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
+        self.act_dim = act_space.n if hasattr(act_space, "n") else math.prod(act_space.shape)
         self.rep_loss = str(config.rep_loss)
 
         # World model components
