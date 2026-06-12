@@ -4,14 +4,14 @@ output_dir: ${DMC_EXPERT_DATA_DIR}
 tasks:
   - walker/walk
 
-num_episodes: 100
+num_episodes: 500
 checkpoint_seed: 1
 seed: 1
 
 action_repeat: 2
-max_episode_steps: 500
+max_episode_steps: 1000
 
-save_images: false
+save_images: true
 image_size: 64
 
 resume: true
