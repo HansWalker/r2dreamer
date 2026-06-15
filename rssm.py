@@ -151,7 +151,7 @@ class Mamba3Deter(nn.Module):
         n_layers=1,
         d_state=32,
         expand=1,
-        headdim=128,
+        headdim=64,
         is_mimo=False,
         mimo_rank=1,
         chunk_size=16,
@@ -165,16 +165,29 @@ class Mamba3Deter(nn.Module):
             ) from _MAMBA3_IMPORT_ERROR
         if int(n_layers) != 1:
             raise ValueError("The first real-cache Mamba3 RSSM implementation supports n_layers=1 only.")
+        expand = int(expand)
+        headdim = int(headdim)
         d_state = int(d_state)
+        if expand <= 0 or headdim <= 0:
+            raise ValueError(
+                f"Mamba3 requires positive expand and headdim, got expand={expand}, headdim={headdim}."
+            )
         if d_state not in (32, 64, 128):
             raise ValueError(
                 f"Mamba3 step mode requires d_state in [32, 64, 128], got d_state={d_state}."
             )
-        inner = int(deter) * int(expand)
-        if inner % int(headdim) != 0:
+        inner = int(deter) * expand
+        if inner % headdim != 0:
             raise ValueError(
                 f"Mamba3 requires deter * expand to be divisible by headdim, "
                 f"got deter={deter}, expand={expand}, headdim={headdim}."
+            )
+        nheads = inner // headdim
+        if nheads % 4 != 0:
+            raise ValueError(
+                "Mamba3 step mode requires the number of heads to be divisible by 4, "
+                f"got nheads={nheads} from deter={deter}, expand={expand}, headdim={headdim}. "
+                "Use a smaller headdim or larger expand."
             )
         self.deter = int(deter)
         self._token = nn.Linear(int(stoch) + int(act_dim), self.deter, bias=True)
@@ -182,8 +195,8 @@ class Mamba3Deter(nn.Module):
             deter=self.deter,
             layer_idx=0,
             d_state=d_state,
-            expand=int(expand),
-            headdim=int(headdim),
+            expand=expand,
+            headdim=headdim,
             is_mimo=bool(is_mimo),
             mimo_rank=int(mimo_rank),
             chunk_size=max(1, int(chunk_size)),
@@ -262,7 +275,7 @@ class RSSM(nn.Module):
                 n_layers=_cfg_get(mcfg, "n_layers", 1),
                 d_state=_cfg_get(mcfg, "d_state", 32),
                 expand=_cfg_get(mcfg, "expand", 1),
-                headdim=_cfg_get(mcfg, "headdim", 128),
+                headdim=_cfg_get(mcfg, "headdim", 64),
                 is_mimo=_cfg_get(mcfg, "is_mimo", False),
                 mimo_rank=_cfg_get(mcfg, "mimo_rank", 1),
                 chunk_size=_cfg_get(mcfg, "chunk_size", 16),
