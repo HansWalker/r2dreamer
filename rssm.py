@@ -151,7 +151,7 @@ class Mamba3Deter(nn.Module):
         n_layers=1,
         d_state=32,
         expand=1,
-        headdim=32,
+        headdim=64,
         is_mimo=False,
         mimo_rank=1,
         chunk_size=16,
@@ -177,6 +177,11 @@ class Mamba3Deter(nn.Module):
         if expand <= 0 or headdim <= 0:
             raise ValueError(
                 f"Mamba3 requires positive expand and headdim, got expand={expand}, headdim={headdim}."
+            )
+        if headdim < 64 or headdim % 64 != 0:
+            raise ValueError(
+                f"Mamba3 step mode requires headdim to be a multiple of 64 because the official step kernel uses tile_D=64, "
+                f"got headdim={headdim}."
             )
         if d_state not in (32, 64, 128):
             raise ValueError(
@@ -300,8 +305,8 @@ class RSSM(nn.Module):
                 act_dim,
                 n_layers=_cfg_get(mcfg, "n_layers", 1),
                 d_state=_cfg_get(mcfg, "d_state", 32),
-                expand=_cfg_get(mcfg, "expand", 1),
-                headdim=_cfg_get(mcfg, "headdim", 32),
+                expand=_cfg_get(mcfg, "expand", 2),
+                headdim=_cfg_get(mcfg, "headdim", 64),
                 is_mimo=_cfg_get(mcfg, "is_mimo", False),
                 mimo_rank=_cfg_get(mcfg, "mimo_rank", 1),
                 chunk_size=_cfg_get(mcfg, "chunk_size", 16),
