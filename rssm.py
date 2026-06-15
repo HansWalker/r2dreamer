@@ -151,7 +151,7 @@ class Mamba3Deter(nn.Module):
         n_layers=1,
         d_state=32,
         expand=1,
-        headdim=64,
+        headdim=32,
         is_mimo=False,
         mimo_rank=1,
         chunk_size=16,
@@ -165,6 +165,12 @@ class Mamba3Deter(nn.Module):
             ) from _MAMBA3_IMPORT_ERROR
         if int(n_layers) != 1:
             raise ValueError("The first real-cache Mamba3 RSSM implementation supports n_layers=1 only.")
+        if bool(is_mimo):
+            raise ValueError("The first real-cache Mamba3 RSSM implementation supports is_mimo=False only.")
+        if int(mimo_rank) != 1:
+            raise ValueError("The first real-cache Mamba3 RSSM implementation supports mimo_rank=1 only.")
+        if bool(is_outproj_norm):
+            raise ValueError("The first real-cache Mamba3 RSSM implementation supports is_outproj_norm=False only.")
         expand = int(expand)
         headdim = int(headdim)
         d_state = int(d_state)
@@ -183,11 +189,24 @@ class Mamba3Deter(nn.Module):
                 f"got deter={deter}, expand={expand}, headdim={headdim}."
             )
         nheads = inner // headdim
-        if nheads % 4 != 0:
+        if nheads % 8 != 0:
             raise ValueError(
-                "Mamba3 step mode requires the number of heads to be divisible by 4, "
+                "Mamba3 step mode requires the number of heads to be divisible by 8, "
                 f"got nheads={nheads} from deter={deter}, expand={expand}, headdim={headdim}. "
                 "Use a smaller headdim or larger expand."
+            )
+        # Mamba3.step uses views into the in-projection output. The CUTLASS
+        # kernel requires the batch stride for the projected x view to be
+        # 8-aligned, which means the full in-projection width must be divisible
+        # by 8 for the current SISO settings.
+        num_rope_angles = (d_state // 2) // 2
+        in_proj_width = 2 * inner + 2 * d_state + 3 * nheads + num_rope_angles
+        if in_proj_width % 8 != 0:
+            raise ValueError(
+                "Mamba3 step mode requires the internal in_proj width to be divisible by 8, "
+                f"got width={in_proj_width} from deter={deter}, expand={expand}, "
+                f"d_state={d_state}, headdim={headdim}, nheads={nheads}. "
+                "Use a smaller headdim."
             )
         self.deter = int(deter)
         self._token = nn.Linear(int(stoch) + int(act_dim), self.deter, bias=True)
@@ -282,7 +301,7 @@ class RSSM(nn.Module):
                 n_layers=_cfg_get(mcfg, "n_layers", 1),
                 d_state=_cfg_get(mcfg, "d_state", 32),
                 expand=_cfg_get(mcfg, "expand", 1),
-                headdim=_cfg_get(mcfg, "headdim", 64),
+                headdim=_cfg_get(mcfg, "headdim", 32),
                 is_mimo=_cfg_get(mcfg, "is_mimo", False),
                 mimo_rank=_cfg_get(mcfg, "mimo_rank", 1),
                 chunk_size=_cfg_get(mcfg, "chunk_size", 16),

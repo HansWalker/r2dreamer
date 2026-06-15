@@ -17,7 +17,7 @@ rssm:
     n_layers: 1
     d_state: 32
     expand: 1
-    headdim: 64
+    headdim: 32
     is_mimo: False
     mimo_rank: 1
     chunk_size: 16
