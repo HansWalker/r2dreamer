@@ -148,7 +148,6 @@ class Mamba3Deter(nn.Module):
         deter,
         stoch,
         act_dim,
-        hidden,
         n_layers=1,
         d_state=16,
         expand=1,
@@ -173,7 +172,7 @@ class Mamba3Deter(nn.Module):
                 f"got deter={deter}, expand={expand}, headdim={headdim}."
             )
         self.deter = int(deter)
-        self._token = nn.Linear(self.deter + int(stoch) + int(act_dim), self.deter, bias=True)
+        self._token = nn.Linear(int(stoch) + int(act_dim), self.deter, bias=True)
         self.layer = Mamba3Layer(
             deter=self.deter,
             layer_idx=0,
@@ -189,19 +188,23 @@ class Mamba3Deter(nn.Module):
     def initial_context(self, batch_size, device=None, dtype=None):
         return self.layer.initial_context(batch_size, device=device, dtype=dtype)
 
-    def forward(self, stoch, deter, action, angle_state=None, ssm_state=None, k_state=None, v_state=None):
-        # (B, S, K), (B, D), (B, A), optional official Mamba3 cache tensors
+    def _norm_action(self, action):
+        action = action / torch.clip(torch.abs(action), min=1.0).detach()
+        return action
+
+    def forward(self, stoch, action, angle_state=None, ssm_state=None, k_state=None, v_state=None):
+        # (B, S, K), (B, A), optional official Mamba3 cache tensors
         B = action.shape[0]
         if angle_state is None or ssm_state is None or k_state is None or v_state is None:
-            angle_state, ssm_state, k_state, v_state = self.initial_context(B, device=deter.device)
+            angle_state, ssm_state, k_state, v_state = self.initial_context(B, device=stoch.device)
         else:
-            angle_state = angle_state.to(device=deter.device)
-            ssm_state = ssm_state.to(device=deter.device)
-            k_state = k_state.to(device=deter.device)
-            v_state = v_state.to(device=deter.device)
+            angle_state = angle_state.to(device=stoch.device)
+            ssm_state = ssm_state.to(device=stoch.device)
+            k_state = k_state.to(device=stoch.device)
+            v_state = v_state.to(device=stoch.device)
         stoch = stoch.reshape(B, -1)
-        action = action / torch.clip(torch.abs(action), min=1.0).detach()
-        token = self._token(torch.cat([deter, stoch, action], dim=-1))
+        action = self._norm_action(action)
+        token = self._token(torch.cat([stoch, action], dim=-1))
         deter, angle_state, ssm_state, k_state, v_state = self.layer.step(
             token,
             angle_state,
@@ -251,7 +254,6 @@ class RSSM(nn.Module):
                 self._deter,
                 self.flat_stoch,
                 act_dim,
-                self._hidden,
                 n_layers=_cfg_get(mcfg, "n_layers", 1),
                 d_state=_cfg_get(mcfg, "d_state", 16),
                 expand=_cfg_get(mcfg, "expand", 1),
@@ -404,7 +406,7 @@ class RSSM(nn.Module):
         # Deterministic transition then posterior logits conditioned on embed.
         # (B, D)
         if self.uses_context:
-            deter, *cache = self._deter_net(stoch, deter, prev_action, *cache)
+            deter, *cache = self._deter_net(stoch, prev_action, *cache)
             cache = tuple(cache)
         else:
             deter = self._deter_net(stoch, deter, prev_action)
@@ -439,7 +441,7 @@ class RSSM(nn.Module):
                 stoch.shape[0],
                 deter.device,
             )
-            deter, *cache = self._deter_net(stoch, deter, prev_action, *cache)
+            deter, *cache = self._deter_net(stoch, prev_action, *cache)
             cache = tuple(cache)
         else:
             deter = self._deter_net(stoch, deter, prev_action)

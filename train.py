@@ -97,29 +97,31 @@ def evaluate_policy(agent, eval_envs, logger, step):
         return None
     print("Evaluating the offline-trained policy...")
     agent.eval()
-    done = torch.ones(eval_envs.env_num, dtype=torch.bool, device=agent.device)
-    once_done = torch.zeros(eval_envs.env_num, dtype=torch.bool, device=agent.device)
-    steps = torch.zeros(eval_envs.env_num, dtype=torch.int32, device=agent.device)
-    returns = torch.zeros(eval_envs.env_num, dtype=torch.float32, device=agent.device)
-    agent_state = agent.get_initial_state(eval_envs.env_num)
-    act = agent_state["prev_action"].clone()
-    while not once_done.all():
-        steps += ~done * ~once_done
-        trans, step_done = eval_envs.step(act.detach(), done)
-        trans = trans.to(agent.device, non_blocking=True)
-        done = step_done.to(agent.device)
-        act, agent_state = agent.act(trans, agent_state, eval=True)
-        if not torch.isfinite(act).all():
-            raise RuntimeError("Policy produced non-finite actions during evaluation.")
-        act = torch.clamp(act, -1.0, 1.0)
-        returns += trans["reward"][:, 0] * ~once_done
-        once_done |= done
-    score = returns.mean()
-    logger.scalar("episode/eval_score", score)
-    logger.scalar("episode/eval_length", steps.to(torch.float32).mean())
-    logger.write(step)
-    agent.train()
-    return float(score)
+    try:
+        done = torch.ones(eval_envs.env_num, dtype=torch.bool, device=agent.device)
+        once_done = torch.zeros(eval_envs.env_num, dtype=torch.bool, device=agent.device)
+        steps = torch.zeros(eval_envs.env_num, dtype=torch.int32, device=agent.device)
+        returns = torch.zeros(eval_envs.env_num, dtype=torch.float32, device=agent.device)
+        agent_state = agent.get_initial_state(eval_envs.env_num)
+        act = agent_state["prev_action"].clone()
+        while not once_done.all():
+            steps += ~done * ~once_done
+            trans, step_done = eval_envs.step(act.detach(), done)
+            trans = trans.to(agent.device, non_blocking=True)
+            done = step_done.to(agent.device)
+            act, agent_state = agent.act(trans, agent_state, eval=True)
+            if not torch.isfinite(act).all():
+                raise RuntimeError("Policy produced non-finite actions during evaluation.")
+            act = torch.clamp(act, -1.0, 1.0)
+            returns += trans["reward"][:, 0] * ~once_done
+            once_done |= done
+        score = returns.mean()
+        logger.scalar("episode/eval_score", score)
+        logger.scalar("episode/eval_length", steps.to(torch.float32).mean())
+        logger.write(step)
+        return float(score)
+    finally:
+        agent.train()
 
 
 def train_offline(config, logger, logdir):
@@ -147,8 +149,10 @@ def train_offline(config, logger, logdir):
     if start_update >= updates:
         print(f"Checkpoint is already at update {start_update}; target is {updates}. Nothing to train.")
         save_checkpoint(agent, logdir, "latest.pt", update=start_update)
+        close_envs(eval_envs)
         return
 
+    last_eval_success_update = None
     for update in range(start_update + 1, updates + 1):
         warmup_data, data = replay.sample()
         train_metrics = agent.update_offline(warmup_data, data)
@@ -171,6 +175,7 @@ def train_offline(config, logger, logdir):
                 close_envs(eval_envs)
                 eval_envs = make_eval_envs(config) if int(config.offline.eval_episode_num) > 0 else None
             else:
+                last_eval_success_update = update
                 if score is not None and (best_score is None or score > best_score):
                     best_score = score
                     save_checkpoint(agent, logdir, "best.pt", update=update)
@@ -185,7 +190,8 @@ def train_offline(config, logger, logdir):
         logger.scalar("train/opt/updates", updates)
         logger.write(updates, fps=True)
     save_checkpoint(agent, logdir, "latest.pt", update=updates)
-    if int(config.offline.eval_episode_num) > 0:
+    should_final_eval = int(config.offline.eval_episode_num) > 0 and last_eval_success_update != updates
+    if should_final_eval:
         try:
             score = evaluate_policy(agent, eval_envs, logger, updates)
         except Exception as exc:
@@ -193,6 +199,7 @@ def train_offline(config, logger, logdir):
             score = None
         if score is not None and (best_score is None or score > best_score):
             save_checkpoint(agent, logdir, "best.pt", update=updates)
+    close_envs(eval_envs)
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="configs")

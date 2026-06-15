@@ -60,6 +60,7 @@ def load_config(path: Path) -> argparse.Namespace:
         "image_size": 64,
         "save_images": True,
         "resume": False,
+        "progress_every": 25,
     }
     with path.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
@@ -549,6 +550,10 @@ def collect_task(args: argparse.Namespace, task: TaskSpec, checkpoint_path: Path
 
     completed = int(root["episode_length"].shape[0])
     returns = []
+    print(
+        f"Collecting {task.dmc_name}: {completed}/{args.num_episodes} episodes already present, "
+        f"writing to {store_path}"
+    )
     for episode_idx in range(completed, args.num_episodes):
         episode, episode_return = collect_episode(
             raw_env,
@@ -562,10 +567,21 @@ def collect_task(args: argparse.Namespace, task: TaskSpec, checkpoint_path: Path
         )
         append_episode(root, episode)
         returns.append(float(episode_return))
-        print(
-            f"{task.dmc_name} episode {episode_idx + 1}/{args.num_episodes}: "
-            f"return={episode_return:.3f}"
+        episode_num = episode_idx + 1
+        progress_every = max(int(args.progress_every), 1)
+        should_log = (
+            episode_num == completed + 1
+            or episode_num == args.num_episodes
+            or episode_num % progress_every == 0
         )
+        if should_log:
+            recent = returns[-progress_every:]
+            recent_mean = float(np.mean(recent)) if recent else float("nan")
+            print(
+                f"{task.dmc_name} {episode_num}/{args.num_episodes}: "
+                f"last_return={episode_return:.3f}, recent_mean={recent_mean:.3f}, "
+                f"rows={int(root['obs'].shape[0])}"
+            )
 
     return {
         "domain_name": task.domain,
