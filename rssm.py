@@ -149,7 +149,7 @@ class Mamba3Deter(nn.Module):
         stoch,
         act_dim,
         n_layers=1,
-        d_state=16,
+        d_state=32,
         expand=1,
         headdim=128,
         is_mimo=False,
@@ -165,6 +165,11 @@ class Mamba3Deter(nn.Module):
             ) from _MAMBA3_IMPORT_ERROR
         if int(n_layers) != 1:
             raise ValueError("The first real-cache Mamba3 RSSM implementation supports n_layers=1 only.")
+        d_state = int(d_state)
+        if d_state not in (32, 64, 128):
+            raise ValueError(
+                f"Mamba3 step mode requires d_state in [32, 64, 128], got d_state={d_state}."
+            )
         inner = int(deter) * int(expand)
         if inner % int(headdim) != 0:
             raise ValueError(
@@ -176,7 +181,7 @@ class Mamba3Deter(nn.Module):
         self.layer = Mamba3Layer(
             deter=self.deter,
             layer_idx=0,
-            d_state=int(d_state),
+            d_state=d_state,
             expand=int(expand),
             headdim=int(headdim),
             is_mimo=bool(is_mimo),
@@ -255,7 +260,7 @@ class RSSM(nn.Module):
                 self.flat_stoch,
                 act_dim,
                 n_layers=_cfg_get(mcfg, "n_layers", 1),
-                d_state=_cfg_get(mcfg, "d_state", 16),
+                d_state=_cfg_get(mcfg, "d_state", 32),
                 expand=_cfg_get(mcfg, "expand", 1),
                 headdim=_cfg_get(mcfg, "headdim", 128),
                 is_mimo=_cfg_get(mcfg, "is_mimo", False),

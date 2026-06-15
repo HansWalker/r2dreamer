@@ -15,7 +15,7 @@ rssm:
   warmup: 0
   mamba3:
     n_layers: 1
-    d_state: 16
+    d_state: 32
     expand: 1
     headdim: 128
     is_mimo: False
