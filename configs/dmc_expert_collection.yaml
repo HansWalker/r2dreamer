@@ -21,11 +21,5 @@ tasks:
     difficulty: easy
   - task: walker/walk
     difficulty: medium
-  - task: cheetah/run
-    difficulty: medium
-  - task: quadruped/run
-    difficulty: hard
-  - task: humanoid/walk
-    difficulty: hard
   - task: humanoid/run
     difficulty: hard
