@@ -18,7 +18,7 @@ expert:
 refresh_seconds: 10
 recent_log_lines: 25
 progress_every: 25
-start_from_scratch: true
+start_from_scratch: false
 
 tasks:
   - task: cartpole/swingup
