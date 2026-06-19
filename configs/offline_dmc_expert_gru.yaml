@@ -1,0 +1,39 @@
+defaults:
+  - env: dmc_proprio
+  - model: size_small_gru
+  - override hydra/job_logging: disabled
+  - _self_
+
+logdir: logdir/offline_dmc_expert/gru/${now:%Y-%m-%d}/${now:%H-%M-%S}
+seed: 0
+deterministic_run: False
+device: "cuda:0"
+
+hydra:
+  run:
+    dir: ${logdir}
+
+batch_size: 16
+batch_length: 64
+
+env:
+  task: dmc_walker_walk
+  env_num: 1
+  eval_episode_num: ${offline.eval_episode_num}
+  action_repeat: 2
+  time_limit: 1000
+
+offline:
+  data_path: ${oc.env:DMC_EXPERT_DATA_DIR,data/dmc_expert}/walker_walk/walker_walk.zarr
+  device: ${device}
+  seed: ${seed}
+  batch_size: ${batch_size}
+  batch_length: ${batch_length}
+  warmup_length: 32
+  updates: 2000
+  eval_every: 1000
+  eval_episode_num: 2
+  log_every: 100
+  save_every: 500
+  resume: true
+  resume_checkpoint: latest.pt

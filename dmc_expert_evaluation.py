@@ -41,12 +41,12 @@ def default_evaluation_runs(workdir: Path):
     return [
         {
             "name": "gru",
-            "model": "size_small_gru",
+            "config_name": "offline_dmc_expert_gru",
             "logdir": newest_run(workdir, "offline_size_small_gru_walker_walk_fresh_*"),
         },
         {
             "name": "mamba3",
-            "model": "size_small_mamba3",
+            "config_name": "offline_dmc_expert_mamba3",
             "logdir": newest_run(workdir, "offline_size_small_mamba3_*walker_walk_fresh_*"),
         },
     ]
@@ -56,8 +56,8 @@ def evaluate_training_run(
     run: dict,
     *,
     r2dreamer_dir: Path,
-    train_store: Path,
-    env_task: str = "dmc_walker_walk",
+    train_store: Path | None = None,
+    env_task: str | None = None,
     eval_episodes: int = 5,
     checkpoint_name: str = "best.pt",
 ):
@@ -89,14 +89,15 @@ def evaluate_training_run(
         }
 
     overrides = [
-        f"model={run['model']}",
-        f"offline.data_path={Path(train_store)}",
-        f"env.task={env_task}",
         f"offline.eval_episode_num={int(eval_episodes)}",
         f"logdir={logdir}",
     ]
+    if train_store is not None:
+        overrides.append(f"offline.data_path={Path(train_store)}")
+    if env_task is not None:
+        overrides.append(f"env.task={env_task}")
     with initialize_config_dir(config_dir=str(r2dreamer_dir / "configs"), version_base=None):
-        cfg = compose(config_name="offline_dmc_expert", overrides=overrides)
+        cfg = compose(config_name=run["config_name"], overrides=overrides)
 
     replay = DMCExpertReplay(cfg.offline)
     agent = Dreamer(cfg.model, replay.obs_space(), replay.act_space()).to(cfg.device)
