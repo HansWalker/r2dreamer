@@ -38,18 +38,27 @@ def newest_run(workdir: Path, pattern: str):
 
 
 def default_evaluation_runs(workdir: Path):
-    return [
-        {
-            "name": "gru",
-            "config_name": "offline_dmc_expert_gru",
-            "logdir": newest_run(workdir, "offline_size_small_gru_walker_walk_fresh_*"),
-        },
-        {
-            "name": "mamba3",
-            "config_name": "offline_dmc_expert_mamba3",
-            "logdir": newest_run(workdir, "offline_size_small_mamba3_*walker_walk_fresh_*"),
-        },
-    ]
+    from dmc_expert_training import DMC_EXPERT_MODELS, DMC_EXPERT_SCENARIOS
+
+    data_dir = Path(workdir) / "data" / "dmc_expert"
+    runs = []
+    for scenario in DMC_EXPERT_SCENARIOS:
+        for model in DMC_EXPERT_MODELS:
+            runs.append(
+                {
+                    "name": f"{scenario['name']}_{model['name']}",
+                    "scenario": scenario["name"],
+                    "model": model["name"],
+                    "config_name": model["config_name"],
+                    "data_path": data_dir / scenario["data_rel"],
+                    "env_task": scenario["env_task"],
+                    "logdir": newest_run(
+                        workdir,
+                        f"offline_{scenario['name']}_{model['name']}_fresh_*",
+                    ),
+                }
+            )
+    return runs
 
 
 def evaluate_training_run(
@@ -75,6 +84,8 @@ def evaluate_training_run(
     import tools
 
     logdir = Path(run["logdir"])
+    train_store = train_store if train_store is not None else run.get("data_path")
+    env_task = env_task if env_task is not None else run.get("env_task")
     checkpoint_path = logdir / checkpoint_name
     if not checkpoint_path.exists():
         checkpoint_path = logdir / "latest.pt"

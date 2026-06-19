@@ -26,30 +26,57 @@ CORE_LOG_KEYS = {
 }
 
 
-def make_training_run(workdir: Path, *, name: str, config_name: str, logdir_name: str):
+DMC_EXPERT_SCENARIOS = [
+    {
+        "name": "cartpole",
+        "env_task": "dmc_cartpole_swingup",
+        "data_rel": "cartpole_swingup/cartpole_swingup.zarr",
+    },
+    {
+        "name": "walker",
+        "env_task": "dmc_walker_walk",
+        "data_rel": "walker_walk/walker_walk.zarr",
+    },
+    {
+        "name": "humanoid",
+        "env_task": "dmc_humanoid_run",
+        "data_rel": "humanoid_run/humanoid_run.zarr",
+    },
+]
+
+DMC_EXPERT_MODELS = [
+    {"name": "gru", "config_name": "offline_dmc_expert_gru"},
+    {"name": "mamba3", "config_name": "offline_dmc_expert_mamba3"},
+]
+
+
+def make_training_run(workdir: Path, *, scenario: dict, model: dict, logdir_name: str):
+    data_dir = Path(workdir) / "data" / "dmc_expert"
     return {
-        "name": name,
-        "config_name": config_name,
+        "name": f"{scenario['name']}_{model['name']}",
+        "scenario": scenario["name"],
+        "model": model["name"],
+        "config_name": model["config_name"],
+        "data_path": data_dir / scenario["data_rel"],
+        "env_task": scenario["env_task"],
         "logdir": Path(workdir) / "runs" / logdir_name,
     }
 
 
 def default_training_runs(workdir: Path, run_tag: str | None = None):
     run_tag = run_tag or time.strftime("%Y%m%d_%H%M%S")
-    return [
-        make_training_run(
-            workdir,
-            name="gru",
-            config_name="offline_dmc_expert_gru",
-            logdir_name=f"offline_size_small_gru_walker_walk_fresh_{run_tag}",
-        ),
-        make_training_run(
-            workdir,
-            name="mamba3",
-            config_name="offline_dmc_expert_mamba3",
-            logdir_name=f"offline_size_small_mamba3_dstate32_expand2_headdim64_walker_walk_fresh_{run_tag}",
-        ),
-    ]
+    runs = []
+    for scenario in DMC_EXPERT_SCENARIOS:
+        for model in DMC_EXPERT_MODELS:
+            runs.append(
+                make_training_run(
+                    workdir,
+                    scenario=scenario,
+                    model=model,
+                    logdir_name=f"offline_{scenario['name']}_{model['name']}_fresh_{run_tag}",
+                )
+            )
+    return runs
 
 
 def read_new_log_lines(log_path: Path, offset: int):
@@ -115,6 +142,9 @@ def start_training_run(
     resume: bool = False,
     extra_overrides=None,
 ):
+    train_store = train_store if train_store is not None else run.get("data_path")
+    env_task = env_task if env_task is not None else run.get("env_task")
+
     logdir = Path(run["logdir"])
     logdir.mkdir(parents=True, exist_ok=True)
     stdout_log = logdir / "notebook_stdout.log"
