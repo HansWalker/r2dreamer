@@ -24,7 +24,7 @@ env:
   time_limit: 1000
 
 offline:
-  data_path: ${oc.env:DMC_EXPERT_DATA_DIR,data/dmc_expert}/walker_walk.zarr
+  data_path: ${oc.env:DMC_EXPERT_DATA_DIR,data/dmc_expert}/walker_walk/walker_walk.zarr
   device: ${device}
   seed: ${seed}
   batch_size: ${batch_size}

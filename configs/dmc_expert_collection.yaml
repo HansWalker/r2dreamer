@@ -1,0 +1,31 @@
+tdmpc2_root: ${TDMPC2_DIR}
+output_dir: ${DMC_EXPERT_DATA_DIR}
+
+num_episodes: 2000
+checkpoint_seed: 1
+seed: 1
+
+action_repeat: 2
+max_episode_steps: 500
+
+save_images: true
+image_size: 64
+
+refresh_seconds: 10
+recent_log_lines: 25
+progress_every: 25
+start_from_scratch: true
+
+tasks:
+  - task: cartpole/swingup
+    difficulty: easy
+  - task: walker/walk
+    difficulty: medium
+  - task: cheetah/run
+    difficulty: medium
+  - task: quadruped/run
+    difficulty: hard
+  - task: humanoid/walk
+    difficulty: hard
+  - task: humanoid/run
+    difficulty: hard
