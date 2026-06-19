@@ -2,6 +2,13 @@ import torch
 
 import tools
 
+MAMBA_CACHE_KEYS = (
+    "mamba_angle_state",
+    "mamba_ssm_state",
+    "mamba_k_state",
+    "mamba_v_state",
+)
+
 
 class OnlineTrainer:
     def __init__(self, config, replay_buffer, logger, logdir, train_envs, eval_envs):
@@ -90,7 +97,7 @@ class OnlineTrainer:
                 tools.to_np(
                     agent.video_pred(
                         cache[:1],  # give only first batch
-                        (initial["stoch"], initial["deter"]),
+                        initial,
                     )
                 ),
             )
@@ -161,6 +168,9 @@ class OnlineTrainer:
             trans["action"] = act * ~done.unsqueeze(-1)
             trans["stoch"] = agent_state["stoch"]
             trans["deter"] = agent_state["deter"]
+            for key in MAMBA_CACHE_KEYS:
+                if key in agent_state.keys():
+                    trans[key] = agent_state[key]
             trans["episode"] = episode_ids  # Don't lift dim
             if "image" in trans:
                 video_cache.append(trans["image"][0])

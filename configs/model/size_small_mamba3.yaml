@@ -1,0 +1,24 @@
+defaults:
+  - _base_
+
+deter: 256
+hidden: 80
+discrete: 8
+depth: 8
+units: 80
+act: 'SiLU'
+norm: True
+compile: False
+
+rssm:
+  core: mamba3
+  warmup: 0
+  mamba3:
+    n_layers: 1
+    d_state: 32
+    expand: 2
+    headdim: 64
+    is_mimo: False
+    mimo_rank: 1
+    chunk_size: 16
+    is_outproj_norm: False

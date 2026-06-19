@@ -52,6 +52,8 @@ dreamer_pro:
     bilinear: True
 
 rssm:
+  core: block_gru
+  warmup: 0
   stoch: 32
   deter: ${model.deter}
   hidden: ${model.hidden}
@@ -65,6 +67,15 @@ rssm:
   unimix_ratio: 0.01
   initial: 'learned'
   device: ${device}
+  mamba3:
+    n_layers: 1
+    d_state: 32
+    expand: 1
+    headdim: 64
+    is_mimo: False
+    mimo_rank: 1
+    chunk_size: 16
+    is_outproj_norm: False
 
 encoder:
   mlp_keys: ${env.encoder.mlp_keys}

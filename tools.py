@@ -154,6 +154,20 @@ class CudaBenchmark:
 
 
 class Logger:
+    CONSOLE_SCALARS = (
+        "train/opt/loss",
+        "train/loss/dyn",
+        "train/loss/rep",
+        "train/loss/barlow",
+        "train/loss/rew",
+        "train/loss/con",
+        "train/loss/policy",
+        "train/loss/value",
+        "train/ret_replay_mean",
+        "episode/eval_score",
+        "fps/fps",
+    )
+
     def __init__(self, logdir, filename="metrics.jsonl"):
         self._logdir = logdir
         self._filename = filename
@@ -181,7 +195,8 @@ class Logger:
         scalars = list(self._scalars.items())
         if fps:
             scalars.append(("fps/fps", self._compute_fps(step)))
-        print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
+        console_scalars = [(k, v) for k, v in scalars if k in self.CONSOLE_SCALARS]
+        print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in console_scalars))
         with (self._logdir / self._filename).open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
         for name, value in scalars:

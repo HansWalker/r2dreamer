@@ -10,6 +10,7 @@ seed: ${seed}
 device: ${device}
 
 size: [64, 64]
+render_image: False
 encoder:
   mlp_keys: '.*'
   cnn_keys: '$^'

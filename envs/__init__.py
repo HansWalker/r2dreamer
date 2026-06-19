@@ -57,7 +57,13 @@ def make_env(config, id):
     if suite == "dmc":
         import envs.dmc as dmc
 
-        env = dmc.DeepMindControl(task, config.action_repeat, config.size, seed=config.seed + id)
+        env = dmc.DeepMindControl(
+            task,
+            config.action_repeat,
+            config.size,
+            seed=config.seed + id,
+            render_image=getattr(config, "render_image", True),
+        )
         env = wrappers.NormalizeActions(env)
     elif suite == "atari":
         import envs.atari as atari
