@@ -28,26 +28,32 @@ def load_collection_config(path: Path, *, tdmpc2_dir: Path | None = None, data_d
     defaults = {
         "tdmpc2_root": str(tdmpc2_dir) if tdmpc2_dir is not None else "${TDMPC2_DIR}",
         "output_dir": str(data_dir) if data_dir is not None else "${DMC_EXPERT_DATA_DIR}",
+        "local_output_dir": "/content/dmc_expert",
         "num_episodes": 2000,
         "checkpoint_seed": 1,
         "seed": 1,
         "action_repeat": 2,
         "max_episode_steps": 500,
-        "save_images": True,
+        "save_images": False,
         "image_size": 64,
         "refresh_seconds": 10,
         "recent_log_lines": 25,
         "progress_every": 25,
         "start_from_scratch": True,
         "tasks": [],
+        "expert": {
+            "mpc": False,
+        },
     }
     with path.open("r", encoding="utf-8") as f:
         loaded = yaml.safe_load(f) or {}
     cfg = {**defaults, **loaded}
+    cfg["expert"] = {**defaults["expert"], **(loaded.get("expert") or {})}
     cfg = expand_value(cfg)
     cfg["config_path"] = path
     cfg["tdmpc2_root"] = Path(cfg["tdmpc2_root"])
     cfg["output_dir"] = Path(cfg["output_dir"])
+    cfg["local_output_dir"] = Path(cfg["local_output_dir"]) if cfg.get("local_output_dir") else None
     return cfg
 
 
@@ -87,12 +93,14 @@ def read_new_log_lines(log_path: Path, offset: int):
 def prepare_collection_run(config: dict, task_item: dict | str, *, r2dreamer_dir: Path):
     task = task_item["task"] if isinstance(task_item, dict) else str(task_item)
     difficulty = task_item.get("difficulty", "-") if isinstance(task_item, dict) else "-"
-    out_dir = Path(config["output_dir"]) / scenario_name(task)
+    run_root = Path(config.get("local_output_dir") or config["output_dir"])
+    out_dir = run_root / scenario_name(task)
+    final_dir = Path(config["output_dir"]) / scenario_name(task)
 
-    if bool(config.get("start_from_scratch", False)) and out_dir.exists():
-        if out_dir.parent != Path(config["output_dir"]):
-            raise RuntimeError(f"Refusing to delete unexpected output directory: {out_dir}")
-        shutil.rmtree(out_dir)
+    if bool(config.get("start_from_scratch", False)):
+        for path in (out_dir, final_dir):
+            if path.exists():
+                shutil.rmtree(path)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     config_path = out_dir / "collect_config.yaml"
@@ -119,6 +127,9 @@ def prepare_collection_run(config: dict, task_item: dict | str, *, r2dreamer_dir
                 "resume: false",
                 f"progress_every: {int(config['progress_every'])}",
                 "",
+                "expert:",
+                f"  mpc: {str(bool(config.get('expert', {}).get('mpc', False))).lower()}",
+                "",
             ]
         ),
         encoding="utf-8",
@@ -128,6 +139,7 @@ def prepare_collection_run(config: dict, task_item: dict | str, *, r2dreamer_dir
         "task": task,
         "difficulty": difficulty,
         "out_dir": out_dir,
+        "final_dir": final_dir,
         "config_path": config_path,
         "log_path": log_path,
         "collector": Path(r2dreamer_dir) / "scripts" / "collect_dmc_expert_data.py",
@@ -146,3 +158,15 @@ def start_collection_run(run: dict):
         env=env,
     )
     return proc, log_file
+
+
+def sync_collection_run(run: dict):
+    out_dir = Path(run["out_dir"])
+    final_dir = Path(run["final_dir"])
+    if out_dir.resolve() == final_dir.resolve():
+        return final_dir
+    if final_dir.exists():
+        shutil.rmtree(final_dir)
+    final_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(out_dir, final_dir)
+    return final_dir

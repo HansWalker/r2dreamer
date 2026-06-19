@@ -1,5 +1,6 @@
 tdmpc2_root: ${TDMPC2_DIR}
 output_dir: ${DMC_EXPERT_DATA_DIR}
+local_output_dir: /content/dmc_expert
 
 num_episodes: 2000
 checkpoint_seed: 1
@@ -8,8 +9,11 @@ seed: 1
 action_repeat: 2
 max_episode_steps: 500
 
-save_images: true
+save_images: false
 image_size: 64
+
+expert:
+  mpc: false
 
 refresh_seconds: 10
 recent_log_lines: 25

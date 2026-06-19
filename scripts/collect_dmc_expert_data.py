@@ -61,10 +61,14 @@ def load_config(path: Path) -> argparse.Namespace:
         "save_images": True,
         "resume": False,
         "progress_every": 25,
+        "expert": {
+            "mpc": False,
+        },
     }
     with path.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
     config = {**defaults, **config}
+    config["expert"] = {**defaults["expert"], **(config.get("expert") or {})}
     config = {key: expand_config_value(value) for key, value in config.items()}
 
     if config["tdmpc2_root"] is None:
@@ -165,6 +169,7 @@ def make_tdmpc2_cfg(
     action_dim: int,
     seed: int,
     max_episode_steps: int,
+    expert: dict[str, Any] | None = None,
 ):
     from common import MODEL_SIZE, TASK_SET
     from common.parser import cfg_to_dataclass
@@ -196,6 +201,10 @@ def make_tdmpc2_cfg(
     cfg.obs_shapes = None
     cfg.action_dims = None
     cfg.episode_lengths = None
+
+    expert = expert or {}
+    if "mpc" in expert:
+        cfg.mpc = bool(expert["mpc"])
     return cfg_to_dataclass(cfg)
 
 
@@ -332,6 +341,7 @@ def load_agent(
     action_dim: int,
     seed: int,
     max_episode_steps: int,
+    expert: dict[str, Any] | None = None,
 ):
     config_path = add_tdmpc2_to_path(tdmpc2_root)
     cfg = make_tdmpc2_cfg(
@@ -341,6 +351,7 @@ def load_agent(
         action_dim=action_dim,
         seed=seed,
         max_episode_steps=max_episode_steps,
+        expert=expert,
     )
 
     from tdmpc2 import TDMPC2
@@ -530,6 +541,7 @@ def collect_task(args: argparse.Namespace, task: TaskSpec, checkpoint_path: Path
         action_dim=action_dim,
         seed=args.seed,
         max_episode_steps=args.max_episode_steps,
+        expert=args.expert,
     )
 
     store_path = args.output_dir / f"{task.zarr_name}.zarr"
