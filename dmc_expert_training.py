@@ -2,35 +2,9 @@
 
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
-
-
-CORE_LOG_KEYS = {
-    "train/opt/loss",
-    "train/loss/dyn",
-    "train/loss/rep",
-    "train/loss/barlow",
-    "train/loss/rew",
-    "train/loss/con",
-    "train/loss/policy",
-    "train/loss/value",
-    "train/ret_replay_mean",
-    "episode/eval_score",
-    "fps/fps",
-}
-
-
-def read_new_log_lines(log_path, offset):
-    if not Path(log_path).exists():
-        return offset, []
-    with Path(log_path).open("r", encoding="utf-8", errors="replace") as f:
-        f.seek(offset)
-        lines = f.readlines()
-        offset = f.tell()
-    return offset, lines
 
 
 def fmt_metric(value):
@@ -40,19 +14,6 @@ def fmt_metric(value):
         return f"{float(value):.3g}"
     except Exception:
         return str(value)
-
-
-def compact_log_line(line):
-    match = re.match(r"^(\[\d+\])\s+(.*)$", line)
-    if not match or " / " not in line:
-        return line
-    step, body = match.groups()
-    kept = []
-    for item in body.split(" / "):
-        parts = item.rsplit(" ", 1)
-        if len(parts) == 2 and parts[0] in CORE_LOG_KEYS:
-            kept.append(item)
-    return f"{step} " + " / ".join(kept) if kept else line
 
 
 def read_metric_summary(logdir):
