@@ -1,13 +1,10 @@
-"""Single-run notebook helpers for offline DMC expert training."""
-
-from __future__ import annotations
+"""Helpers for launching one offline DMC expert training job."""
 
 import json
 import os
 import re
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 
@@ -26,60 +23,7 @@ CORE_LOG_KEYS = {
 }
 
 
-DMC_EXPERT_SCENARIOS = [
-    {
-        "name": "cartpole",
-        "env_task": "dmc_cartpole_swingup",
-        "data_rel": "cartpole_swingup/cartpole_swingup.zarr",
-    },
-    {
-        "name": "walker",
-        "env_task": "dmc_walker_walk",
-        "data_rel": "walker_walk/walker_walk.zarr",
-    },
-    {
-        "name": "humanoid",
-        "env_task": "dmc_humanoid_run",
-        "data_rel": "humanoid_run/humanoid_run.zarr",
-    },
-]
-
-DMC_EXPERT_MODELS = [
-    {"name": "gru", "config_name": "offline_dmc_expert_gru"},
-    {"name": "mamba3", "config_name": "offline_dmc_expert_mamba3"},
-]
-
-
-def make_training_run(workdir: Path, *, scenario: dict, model: dict, logdir_name: str):
-    data_dir = Path(workdir) / "data" / "dmc_expert"
-    return {
-        "name": f"{scenario['name']}_{model['name']}",
-        "scenario": scenario["name"],
-        "model": model["name"],
-        "config_name": model["config_name"],
-        "data_path": data_dir / scenario["data_rel"],
-        "env_task": scenario["env_task"],
-        "logdir": Path(workdir) / "runs" / logdir_name,
-    }
-
-
-def default_training_runs(workdir: Path, run_tag: str | None = None):
-    run_tag = run_tag or time.strftime("%Y%m%d_%H%M%S")
-    runs = []
-    for scenario in DMC_EXPERT_SCENARIOS:
-        for model in DMC_EXPERT_MODELS:
-            runs.append(
-                make_training_run(
-                    workdir,
-                    scenario=scenario,
-                    model=model,
-                    logdir_name=f"offline_{scenario['name']}_{model['name']}_fresh_{run_tag}",
-                )
-            )
-    return runs
-
-
-def read_new_log_lines(log_path: Path, offset: int):
+def read_new_log_lines(log_path, offset):
     if not Path(log_path).exists():
         return offset, []
     with Path(log_path).open("r", encoding="utf-8", errors="replace") as f:
@@ -98,7 +42,7 @@ def fmt_metric(value):
         return str(value)
 
 
-def compact_log_line(line: str) -> str:
+def compact_log_line(line):
     match = re.match(r"^(\[\d+\])\s+(.*)$", line)
     if not match or " / " not in line:
         return line
@@ -111,7 +55,7 @@ def compact_log_line(line: str) -> str:
     return f"{step} " + " / ".join(kept) if kept else line
 
 
-def read_metric_summary(logdir: Path):
+def read_metric_summary(logdir):
     metrics_path = Path(logdir) / "metrics.jsonl"
     update = None
     opt_loss = None
@@ -133,19 +77,21 @@ def read_metric_summary(logdir: Path):
     return fmt_metric(update), fmt_metric(opt_loss), fmt_metric(eval_score)
 
 
-def start_training_run(
-    run: dict,
+def start_training(
     *,
-    r2dreamer_dir: Path,
-    train_store: Path | None = None,
-    env_task: str | None = None,
-    resume: bool = False,
-    extra_overrides=None,
+    r2dreamer_dir,
+    config,
+    data,
+    task,
+    logdir,
+    resume=False,
+    extra=None,
 ):
-    train_store = train_store if train_store is not None else run.get("data_path")
-    env_task = env_task if env_task is not None else run.get("env_task")
+    data = Path(data)
+    if not data.exists():
+        raise FileNotFoundError(f"Missing training dataset: {data}")
 
-    logdir = Path(run["logdir"])
+    logdir = Path(logdir)
     logdir.mkdir(parents=True, exist_ok=True)
     stdout_log = logdir / "notebook_stdout.log"
     cmd = [
@@ -153,18 +99,13 @@ def start_training_run(
         "-u",
         "train.py",
         "--config-name",
-        run["config_name"],
+        config,
+        f"offline.data_path={data}",
+        f"env.task={task}",
         f"offline.resume={str(bool(resume)).lower()}",
         f"logdir={logdir}",
     ]
-    if train_store is not None:
-        train_store = Path(train_store)
-        if not train_store.exists():
-            raise FileNotFoundError(f"Missing training dataset: {train_store}")
-        cmd.append(f"offline.data_path={train_store}")
-    if env_task is not None:
-        cmd.append(f"env.task={env_task}")
-    cmd.extend(extra_overrides or [])
+    cmd.extend(extra or [])
 
     log_file = stdout_log.open("w", buffering=1, encoding="utf-8")
     env = dict(os.environ)

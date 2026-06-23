@@ -403,6 +403,8 @@ def zarr_attrs(
         "checkpoint_path": checkpoint_name(task, checkpoint_seed),
         "checkpoint_local_path": str(checkpoint_path),
         "checkpoint_seed": checkpoint_seed,
+        "seed": args.seed,
+        "episode_seed_rule": "seed + episode_index",
         "obs_dim": obs_dim,
         "action_dim": int(np.prod(action_spec.shape)),
         "observation_keys": list(obs.keys()),
@@ -527,8 +529,8 @@ def collect_episode(
 
 
 def collect_task(args: argparse.Namespace, task: TaskSpec, checkpoint_path: Path) -> dict[str, Any]:
-    raw_env, env, raw_action_spec, action_spec = make_env(task, args.seed)
-    first_step = env.reset()
+    _schema_raw_env, schema_env, raw_action_spec, action_spec = make_env(task, args.seed)
+    first_step = schema_env.reset()
     first_obs = dict(first_step.observation)
     obs_dim = int(flatten_obs(first_obs).shape[0])
     action_dim = int(np.prod(action_spec.shape))
@@ -567,6 +569,8 @@ def collect_task(args: argparse.Namespace, task: TaskSpec, checkpoint_path: Path
         f"writing to {store_path}"
     )
     for episode_idx in range(completed, args.num_episodes):
+        episode_seed = int(args.seed) + int(episode_idx)
+        raw_env, env, _, _ = make_env(task, episode_seed)
         episode, episode_return = collect_episode(
             raw_env,
             env,

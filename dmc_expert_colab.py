@@ -1,6 +1,4 @@
-"""Small Colab setup helper for the DMC expert notebook."""
-
-from __future__ import annotations
+"""Colab setup helper for the DMC expert notebook."""
 
 import os
 import subprocess
@@ -15,12 +13,12 @@ kornia termcolor tqdm pandas moviepy imageio imageio-ffmpeg h5py wheel ninja pac
 """.split()
 
 
-def run(label: str, cmd, *, cwd=None, env=None):
+def run(label, cmd, cwd=None, env=None):
     print(f"\n== {label} ==")
     subprocess.run(cmd, cwd=cwd, env=env, check=True)
 
 
-def sync_tdmpc2(tdmpc2_dir: Path):
+def sync_tdmpc2(tdmpc2_dir):
     repo = "https://github.com/nicklashansen/tdmpc2.git"
     if tdmpc2_dir.exists():
         run("Update TD-MPC2", ["git", "remote", "set-url", "origin", repo], cwd=tdmpc2_dir)
@@ -62,7 +60,7 @@ def install_mamba3():
         return Mamba3
 
 
-def setup_colab(workdir: Path, r2dreamer_dir: Path):
+def setup_colab(workdir, r2dreamer_dir):
     tdmpc2_dir = Path(workdir) / "tdmpc2"
     data_dir = Path(workdir) / "data" / "dmc_expert"
     data_dir.mkdir(parents=True, exist_ok=True)
