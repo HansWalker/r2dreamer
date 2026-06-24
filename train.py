@@ -149,6 +149,7 @@ def train_offline(config, logger, logdir):
     if start_update >= updates:
         print(f"Checkpoint is already at update {start_update}; target is {updates}. Nothing to train.")
         save_checkpoint(agent, logdir, "latest.pt", update=start_update)
+        replay.close()
         close_envs(eval_envs)
         return
 
@@ -199,6 +200,7 @@ def train_offline(config, logger, logdir):
             score = None
         if score is not None and (best_score is None or score > best_score):
             save_checkpoint(agent, logdir, "best.pt", update=updates)
+    replay.close()
     close_envs(eval_envs)
 
 

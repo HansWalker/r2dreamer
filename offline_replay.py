@@ -1,4 +1,6 @@
 import math
+import queue
+import threading
 from pathlib import Path
 
 import gymnasium as gym
@@ -18,7 +20,13 @@ class DMCExpertReplay:
         self.batch_length = int(config.batch_length)
         self.warmup_length = int(config.warmup_length)
         self.total_length = self.warmup_length + self.batch_length
+        self.shuffle = bool(getattr(config, "shuffle", True))
+        self.prefetch = bool(getattr(config, "prefetch", True))
+        self.prefetch_size = int(getattr(config, "prefetch_size", 2))
         self.rng = np.random.default_rng(int(config.seed))
+        self._stop = threading.Event()
+        self._queue = None
+        self._thread = None
 
         self.root = zarr.open(str(self.path), mode="r")
         self.obs_dim = int(self.root.attrs["obs_dim"])
@@ -29,12 +37,24 @@ class DMCExpertReplay:
             for key in self.obs_keys
         }
         self.obs_slices = self._build_obs_slices()
+        self.obs = np.asarray(self.root["obs"][:], dtype=np.float32)
+        self.action = np.asarray(self.root["action"][:], dtype=np.float32)
+        self.reward = np.asarray(self.root["reward"][:], dtype=np.float32)
+        self.is_last = np.asarray(self.root["is_last"][:], dtype=bool)
+        self.terminated = np.asarray(self.root["terminated"][:], dtype=bool)
+        self.episode_start = np.asarray(self.root["episode_start"][:], dtype=np.int64)
+        self.episode_length = np.asarray(self.root["episode_length"][:], dtype=np.int64)
         self.episodes = self._valid_episodes()
         if not self.episodes:
             raise ValueError(
                 f"{self.path} has no episodes long enough for "
                 f"warmup_length={self.warmup_length}, batch_length={self.batch_length}."
             )
+        self.window_starts = self._build_window_starts()
+        self._order = np.arange(len(self.window_starts), dtype=np.int64)
+        self._pos = len(self._order)
+        if self.prefetch:
+            self._start_prefetch()
 
     def _build_obs_slices(self):
         out = {}
@@ -49,16 +69,21 @@ class DMCExpertReplay:
         return out
 
     def _valid_episodes(self):
-        starts = np.asarray(self.root["episode_start"][:], dtype=np.int64)
-        lengths = np.asarray(self.root["episode_length"][:], dtype=np.int64)
         # Each training item needs obs_{t+1}, so the final raw transition in an episode
         # cannot be sampled because the dataset stores pre-step observations only.
         min_length = self.total_length + 1
         return [
             (int(start), int(length))
-            for start, length in zip(starts, lengths)
+            for start, length in zip(self.episode_start, self.episode_length)
             if int(length) >= min_length
         ]
+
+    def _build_window_starts(self):
+        starts = []
+        for ep_start, ep_length in self.episodes:
+            count = ep_length - self.total_length
+            starts.append(np.arange(ep_start, ep_start + count, dtype=np.int64))
+        return np.concatenate(starts)
 
     def obs_space(self):
         spaces = {
@@ -90,13 +115,22 @@ class DMCExpertReplay:
         return gym.spaces.Box(low.reshape(-1), high.reshape(-1), dtype=np.float32)
 
     def sample(self):
+        if self._queue is None:
+            return self._sample_batch()
+        item = self._queue.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def close(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+    def _sample_batch(self):
         warmup_rows = []
         train_rows = []
-        for _ in range(self.batch_size):
-            ep_start, ep_length = self.episodes[self.rng.integers(len(self.episodes))]
-            max_local_start = ep_length - self.total_length - 1
-            local_start = int(self.rng.integers(max_local_start + 1))
-            raw_start = ep_start + local_start
+        for raw_start in self._next_starts():
             warmup_rows.append(self._make_window(raw_start, self.warmup_length))
             train_rows.append(self._make_window(raw_start + self.warmup_length, self.batch_length))
 
@@ -104,14 +138,41 @@ class DMCExpertReplay:
         train = self._stack(train_rows)
         return warmup, train
 
+    def _next_starts(self):
+        if self._pos + self.batch_size > len(self._order):
+            self._pos = 0
+            if self.shuffle:
+                self.rng.shuffle(self._order)
+        idx = self._order[self._pos : self._pos + self.batch_size]
+        self._pos += self.batch_size
+        return self.window_starts[idx]
+
+    def _start_prefetch(self):
+        self._queue = queue.Queue(maxsize=max(1, self.prefetch_size))
+        self._thread = threading.Thread(target=self._prefetch_loop, daemon=True)
+        self._thread.start()
+
+    def _prefetch_loop(self):
+        while not self._stop.is_set():
+            try:
+                item = self._sample_batch()
+            except BaseException as exc:
+                item = exc
+            while not self._stop.is_set():
+                try:
+                    self._queue.put(item, timeout=0.1)
+                    break
+                except queue.Full:
+                    pass
+
     def _make_window(self, raw_start, length):
         if length == 0:
             return None
-        obs = np.asarray(self.root["obs"][raw_start + 1 : raw_start + length + 1], dtype=np.float32)
-        action = np.asarray(self.root["action"][raw_start : raw_start + length], dtype=np.float32)
-        reward = np.asarray(self.root["reward"][raw_start : raw_start + length], dtype=np.float32)
-        is_last = np.asarray(self.root["is_last"][raw_start : raw_start + length], dtype=bool)
-        terminated = np.asarray(self.root["terminated"][raw_start : raw_start + length], dtype=bool)
+        obs = self.obs[raw_start + 1 : raw_start + length + 1]
+        action = self.action[raw_start : raw_start + length]
+        reward = self.reward[raw_start : raw_start + length]
+        is_last = self.is_last[raw_start : raw_start + length]
+        terminated = self.terminated[raw_start : raw_start + length]
 
         data = self._split_obs(obs)
         data.update(

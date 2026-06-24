@@ -30,6 +30,9 @@ offline:
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   warmup_length: 32
+  shuffle: true
+  prefetch: true
+  prefetch_size: 2
   updates: 20000
   eval_every: 1000
   eval_episode_num: 2
