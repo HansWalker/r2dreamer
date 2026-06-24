@@ -1,8 +1,10 @@
 """Colab setup helper for the DMC expert notebook."""
 
 import os
+import shutil
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 
@@ -29,12 +31,46 @@ def sync_tdmpc2(tdmpc2_dir):
 
 def clear_mamba_modules():
     for name in list(sys.modules):
-        if name == "mamba_ssm" or name.startswith("mamba_ssm."):
+        if name in {"mamba_ssm", "tvm_ffi"} or name.startswith(("mamba_ssm.", "tvm_ffi.")):
             del sys.modules[name]
+
+
+def remove_tvm_ffi_files():
+    for key in ("purelib", "platlib"):
+        site_dir = Path(sysconfig.get_paths()[key])
+        for path in site_dir.glob("tvm_ffi*"):
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+
+
+def install_mamba3_runtime_deps():
+    clear_mamba_modules()
+    run(
+        "Remove old TVM FFI packages",
+        [sys.executable, "-m", "pip", "uninstall", "-y", "tvm-ffi", "apache-tvm-ffi"],
+    )
+    remove_tvm_ffi_files()
+    run(
+        "Install Mamba3 runtime dependencies",
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "--no-cache-dir",
+            "--force-reinstall",
+            "apache-tvm-ffi>=0.1.10",
+        ],
+    )
+    clear_mamba_modules()
 
 
 def install_mamba3():
     run("Remove optional TileLang kernels", [sys.executable, "-m", "pip", "uninstall", "-y", "tilelang"])
+    install_mamba3_runtime_deps()
     try:
         clear_mamba_modules()
         from mamba_ssm.modules.mamba3 import Mamba3
@@ -55,6 +91,7 @@ def install_mamba3():
             env=env,
         )
         run("Remove optional TileLang kernels", [sys.executable, "-m", "pip", "uninstall", "-y", "tilelang"])
+        install_mamba3_runtime_deps()
         clear_mamba_modules()
         from mamba_ssm.modules.mamba3 import Mamba3
         return Mamba3
