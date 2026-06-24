@@ -38,11 +38,17 @@ def clear_mamba_modules():
 def remove_tvm_ffi_files():
     for key in ("purelib", "platlib"):
         site_dir = Path(sysconfig.get_paths()[key])
-        for path in site_dir.glob("tvm_ffi*"):
-            if path.is_dir():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
+        for pattern in ("tvm_ffi*", "apache_tvm_ffi*"):
+            for path in site_dir.glob(pattern):
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+
+
+def check_mamba3_import():
+    code = "import tvm_ffi; from mamba_ssm.modules.mamba3 import Mamba3; print('Mamba3 ok')"
+    run("Check Mamba3 import", [sys.executable, "-c", code])
 
 
 def install_mamba3_runtime_deps():
@@ -62,7 +68,7 @@ def install_mamba3_runtime_deps():
             "-q",
             "--no-cache-dir",
             "--force-reinstall",
-            "apache-tvm-ffi>=0.1.10",
+            "apache-tvm-ffi==0.1.11",
         ],
     )
     clear_mamba_modules()
@@ -92,6 +98,7 @@ def install_mamba3():
         )
         run("Remove optional TileLang kernels", [sys.executable, "-m", "pip", "uninstall", "-y", "tilelang"])
         install_mamba3_runtime_deps()
+        check_mamba3_import()
         clear_mamba_modules()
         from mamba_ssm.modules.mamba3 import Mamba3
         return Mamba3
