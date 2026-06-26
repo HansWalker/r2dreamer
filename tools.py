@@ -165,6 +165,7 @@ class Logger:
         "train/loss/value",
         "train/ret_replay_mean",
         "episode/eval_score",
+        "train/timing/sec_per_update",
         "fps/fps",
     )
 

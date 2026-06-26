@@ -2,6 +2,7 @@ import atexit
 import json
 import pathlib
 import sys
+import time
 import warnings
 
 import hydra
@@ -156,6 +157,7 @@ def train_offline(config, logger, logdir):
             return
 
         last_eval_success_update = None
+        train_start_time = time.perf_counter()
         for update in range(start_update + 1, updates + 1):
             warmup_data, data = replay.sample()
             if warmup_data is not None:
@@ -164,10 +166,14 @@ def train_offline(config, logger, logdir):
             train_metrics = agent.update_offline(warmup_data, data)
 
             if log_every and update % log_every == 0:
+                completed_updates = update - start_update
+                elapsed = time.perf_counter() - train_start_time
+                sec_per_update = elapsed / max(completed_updates, 1)
                 for name, value in train_metrics.items():
                     value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
                     logger.scalar(f"train/{name}", value)
                 logger.scalar("train/opt/updates", update)
+                logger.scalar("train/timing/sec_per_update", sec_per_update)
                 logger.write(update, fps=True)
 
             if eval_every and update % eval_every == 0:
@@ -190,10 +196,14 @@ def train_offline(config, logger, logdir):
                 save_checkpoint(agent, logdir, "latest.pt", update=update)
 
         if train_metrics:
+            completed_updates = updates - start_update
+            elapsed = time.perf_counter() - train_start_time
+            sec_per_update = elapsed / max(completed_updates, 1)
             for name, value in train_metrics.items():
                 value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
                 logger.scalar(f"train/{name}", value)
             logger.scalar("train/opt/updates", updates)
+            logger.scalar("train/timing/sec_per_update", sec_per_update)
             logger.write(updates, fps=True)
         save_checkpoint(agent, logdir, "latest.pt", update=updates)
         should_final_eval = int(config.offline.eval_episode_num) > 0 and last_eval_success_update != updates
