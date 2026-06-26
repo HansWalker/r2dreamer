@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,10 @@ import numpy as np
 
 
 CHECKPOINT_REPO = "nicklashansen/tdmpc2"
-DATA_FORMAT = "dmc_expert_interleaved_episodes_v1"
+DATA_FORMAT = "dmc_expert_hdf5_dense_v1"
+
+
+# Task and config helpers.
 
 
 @dataclass(frozen=True)
@@ -28,7 +32,7 @@ class TaskSpec:
         return f"{self.domain}/{self.task}"
 
     @property
-    def zarr_name(self) -> str:
+    def store_name(self) -> str:
         return self.slug.replace("-", "_")
 
 
@@ -39,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/dmc_expert.yaml"),
+        default=Path("configs/dmc_expert_collection.yaml"),
         help="YAML config file for collection settings.",
     )
     return parser.parse_args()
@@ -151,6 +155,9 @@ def flatten_obs(obs: dict[str, np.ndarray]) -> np.ndarray:
         [np.asarray(value, dtype=np.float32).reshape(-1) for value in obs.values()],
         dtype=np.float32,
     )
+
+
+# TD-MPC2 loading.
 
 
 def add_tdmpc2_to_path(root: Path) -> Path:
@@ -362,6 +369,9 @@ def load_agent(
     return agent
 
 
+# DMC environment and dataset metadata.
+
+
 def make_env(task: TaskSpec, seed: int):
     from dm_control import suite
     from dm_control.suite.wrappers import action_scale
@@ -382,7 +392,7 @@ def render(raw_env, domain: str, image_size: int) -> np.ndarray:
     return raw_env.physics.render(image_size, image_size, camera_id=camera_id)
 
 
-def zarr_attrs(
+def dataset_metadata(
     task: TaskSpec,
     checkpoint_path: Path,
     checkpoint_seed: int,
@@ -405,6 +415,7 @@ def zarr_attrs(
         "checkpoint_seed": checkpoint_seed,
         "seed": args.seed,
         "episode_seed_rule": "seed + episode_index",
+        "num_episodes": args.num_episodes,
         "obs_dim": obs_dim,
         "action_dim": int(np.prod(action_spec.shape)),
         "observation_keys": list(obs.keys()),
@@ -418,46 +429,149 @@ def zarr_attrs(
         "action_repeat": args.action_repeat,
         "max_episode_steps": args.max_episode_steps,
         "image_size": args.image_size if args.save_images else None,
-        "row_layout": "obs_t/image_t/action_t plus reward/discount/done from s_t -> s_{t+1}",
+        "layout": "episode-major dense arrays; observations[e, t], actions[e, t] -> observations[e, t + 1]",
+        "data_file": "data.hdf5",
     }
 
 
-def ensure_array(root, name: str, values: np.ndarray):
-    if name not in root:
-        row_shape = values.shape[1:]
-        chunks = (min(max(values.shape[0], 1), 1024),) + row_shape
-        root.zeros(
-            name=name,
-            shape=(0,) + row_shape,
-            chunks=chunks,
-            dtype=str(values.dtype),
-        )
-    return root[name]
+# HDF5 dataset writing.
 
 
-def open_store(path: Path, attrs: dict[str, Any], resume: bool):
-    import zarr
+def open_dataset(path: Path, metadata: dict[str, Any], resume: bool):
+    import h5py
 
     if path.exists() and not resume:
-        raise FileExistsError(f"{path} exists. Pass --resume or delete it.")
+        shutil.rmtree(path)
 
-    root = zarr.open(str(path), mode="a" if resume and path.exists() else "w")
-    root.attrs.update(attrs)
-    if "episode_start" not in root:
-        root.zeros(name="episode_start", shape=(0,), chunks=(512,), dtype="int64")
-    if "episode_length" not in root:
-        root.zeros(name="episode_length", shape=(0,), chunks=(512,), dtype="int32")
-    return root
+    path.mkdir(parents=True, exist_ok=True)
+    metadata_path = path / "metadata.json"
+    data_path = path / "data.hdf5"
+    if resume and metadata_path.exists():
+        existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if existing.get("format") != DATA_FORMAT:
+            raise RuntimeError(
+                f"{path} uses format={existing.get('format')!r}, expected {DATA_FORMAT!r}. "
+                "Convert or delete the old dataset before collecting with the dense HDF5 format."
+            )
+        if int(metadata["num_episodes"]) > int(existing.get("num_episodes", 0)):
+            existing["num_episodes"] = int(metadata["num_episodes"])
+            metadata_path.write_text(json.dumps(existing, indent=2, default=str), encoding="utf-8")
+        metadata = existing
+    else:
+        metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+
+    h5 = h5py.File(data_path, "a")
+    ensure_arrays(h5, metadata)
+    return h5, metadata_path, data_path
 
 
-def append_episode(root, episode: dict[str, np.ndarray]):
-    start = int(root["obs"].shape[0]) if "obs" in root else 0
-    length = int(episode["obs"].shape[0])
-    for key, values in episode.items():
-        values = np.asarray(values)
-        ensure_array(root, key, values).append(values, axis=0)
-    root["episode_start"].append(np.array([start], dtype=np.int64), axis=0)
-    root["episode_length"].append(np.array([length], dtype=np.int32), axis=0)
+def time_chunk(length: int) -> int:
+    return min(max(int(length), 1), 128)
+
+
+def require_array(h5, name: str, shape: tuple[int, ...], dtype, chunks: tuple[int, ...]):
+    if name not in h5:
+        return h5.create_dataset(
+            name,
+            shape=shape,
+            maxshape=(None, *shape[1:]),
+            chunks=chunks,
+            dtype=dtype,
+        )
+    dataset = h5[name]
+    if dataset.shape[1:] != shape[1:]:
+        raise RuntimeError(
+            f"Existing HDF5 array {name!r} has shape {dataset.shape}, expected (*, {shape[1:]}). "
+            "Start a fresh dataset or convert the existing data."
+        )
+    if dataset.dtype != np.dtype(dtype):
+        raise RuntimeError(
+            f"Existing HDF5 array {name!r} has dtype {dataset.dtype}, expected {np.dtype(dtype)}."
+        )
+    if dataset.shape[0] < shape[0]:
+        dataset.resize((shape[0], *dataset.shape[1:]))
+    return dataset
+
+
+def ensure_arrays(h5, metadata: dict[str, Any]):
+    episodes = int(metadata["num_episodes"])
+    steps = int(metadata["max_episode_steps"])
+    obs_dim = int(metadata["obs_dim"])
+    action_dim = int(metadata["action_dim"])
+    obs_chunk = time_chunk(steps + 1)
+    step_chunk = time_chunk(steps)
+
+    require_array(
+        h5,
+        "observations",
+        (episodes, steps + 1, obs_dim),
+        np.float32,
+        (1, obs_chunk, obs_dim),
+    )
+    require_array(
+        h5,
+        "actions",
+        (episodes, steps, action_dim),
+        np.float32,
+        (1, step_chunk, action_dim),
+    )
+    for name, dtype in (
+        ("rewards", np.float32),
+        ("discounts", np.float32),
+        ("terminations", np.uint8),
+        ("truncations", np.uint8),
+    ):
+        require_array(h5, name, (episodes, steps, 1), dtype, (1, step_chunk, 1))
+    if metadata.get("image_size") is not None:
+        image_size = int(metadata["image_size"])
+        require_array(
+            h5,
+            "images",
+            (episodes, steps + 1, image_size, image_size, 3),
+            np.uint8,
+            (1, min(16, steps + 1), image_size, image_size, 3),
+        )
+    require_array(h5, "lengths", (episodes,), np.int32, (min(1024, episodes),))
+    require_array(h5, "returns", (episodes,), np.float32, (min(1024, episodes),))
+    require_array(h5, "complete", (episodes,), np.uint8, (min(1024, episodes),))
+
+
+def completed_episodes(h5) -> int:
+    complete = np.asarray(h5["complete"], dtype=bool)
+    missing = np.flatnonzero(~complete)
+    return int(missing[0]) if missing.size else int(complete.shape[0])
+
+
+def total_rows(h5, completed: int) -> int:
+    return int(np.asarray(h5["lengths"][:completed], dtype=np.int64).sum())
+
+
+def write_progress(path: Path, episodes: int, rows: int, target: int):
+    payload = {
+        "episodes": int(episodes),
+        "rows": int(rows),
+        "target_episodes": int(target),
+    }
+    (path / "progress.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def append_episode(h5, episode_idx: int, episode: dict[str, np.ndarray], episode_return: float):
+    h5["complete"][episode_idx] = 0
+    length = int(episode["actions"].shape[0])
+    h5["observations"][episode_idx, : length + 1] = episode["observations"]
+    h5["actions"][episode_idx, :length] = episode["actions"]
+    h5["rewards"][episode_idx, :length] = episode["rewards"]
+    h5["discounts"][episode_idx, :length] = episode["discounts"]
+    h5["terminations"][episode_idx, :length] = episode["terminations"]
+    h5["truncations"][episode_idx, :length] = episode["truncations"]
+    if "images" in h5 and "images" in episode:
+        h5["images"][episode_idx, : length + 1] = episode["images"]
+    h5["lengths"][episode_idx] = length
+    h5["returns"][episode_idx] = float(episode_return)
+    h5["complete"][episode_idx] = 1
+
+
+# Episode and task collection.
 
 
 def collect_episode(
@@ -474,20 +588,19 @@ def collect_episode(
 
     time_step = env.reset()
     rows: dict[str, list[np.ndarray]] = {
-        "obs": [],
-        "action": [],
-        "reward": [],
-        "discount": [],
-        "is_last": [],
-        "terminated": [],
-        "timeout": [],
+        "observations": [flatten_obs(time_step.observation)],
+        "actions": [],
+        "rewards": [],
+        "discounts": [],
+        "terminations": [],
+        "truncations": [],
     }
     if save_images:
-        rows["image"] = []
+        rows["images"] = [render(raw_env, task.domain, image_size)]
 
     episode_return = 0.0
     for step in range(max_episode_steps):
-        obs_vec = flatten_obs(time_step.observation)
+        obs_vec = rows["observations"][-1]
         action = agent.act(
             torch.from_numpy(obs_vec),
             t0=(step == 0),
@@ -495,11 +608,6 @@ def collect_episode(
         )
         action = action.detach().cpu().numpy().astype(np.float32).reshape(-1)
         action = np.clip(action, -1.0, 1.0)
-
-        rows["obs"].append(obs_vec)
-        rows["action"].append(action)
-        if save_images:
-            rows["image"].append(render(raw_env, task.domain, image_size))
 
         reward = 0.0
         discount = 1.0
@@ -513,16 +621,18 @@ def collect_episode(
                 break
 
         timeout = (step + 1) >= max_episode_steps and not dmc_last
-        is_last = dmc_last or timeout
         terminated = dmc_last and discount == 0.0
 
         episode_return += reward
-        rows["reward"].append(np.array([reward], dtype=np.float32))
-        rows["discount"].append(np.array([discount], dtype=np.float32))
-        rows["is_last"].append(np.array([is_last], dtype=np.uint8))
-        rows["terminated"].append(np.array([terminated], dtype=np.uint8))
-        rows["timeout"].append(np.array([timeout], dtype=np.uint8))
-        if is_last:
+        rows["actions"].append(action)
+        rows["rewards"].append(np.array([reward], dtype=np.float32))
+        rows["discounts"].append(np.array([discount], dtype=np.float32))
+        rows["terminations"].append(np.array([terminated], dtype=np.uint8))
+        rows["truncations"].append(np.array([timeout], dtype=np.uint8))
+        rows["observations"].append(flatten_obs(time_step.observation))
+        if save_images:
+            rows["images"].append(render(raw_env, task.domain, image_size))
+        if dmc_last or timeout:
             break
 
     return {key: np.stack(values, axis=0) for key, values in rows.items()}, episode_return
@@ -530,10 +640,15 @@ def collect_episode(
 
 def collect_task(args: argparse.Namespace, task: TaskSpec, checkpoint_path: Path) -> dict[str, Any]:
     _schema_raw_env, schema_env, raw_action_spec, action_spec = make_env(task, args.seed)
-    first_step = schema_env.reset()
-    first_obs = dict(first_step.observation)
-    obs_dim = int(flatten_obs(first_obs).shape[0])
-    action_dim = int(np.prod(action_spec.shape))
+    try:
+        first_step = schema_env.reset()
+        first_obs = dict(first_step.observation)
+        obs_dim = int(flatten_obs(first_obs).shape[0])
+        action_dim = int(np.prod(action_spec.shape))
+    finally:
+        close = getattr(_schema_raw_env, "close", None)
+        if callable(close):
+            close()
 
     agent = load_agent(
         args.tdmpc2_root,
@@ -546,10 +661,10 @@ def collect_task(args: argparse.Namespace, task: TaskSpec, checkpoint_path: Path
         expert=args.expert,
     )
 
-    store_path = args.output_dir / f"{task.zarr_name}.zarr"
-    root = open_store(
+    store_path = args.output_dir / task.store_name
+    h5, metadata_path, data_path = open_dataset(
         store_path,
-        zarr_attrs(
+        dataset_metadata(
             task,
             checkpoint_path,
             args.checkpoint_seed,
@@ -562,59 +677,79 @@ def collect_task(args: argparse.Namespace, task: TaskSpec, checkpoint_path: Path
         resume=args.resume,
     )
 
-    completed = int(root["episode_length"].shape[0])
+    completed = completed_episodes(h5)
     returns = []
     print(
         f"Collecting {task.dmc_name}: {completed}/{args.num_episodes} episodes already present, "
         f"writing to {store_path}"
     )
-    for episode_idx in range(completed, args.num_episodes):
-        episode_seed = int(args.seed) + int(episode_idx)
-        raw_env, env, _, _ = make_env(task, episode_seed)
-        episode, episode_return = collect_episode(
-            raw_env,
-            env,
-            agent,
-            task,
-            save_images=args.save_images,
-            image_size=args.image_size,
-            action_repeat=args.action_repeat,
-            max_episode_steps=args.max_episode_steps,
-        )
-        append_episode(root, episode)
-        returns.append(float(episode_return))
-        episode_num = episode_idx + 1
-        progress_every = max(int(args.progress_every), 1)
-        should_log = (
-            episode_num == completed + 1
-            or episode_num == args.num_episodes
-            or episode_num % progress_every == 0
-        )
-        if should_log:
-            recent = returns[-progress_every:]
-            recent_mean = float(np.mean(recent)) if recent else float("nan")
-            print(
-                f"{task.dmc_name} {episode_num}/{args.num_episodes}: "
-                f"last_return={episode_return:.3f}, recent_mean={recent_mean:.3f}, "
-                f"rows={int(root['obs'].shape[0])}"
+    final_episodes = completed
+    final_rows = total_rows(h5, completed)
+    write_progress(store_path, final_episodes, final_rows, args.num_episodes)
+    try:
+        for episode_idx in range(completed, args.num_episodes):
+            episode_seed = int(args.seed) + int(episode_idx)
+            raw_env, env, _, _ = make_env(task, episode_seed)
+            try:
+                episode, episode_return = collect_episode(
+                    raw_env,
+                    env,
+                    agent,
+                    task,
+                    save_images=args.save_images,
+                    image_size=args.image_size,
+                    action_repeat=args.action_repeat,
+                    max_episode_steps=args.max_episode_steps,
+                )
+            finally:
+                close = getattr(raw_env, "close", None)
+                if callable(close):
+                    close()
+            append_episode(h5, episode_idx, episode, episode_return)
+            h5.flush()
+            final_episodes = episode_idx + 1
+            final_rows += int(episode["actions"].shape[0])
+            write_progress(store_path, final_episodes, final_rows, args.num_episodes)
+            returns.append(float(episode_return))
+            episode_num = episode_idx + 1
+            progress_every = max(int(args.progress_every), 1)
+            should_log = (
+                episode_num == completed + 1
+                or episode_num == args.num_episodes
+                or episode_num % progress_every == 0
             )
+            if should_log:
+                recent = returns[-progress_every:]
+                recent_mean = float(np.mean(recent)) if recent else float("nan")
+                print(
+                    f"{task.dmc_name} {episode_num}/{args.num_episodes}: "
+                    f"last_return={episode_return:.3f}, recent_mean={recent_mean:.3f}, "
+                    f"rows={final_rows}"
+                )
+    finally:
+        h5.close()
 
     return {
         "domain_name": task.domain,
         "task_name": task.task,
         "task_slug": task.slug,
-        "zarr_path": str(store_path),
+        "data_path": str(store_path),
+        "hdf5_path": str(data_path),
+        "metadata_path": str(metadata_path),
         "checkpoint_path": str(checkpoint_path),
-        "episodes": int(root["episode_length"].shape[0]),
-        "rows": int(root["obs"].shape[0]) if "obs" in root else 0,
+        "episodes": final_episodes,
+        "rows": final_rows,
         "obs_dim": obs_dim,
         "action_dim": action_dim,
         "mean_new_return": float(np.mean(returns)) if returns else None,
     }
 
 
+# Manifest and entry point.
+
+
 def write_manifest(
-    output_dir: Path,
+    path: Path,
     args: argparse.Namespace,
     collected: list[dict[str, Any]],
     skipped: list[dict[str, Any]],
@@ -630,7 +765,7 @@ def write_manifest(
         "collected": collected,
         "skipped": skipped,
     }
-    path = output_dir / "manifest.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
     print(f"Wrote {path}")
 
@@ -643,6 +778,9 @@ def main():
     all_tasks = discover_tasks()
     selected_tasks = select_tasks(all_tasks, cfg.tasks)
     checkpoint_files = list_checkpoints()
+    manifest_path = cfg.output_dir / "manifest.json"
+    if len(selected_tasks) == 1:
+        manifest_path = cfg.output_dir / selected_tasks[0].store_name / "manifest.json"
 
     collected = []
     skipped = []
@@ -662,9 +800,9 @@ def main():
 
         checkpoint_path = download_checkpoint(task, cfg.checkpoint_seed)
         collected.append(collect_task(cfg, task, checkpoint_path))
-        write_manifest(cfg.output_dir, cfg, collected, skipped)
+        write_manifest(manifest_path, cfg, collected, skipped)
 
-    write_manifest(cfg.output_dir, cfg, collected, skipped)
+    write_manifest(manifest_path, cfg, collected, skipped)
 
 
 if __name__ == "__main__":

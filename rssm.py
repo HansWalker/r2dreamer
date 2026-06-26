@@ -6,13 +6,6 @@ import distributions as dists
 from networks import BlockLinear, LambdaLayer
 from tools import rpad, weight_init_
 
-MAMBA_CACHE_KEYS = (
-    "mamba_angle_state",
-    "mamba_ssm_state",
-    "mamba_k_state",
-    "mamba_v_state",
-)
-
 try:
     from mamba_ssm.modules.mamba3 import Mamba3
 except Exception as exc:  # pragma: no cover - exercised only when dependency is absent

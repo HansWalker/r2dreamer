@@ -75,7 +75,12 @@ def eval_run(
         cfg = compose(config_name=config, overrides=overrides)
 
     replay = DMCExpertReplay(cfg.offline)
-    agent = Dreamer(cfg.model, replay.obs_space(), replay.act_space()).to(cfg.device)
+    try:
+        obs_space = replay.obs_space()
+        act_space = replay.act_space()
+    finally:
+        replay.close()
+    agent = Dreamer(cfg.model, obs_space, act_space).to(cfg.device)
     checkpoint = torch.load(checkpoint_path, map_location=agent.device, weights_only=False)
     agent.load_state_dict(checkpoint["agent_state_dict"])
     agent.clone_and_freeze()

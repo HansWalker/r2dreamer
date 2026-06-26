@@ -1,60 +1,66 @@
+import json
 import math
-import queue
-import threading
 from pathlib import Path
 
 import gymnasium as gym
+import h5py
 import numpy as np
 import torch
-import zarr
 from tensordict import TensorDict
 
 
 class DMCExpertReplay:
-    """Sample Dreamer training windows from a DMC expert zarr dataset."""
+    """Sample Dreamer training windows from an episode HDF5 expert dataset."""
 
     def __init__(self, config):
         self.path = Path(config.data_path).expanduser()
-        self.device = torch.device(config.device)
         self.batch_size = int(config.batch_size)
         self.batch_length = int(config.batch_length)
         self.warmup_length = int(config.warmup_length)
         self.total_length = self.warmup_length + self.batch_length
         self.shuffle = bool(getattr(config, "shuffle", True))
-        self.prefetch = bool(getattr(config, "prefetch", True))
-        self.prefetch_size = int(getattr(config, "prefetch_size", 2))
         self.rng = np.random.default_rng(int(config.seed))
-        self._stop = threading.Event()
-        self._queue = None
-        self._thread = None
 
-        self.root = zarr.open(str(self.path), mode="r")
-        self.obs_dim = int(self.root.attrs["obs_dim"])
-        self.action_dim = int(self.root.attrs["action_dim"])
-        self.obs_keys = list(self.root.attrs["observation_keys"])
+        self.root_path = self.path
+        self.data_path = self.root_path / "data.hdf5"
+        self.metadata_path = self.root_path / "metadata.json"
+        with self.metadata_path.open("r", encoding="utf-8") as f:
+            self.metadata = json.load(f)
+        if self.metadata.get("format") != "dmc_expert_hdf5_dense_v1":
+            raise ValueError(
+                f"{self.root_path} uses format={self.metadata.get('format')!r}; "
+                "expected 'dmc_expert_hdf5_dense_v1'."
+            )
+        self.h5 = h5py.File(self.data_path, "r")
+        self.observations = self.h5["observations"]
+        self.actions = self.h5["actions"]
+        self.rewards = self.h5["rewards"]
+        self.terminations = self.h5["terminations"]
+        self.truncations = self.h5["truncations"]
+        self.lengths = np.asarray(self.h5["lengths"], dtype=np.int64)
+        self.complete = np.asarray(self.h5["complete"], dtype=bool)
+
+        self.obs_dim = int(self.metadata["obs_dim"])
+        self.action_dim = int(self.metadata["action_dim"])
+        self.obs_keys = list(self.metadata["observation_keys"])
         self.obs_shapes = {
-            key: tuple(self.root.attrs["observation_shapes"][key])
+            key: tuple(self.metadata["observation_shapes"][key])
             for key in self.obs_keys
         }
         self.obs_slices = self._build_obs_slices()
-        self.obs = np.asarray(self.root["obs"][:], dtype=np.float32)
-        self.action = np.asarray(self.root["action"][:], dtype=np.float32)
-        self.reward = np.asarray(self.root["reward"][:], dtype=np.float32)
-        self.is_last = np.asarray(self.root["is_last"][:], dtype=bool)
-        self.terminated = np.asarray(self.root["terminated"][:], dtype=bool)
-        self.episode_start = np.asarray(self.root["episode_start"][:], dtype=np.int64)
-        self.episode_length = np.asarray(self.root["episode_length"][:], dtype=np.int64)
         self.episodes = self._valid_episodes()
-        if not self.episodes:
+        if len(self.episodes) == 0:
             raise ValueError(
-                f"{self.path} has no episodes long enough for "
+                f"{self.root_path} has no episodes long enough for "
                 f"warmup_length={self.warmup_length}, batch_length={self.batch_length}."
             )
-        self.window_starts = self._build_window_starts()
-        self._order = np.arange(len(self.window_starts), dtype=np.int64)
-        self._pos = len(self._order)
-        if self.prefetch:
-            self._start_prefetch()
+        self.max_starts = self.lengths[self.episodes] - self.total_length
+        self.num_windows = int((self.max_starts + 1).sum())
+        self._seq_episode = 0
+        self._seq_start = 0
+
+    def close(self):
+        self.h5.close()
 
     def _build_obs_slices(self):
         out = {}
@@ -69,21 +75,7 @@ class DMCExpertReplay:
         return out
 
     def _valid_episodes(self):
-        # Each training item needs obs_{t+1}, so the final raw transition in an episode
-        # cannot be sampled because the dataset stores pre-step observations only.
-        min_length = self.total_length + 1
-        return [
-            (int(start), int(length))
-            for start, length in zip(self.episode_start, self.episode_length)
-            if int(length) >= min_length
-        ]
-
-    def _build_window_starts(self):
-        starts = []
-        for ep_start, ep_length in self.episodes:
-            count = ep_length - self.total_length
-            starts.append(np.arange(ep_start, ep_start + count, dtype=np.int64))
-        return np.concatenate(starts)
+        return np.flatnonzero(self.complete & (self.lengths >= self.total_length))
 
     def obs_space(self):
         spaces = {
@@ -101,8 +93,8 @@ class DMCExpertReplay:
         return gym.spaces.Dict(spaces)
 
     def act_space(self):
-        low = np.asarray(self.root.attrs.get("action_min", [-1.0] * self.action_dim), dtype=np.float32)
-        high = np.asarray(self.root.attrs.get("action_max", [1.0] * self.action_dim), dtype=np.float32)
+        low = np.asarray(self.metadata.get("action_min", [-1.0] * self.action_dim), dtype=np.float32)
+        high = np.asarray(self.metadata.get("action_max", [1.0] * self.action_dim), dtype=np.float32)
         if low.size == 1:
             low = np.full((self.action_dim,), float(low.reshape(-1)[0]), dtype=np.float32)
         if high.size == 1:
@@ -115,73 +107,59 @@ class DMCExpertReplay:
         return gym.spaces.Box(low.reshape(-1), high.reshape(-1), dtype=np.float32)
 
     def sample(self):
-        if self._queue is None:
-            return self._sample_batch()
-        item = self._queue.get()
-        if isinstance(item, BaseException):
-            raise item
-        return item
-
-    def close(self):
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1)
-
-    def _sample_batch(self):
         warmup_rows = []
         train_rows = []
-        for raw_start in self._next_starts():
-            warmup_rows.append(self._make_window(raw_start, self.warmup_length))
-            train_rows.append(self._make_window(raw_start + self.warmup_length, self.batch_length))
-
+        for ep_idx, start in self._next_starts():
+            warmup_rows.append(self._make_window(ep_idx, start, self.warmup_length))
+            train_rows.append(self._make_window(ep_idx, start + self.warmup_length, self.batch_length))
         warmup = self._stack(warmup_rows) if self.warmup_length else None
         train = self._stack(train_rows)
         return warmup, train
 
+    def skip_batches(self, count):
+        for _ in range(int(count)):
+            self._next_starts()
+
     def _next_starts(self):
-        if self._pos + self.batch_size > len(self._order):
-            self._pos = 0
-            if self.shuffle:
-                self.rng.shuffle(self._order)
-        idx = self._order[self._pos : self._pos + self.batch_size]
-        self._pos += self.batch_size
-        return self.window_starts[idx]
+        if self.shuffle:
+            ep_pos = self.rng.integers(0, len(self.episodes), size=self.batch_size)
+            starts = np.array(
+                [self.rng.integers(0, self.max_starts[pos] + 1) for pos in ep_pos],
+                dtype=np.int64,
+            )
+            return np.stack([self.episodes[ep_pos], starts], axis=1)
 
-    def _start_prefetch(self):
-        self._queue = queue.Queue(maxsize=max(1, self.prefetch_size))
-        self._thread = threading.Thread(target=self._prefetch_loop, daemon=True)
-        self._thread.start()
+        rows = []
+        for _ in range(self.batch_size):
+            rows.append((int(self.episodes[self._seq_episode]), int(self._seq_start)))
+            self._seq_start += 1
+            if self._seq_start > self.max_starts[self._seq_episode]:
+                self._seq_start = 0
+                self._seq_episode = (self._seq_episode + 1) % len(self.episodes)
+        return np.asarray(rows, dtype=np.int64)
 
-    def _prefetch_loop(self):
-        while not self._stop.is_set():
-            try:
-                item = self._sample_batch()
-            except BaseException as exc:
-                item = exc
-            while not self._stop.is_set():
-                try:
-                    self._queue.put(item, timeout=0.1)
-                    break
-                except queue.Full:
-                    pass
-
-    def _make_window(self, raw_start, length):
+    def _make_window(self, ep_idx, start, length):
         if length == 0:
             return None
-        obs = self.obs[raw_start + 1 : raw_start + length + 1]
-        action = self.action[raw_start : raw_start + length]
-        reward = self.reward[raw_start : raw_start + length]
-        is_last = self.is_last[raw_start : raw_start + length]
-        terminated = self.terminated[raw_start : raw_start + length]
+        ep_idx = int(ep_idx)
+        start = int(start)
+        end = start + int(length)
+
+        obs = np.asarray(self.observations[ep_idx, start + 1 : end + 1], dtype=np.float32)
+        actions = np.asarray(self.actions[ep_idx, start:end], dtype=np.float32)
+        rewards = np.asarray(self.rewards[ep_idx, start:end], dtype=np.float32)
+        terminations = np.asarray(self.terminations[ep_idx, start:end], dtype=bool)
+        truncations = np.asarray(self.truncations[ep_idx, start:end], dtype=bool)
+        is_last = np.logical_or(terminations, truncations)
 
         data = self._split_obs(obs)
         data.update(
             {
-                "action": action,
-                "reward": reward.reshape(length, 1),
+                "action": actions,
+                "reward": rewards.reshape(length, 1),
                 "is_first": np.zeros((length, 1), dtype=bool),
                 "is_last": is_last.reshape(length, 1),
-                "is_terminal": terminated.reshape(length, 1),
+                "is_terminal": terminations.reshape(length, 1),
             }
         )
         return data
@@ -196,5 +174,5 @@ class DMCExpertReplay:
         data = {}
         for key in rows[0]:
             value = np.stack([row[key] for row in rows], axis=0)
-            data[key] = torch.as_tensor(value, device=self.device)
+            data[key] = torch.as_tensor(value)
         return TensorDict(data, batch_size=(self.batch_size, next(iter(data.values())).shape[1]))

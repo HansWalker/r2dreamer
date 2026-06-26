@@ -127,81 +127,87 @@ def evaluate_policy(agent, eval_envs, logger, step):
 def train_offline(config, logger, logdir):
     from offline_replay import DMCExpertReplay
 
+    print(f"Load offline data: {config.offline.data_path}")
     replay = DMCExpertReplay(config.offline)
-    print(f"Offline data: {replay.path}")
-    print(f"Offline episodes: {len(replay.episodes)}")
-
     eval_envs = None
-    if int(config.offline.eval_episode_num) > 0:
-        print("Create eval envs.")
-        eval_envs = make_eval_envs(config)
+    try:
+        print(f"Offline data: {replay.path}")
+        print(f"Offline episodes: {len(replay.episodes)}")
+        print(f"Offline windows: {replay.num_windows}")
 
-    print("Create agent.")
-    agent = Dreamer(config.model, replay.obs_space(), replay.act_space()).to(config.device)
-    start_update = maybe_resume_offline(agent, config, logdir)
+        if int(config.offline.eval_episode_num) > 0:
+            print("Create eval envs.")
+            eval_envs = make_eval_envs(config)
 
-    best_score = None
-    train_metrics = {}
-    updates = int(config.offline.updates)
-    eval_every = int(config.offline.eval_every)
-    log_every = int(config.offline.log_every)
-    save_every = int(config.offline.save_every)
-    if start_update >= updates:
-        print(f"Checkpoint is already at update {start_update}; target is {updates}. Nothing to train.")
-        save_checkpoint(agent, logdir, "latest.pt", update=start_update)
-        replay.close()
-        close_envs(eval_envs)
-        return
+        print("Create agent.")
+        agent = Dreamer(config.model, replay.obs_space(), replay.act_space()).to(config.device)
+        start_update = maybe_resume_offline(agent, config, logdir)
+        replay.skip_batches(start_update)
 
-    last_eval_success_update = None
-    for update in range(start_update + 1, updates + 1):
-        warmup_data, data = replay.sample()
-        train_metrics = agent.update_offline(warmup_data, data)
+        best_score = None
+        train_metrics = {}
+        updates = int(config.offline.updates)
+        eval_every = int(config.offline.eval_every)
+        log_every = int(config.offline.log_every)
+        save_every = int(config.offline.save_every)
+        if start_update >= updates:
+            print(f"Checkpoint is already at update {start_update}; target is {updates}. Nothing to train.")
+            save_checkpoint(agent, logdir, "latest.pt", update=start_update)
+            return
 
-        if log_every and update % log_every == 0:
+        last_eval_success_update = None
+        for update in range(start_update + 1, updates + 1):
+            warmup_data, data = replay.sample()
+            if warmup_data is not None:
+                warmup_data = warmup_data.to(config.device, non_blocking=True)
+            data = data.to(config.device, non_blocking=True)
+            train_metrics = agent.update_offline(warmup_data, data)
+
+            if log_every and update % log_every == 0:
+                for name, value in train_metrics.items():
+                    value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
+                    logger.scalar(f"train/{name}", value)
+                logger.scalar("train/opt/updates", update)
+                logger.write(update, fps=True)
+
+            if eval_every and update % eval_every == 0:
+                save_checkpoint(agent, logdir, "latest.pt", update=update)
+                try:
+                    score = evaluate_policy(agent, eval_envs, logger, update)
+                except Exception as exc:
+                    print(f"Evaluation failed at update {update}: {type(exc).__name__}: {exc}")
+                    logger.scalar("episode/eval_error", 1.0)
+                    logger.write(update)
+                    close_envs(eval_envs)
+                    eval_envs = make_eval_envs(config) if int(config.offline.eval_episode_num) > 0 else None
+                else:
+                    last_eval_success_update = update
+                    if score is not None and (best_score is None or score > best_score):
+                        best_score = score
+                        save_checkpoint(agent, logdir, "best.pt", update=update)
+
+            if save_every and update % save_every == 0:
+                save_checkpoint(agent, logdir, "latest.pt", update=update)
+
+        if train_metrics:
             for name, value in train_metrics.items():
                 value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
                 logger.scalar(f"train/{name}", value)
-            logger.scalar("train/opt/updates", update)
-            logger.write(update, fps=True)
-
-        if eval_every and update % eval_every == 0:
-            save_checkpoint(agent, logdir, "latest.pt", update=update)
+            logger.scalar("train/opt/updates", updates)
+            logger.write(updates, fps=True)
+        save_checkpoint(agent, logdir, "latest.pt", update=updates)
+        should_final_eval = int(config.offline.eval_episode_num) > 0 and last_eval_success_update != updates
+        if should_final_eval:
             try:
-                score = evaluate_policy(agent, eval_envs, logger, update)
+                score = evaluate_policy(agent, eval_envs, logger, updates)
             except Exception as exc:
-                print(f"Evaluation failed at update {update}: {type(exc).__name__}: {exc}")
-                logger.scalar("episode/eval_error", 1.0)
-                logger.write(update)
-                close_envs(eval_envs)
-                eval_envs = make_eval_envs(config) if int(config.offline.eval_episode_num) > 0 else None
-            else:
-                last_eval_success_update = update
-                if score is not None and (best_score is None or score > best_score):
-                    best_score = score
-                    save_checkpoint(agent, logdir, "best.pt", update=update)
-
-        if save_every and update % save_every == 0:
-            save_checkpoint(agent, logdir, "latest.pt", update=update)
-
-    if train_metrics:
-        for name, value in train_metrics.items():
-            value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
-            logger.scalar(f"train/{name}", value)
-        logger.scalar("train/opt/updates", updates)
-        logger.write(updates, fps=True)
-    save_checkpoint(agent, logdir, "latest.pt", update=updates)
-    should_final_eval = int(config.offline.eval_episode_num) > 0 and last_eval_success_update != updates
-    if should_final_eval:
-        try:
-            score = evaluate_policy(agent, eval_envs, logger, updates)
-        except Exception as exc:
-            print(f"Final evaluation failed: {type(exc).__name__}: {exc}")
-            score = None
-        if score is not None and (best_score is None or score > best_score):
-            save_checkpoint(agent, logdir, "best.pt", update=updates)
-    replay.close()
-    close_envs(eval_envs)
+                print(f"Final evaluation failed: {type(exc).__name__}: {exc}")
+                score = None
+            if score is not None and (best_score is None or score > best_score):
+                save_checkpoint(agent, logdir, "best.pt", update=updates)
+    finally:
+        replay.close()
+        close_envs(eval_envs)
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="configs")

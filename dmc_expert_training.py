@@ -10,10 +10,7 @@ from pathlib import Path
 def fmt_metric(value):
     if value is None:
         return "-"
-    try:
-        return f"{float(value):.3g}"
-    except Exception:
-        return str(value)
+    return f"{float(value):.3g}"
 
 
 def read_metric_summary(logdir):
@@ -23,18 +20,15 @@ def read_metric_summary(logdir):
     eval_score = None
     if not metrics_path.exists():
         return "-", "-", "-"
-    try:
-        with metrics_path.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                row = json.loads(line)
-                update = row.get("train/opt/updates", update)
-                opt_loss = row.get("train/opt/loss", opt_loss)
-                eval_score = row.get("episode/eval_score", eval_score)
-    except Exception as exc:
-        return "read_err", type(exc).__name__, "-"
+    with metrics_path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            update = row.get("train/opt/updates", update)
+            opt_loss = row.get("train/opt/loss", opt_loss)
+            eval_score = row.get("episode/eval_score", eval_score)
     return fmt_metric(update), fmt_metric(opt_loss), fmt_metric(eval_score)
 
 
@@ -49,7 +43,7 @@ def start_training(
     extra=None,
 ):
     data = Path(data)
-    if not data.exists():
+    if not all((data / name).exists() for name in ("metadata.json", "data.hdf5")):
         raise FileNotFoundError(f"Missing training dataset: {data}")
 
     logdir = Path(logdir)

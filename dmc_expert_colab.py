@@ -8,14 +8,14 @@ import sysconfig
 from pathlib import Path
 
 
-PACKAGES = """
-numpy==2.0.2 pyyaml zarr<3 huggingface_hub dm_control==1.0.28 mujoco==3.3.0
+COLAB_PACKAGES = """
+numpy==2.0.2 pyyaml h5py huggingface_hub dm_control==1.0.28 mujoco==3.3.0
 omegaconf hydra-core tensorboard>=2.20,<3 gymnasium==1.2.0 tensordict torchrl
-kornia termcolor tqdm pandas moviepy imageio imageio-ffmpeg h5py wheel ninja packaging einops
+kornia termcolor tqdm pandas moviepy imageio imageio-ffmpeg wheel ninja packaging einops
 """.split()
 
 
-def run(label, cmd, cwd=None, env=None):
+def run_step(label, cmd, cwd=None, env=None):
     print(f"\n== {label} ==")
     subprocess.run(cmd, cwd=cwd, env=env, check=True)
 
@@ -23,10 +23,10 @@ def run(label, cmd, cwd=None, env=None):
 def sync_tdmpc2(tdmpc2_dir):
     repo = "https://github.com/nicklashansen/tdmpc2.git"
     if tdmpc2_dir.exists():
-        run("Update TD-MPC2", ["git", "remote", "set-url", "origin", repo], cwd=tdmpc2_dir)
-        run("Pull TD-MPC2", ["git", "pull", "--ff-only"], cwd=tdmpc2_dir)
+        run_step("Update TD-MPC2", ["git", "remote", "set-url", "origin", repo], cwd=tdmpc2_dir)
+        run_step("Pull TD-MPC2", ["git", "pull", "--ff-only"], cwd=tdmpc2_dir)
     else:
-        run("Clone TD-MPC2", ["git", "clone", repo, str(tdmpc2_dir)])
+        run_step("Clone TD-MPC2", ["git", "clone", repo, str(tdmpc2_dir)])
 
 
 def clear_mamba_modules():
@@ -46,19 +46,14 @@ def remove_tvm_ffi_files():
                     path.unlink()
 
 
-def check_mamba3_import():
-    code = "import tvm_ffi; from mamba_ssm.modules.mamba3 import Mamba3; print('Mamba3 ok')"
-    run("Check Mamba3 import", [sys.executable, "-c", code])
-
-
 def install_mamba3_runtime_deps():
     clear_mamba_modules()
-    run(
+    run_step(
         "Remove old TVM FFI packages",
         [sys.executable, "-m", "pip", "uninstall", "-y", "tvm-ffi", "apache-tvm-ffi"],
     )
     remove_tvm_ffi_files()
-    run(
+    run_step(
         "Install Mamba3 runtime dependencies",
         [
             sys.executable,
@@ -75,7 +70,7 @@ def install_mamba3_runtime_deps():
 
 
 def install_mamba3():
-    run("Remove optional TileLang kernels", [sys.executable, "-m", "pip", "uninstall", "-y", "tilelang"])
+    run_step("Remove optional TileLang kernels", [sys.executable, "-m", "pip", "uninstall", "-y", "tilelang"])
     install_mamba3_runtime_deps()
     try:
         clear_mamba_modules()
@@ -83,7 +78,7 @@ def install_mamba3():
         return Mamba3
     except Exception:
         env = dict(os.environ, MAMBA_FORCE_BUILD="TRUE")
-        run(
+        run_step(
             "Install Mamba3 from source",
             [
                 sys.executable,
@@ -96,9 +91,16 @@ def install_mamba3():
             ],
             env=env,
         )
-        run("Remove optional TileLang kernels", [sys.executable, "-m", "pip", "uninstall", "-y", "tilelang"])
+        run_step("Remove optional TileLang kernels", [sys.executable, "-m", "pip", "uninstall", "-y", "tilelang"])
         install_mamba3_runtime_deps()
-        check_mamba3_import()
+        run_step(
+            "Check Mamba3 import",
+            [
+                sys.executable,
+                "-c",
+                "import tvm_ffi; from mamba_ssm.modules.mamba3 import Mamba3; print('Mamba3 ok')",
+            ],
+        )
         clear_mamba_modules()
         from mamba_ssm.modules.mamba3 import Mamba3
         return Mamba3
@@ -110,7 +112,7 @@ def setup_colab(workdir, r2dreamer_dir):
     data_dir.mkdir(parents=True, exist_ok=True)
 
     sync_tdmpc2(tdmpc2_dir)
-    run("Install Python packages", [sys.executable, "-m", "pip", "install", "-q", *PACKAGES])
+    run_step("Install Python packages", [sys.executable, "-m", "pip", "install", "-q", *COLAB_PACKAGES])
     mamba3 = install_mamba3()
 
     os.environ["MUJOCO_GL"] = "egl"

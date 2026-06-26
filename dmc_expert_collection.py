@@ -1,5 +1,6 @@
 """Helpers for launching one TD-MPC2 DMC collection job."""
 
+import json
 import os
 import subprocess
 import sys
@@ -49,29 +50,27 @@ def load_collection_config(path, tdmpc2_dir=None, data_dir=None):
     return cfg
 
 
-def scenario_name(task):
-    return task.replace("/", "_").replace("-", "_").replace("__", "_")
+def read_progress(out_dir, _task=None):
+    store_path = Path(out_dir)
+    progress_path = store_path / "progress.json"
+    if progress_path.exists():
+        payload = json.loads(progress_path.read_text(encoding="utf-8"))
+        return int(payload.get("episodes", 0)), int(payload.get("rows", 0)), str(store_path)
 
+    import h5py
 
-def task_store_name(task):
-    if task == "ball_in_cup/catch":
-        return "cup_catch.zarr"
-    return scenario_name(task) + ".zarr"
-
-
-def read_progress(out_dir, task):
-    import zarr
-
-    store_path = Path(out_dir) / task_store_name(task)
-    if not store_path.exists():
+    data_path = store_path / "data.hdf5"
+    if not data_path.exists():
         return 0, 0, "not created"
-    try:
-        root = zarr.open(str(store_path), mode="r")
-        episodes = int(root["episode_length"].shape[0]) if "episode_length" in root else 0
-        rows = int(root["obs"].shape[0]) if "obs" in root else 0
-        return episodes, rows, str(store_path)
-    except Exception as exc:
-        return 0, 0, f"read pending: {type(exc).__name__}"
+
+    rows = 0
+    episodes = 0
+    with h5py.File(data_path, "r") as root:
+        complete = root["complete"][:].astype(bool)
+        lengths = root["lengths"][:].astype("int64")
+        episodes = int(complete.sum())
+        rows = int(lengths[complete].sum())
+    return episodes, rows, str(store_path)
 
 
 def make_collect_config(base, task, output_dir, path):

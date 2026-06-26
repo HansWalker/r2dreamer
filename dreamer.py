@@ -9,6 +9,7 @@ from torch import nn
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
 
+from constants import MAMBA_CACHE_KEYS
 import networks
 import rssm
 import tools
@@ -246,13 +247,13 @@ class Dreamer(nn.Module):
         if isinstance(state, (tuple, list)):
             return tuple(state)
         out = [state["stoch"], state["deter"]]
-        if all(key in state.keys() for key in rssm.MAMBA_CACHE_KEYS):
-            out.extend(state[key] for key in rssm.MAMBA_CACHE_KEYS)
+        if all(key in state.keys() for key in MAMBA_CACHE_KEYS):
+            out.extend(state[key] for key in MAMBA_CACHE_KEYS)
         return tuple(out)
 
     def _cache_from_state(self, state):
-        if all(key in state.keys() for key in rssm.MAMBA_CACHE_KEYS):
-            return tuple(state[key] for key in rssm.MAMBA_CACHE_KEYS)
+        if all(key in state.keys() for key in MAMBA_CACHE_KEYS):
+            return tuple(state[key] for key in MAMBA_CACHE_KEYS)
         return None
 
     @torch.no_grad()
@@ -296,7 +297,7 @@ class Dreamer(nn.Module):
         action = action_dist.mode if eval else action_dist.rsample()
         next_state = {"stoch": stoch, "deter": deter, "prev_action": action}
         if self._frozen_rssm.uses_context:
-            next_state.update({key: value for key, value in zip(rssm.MAMBA_CACHE_KEYS, cache)})
+            next_state.update({key: value for key, value in zip(MAMBA_CACHE_KEYS, cache)})
         return action, TensorDict(
             next_state,
             batch_size=state.batch_size,
@@ -309,7 +310,7 @@ class Dreamer(nn.Module):
         state = {"stoch": stoch, "deter": deter, "prev_action": action}
         cache = self.rssm.initial_context(B)
         if cache is not None:
-            state.update({key: value for key, value in zip(rssm.MAMBA_CACHE_KEYS, cache)})
+            state.update({key: value for key, value in zip(MAMBA_CACHE_KEYS, cache)})
         return TensorDict(state, batch_size=(B,))
 
     @torch.no_grad()
@@ -389,7 +390,7 @@ class Dreamer(nn.Module):
         return metrics
 
     def update_offline(self, warmup_data, data):
-        """Perform one optimization step from an offline zarr batch."""
+        """Perform one optimization step from an offline expert batch."""
         torch.compiler.cudagraph_mark_step_begin()
         p_data = self.preprocess(data)
         initial = self._offline_initial(data.shape[0], warmup_data)
