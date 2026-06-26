@@ -423,6 +423,40 @@ class Dreamer(nn.Module):
         self.clone_and_freeze()
         return metrics
 
+    def update_expert_pretrain(self, data):
+        """Perform one supervised expert pretraining update from full episodes."""
+        torch.compiler.cudagraph_mark_step_begin()
+        p_data = self.preprocess(data)
+        initial = self._initial_tuple(data.shape[0])
+        self._update_slow_target()
+        if self.rep_loss == "dreamerpro":
+            self.ema_update()
+        metrics = {}
+        with autocast(device_type=self.device.type, dtype=torch.float16):
+            mets = self._cal_expert_pretrain_grad(p_data, initial)
+        self._scaler.unscale_(self._optimizer)
+        if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
+            self._prototypes.grad.zero_()
+        if self._log_grads:
+            old_params = [p.data.clone().detach() for p in self._named_params.values()]
+            grads = [p.grad for p in self._named_params.values() if p.grad is not None]
+            mets["opt/grad_norm"] = tools.compute_global_norm(grads)
+            mets["opt/grad_rms"] = tools.compute_rms(grads)
+        self._agc(self._named_params.values())
+        self._scaler.step(self._optimizer)
+        self._scaler.update()
+        self._scheduler.step()
+        self._optimizer.zero_grad(set_to_none=True)
+        mets["opt/lr"] = self._scheduler.get_lr()[0]
+        mets["opt/grad_scale"] = self._scaler.get_scale()
+        if self._log_grads:
+            updates = [(new - old) for (new, old) in zip(self._named_params.values(), old_params)]
+            mets["opt/param_rms"] = tools.compute_rms(self._named_params.values())
+            mets["opt/update_rms"] = tools.compute_rms(updates)
+        metrics.update(mets)
+        self.clone_and_freeze()
+        return metrics
+
     @torch.no_grad()
     def _offline_initial(self, batch_size, warmup_data=None):
         initial = self._initial_tuple(batch_size)
@@ -630,6 +664,93 @@ class Dreamer(nn.Module):
         if post_cache:
             post_state = post_state + tuple(post_cache)
         return post_state, metrics
+
+    def _cal_expert_pretrain_grad(self, data, initial):
+        """Compute expert pretraining gradients without imagined policy rollouts."""
+        losses = {}
+        metrics = {}
+        B, T = data.shape
+
+        embed = self.encoder(data)
+        post = self.rssm.observe(embed, data["action"], initial, data["is_first"], return_cache=False)
+        post_stoch, post_deter, post_logit = post[:3]
+        _, prior_logit = self.rssm.prior(post_deter)
+        dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
+        losses["dyn"] = torch.mean(dyn_loss)
+        losses["rep"] = torch.mean(rep_loss)
+
+        feat = self.rssm.get_feat(post_stoch, post_deter)
+        if self.rep_loss == "dreamer":
+            recon_losses = {
+                key: torch.mean(-dist.log_prob(data[key])) for key, dist in self.decoder(post_stoch, post_deter).items()
+            }
+            losses.update(recon_losses)
+        elif self.rep_loss == "r2dreamer":
+            x1 = self.prj(feat.reshape(B * T, -1))
+            x2 = embed.reshape(B * T, -1).detach()
+            x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + 1e-8)
+            x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + 1e-8)
+            c = torch.mm(x1_norm.T, x2_norm) / (B * T)
+            invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
+            off_diag_mask = ~torch.eye(x1.shape[-1], dtype=torch.bool, device=x1.device)
+            redundancy_loss = c[off_diag_mask].pow(2).sum()
+            losses["barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
+        elif self.rep_loss == "infonce":
+            x1 = self.prj(feat.reshape(B * T, -1))
+            x2 = embed.reshape(B * T, -1).detach()
+            logits = torch.matmul(x1, x2.T)
+            norm_logits = logits - torch.max(logits, 1)[0][:, None]
+            labels = torch.arange(norm_logits.shape[0]).long().to(self.device)
+            losses["infonce"] = torch.nn.functional.cross_entropy(norm_logits, labels)
+        elif self.rep_loss == "dreamerpro":
+            with torch.no_grad():
+                data_aug = self.augment_data(data)
+                initial_aug = tuple(torch.cat([item, item], dim=0) for item in initial)
+                ema_proj = self.ema_proj(data_aug)
+            embed_aug = self.encoder(data_aug)
+            post_aug = self.rssm.observe(embed_aug, data_aug["action"], initial_aug, data_aug["is_first"])
+            post_stoch_aug, post_deter_aug = post_aug[:2]
+            losses.update(self.proto_loss(post_stoch_aug, post_deter_aug, embed_aug, ema_proj))
+        else:
+            raise NotImplementedError
+
+        losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))
+        cont = 1.0 - to_f32(data["is_terminal"])
+        losses["con"] = torch.mean(-self.cont(feat).log_prob(cont))
+        bc_dist = self.actor(feat.detach())
+        losses["bc"] = torch.mean(-bc_dist.log_prob(to_f32(data["action"])))
+
+        last, term, reward = (
+            to_f32(data["is_last"]),
+            to_f32(data["is_terminal"]),
+            to_f32(data["reward"]),
+        )
+        value = self._frozen_value(feat).mode()
+        slow_value = self._frozen_slow_value(feat).mode()
+        disc = 1 - 1 / self.horizon
+        ret = self._lambda_return(last, term, reward, value, value, disc, self.lamb)
+        ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
+        weight = 1.0 - last
+        value_dist = self.value(feat)
+        losses["repval"] = torch.mean(
+            weight[:, :-1]
+            * (-value_dist.log_prob(ret_padded.detach()) - value_dist.log_prob(slow_value.detach()))[:, :-1].unsqueeze(
+                -1
+            )
+        )
+
+        metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
+        metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
+        metrics["bc_logprob"] = -losses["bc"]
+        metrics.update(tools.tensorstats(ret, "ret_replay"))
+        metrics.update(tools.tensorstats(value, "value_replay"))
+        metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
+
+        total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
+        self._scaler.scale(total_loss).backward()
+        metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
+        metrics.update({"opt/loss": total_loss})
+        return metrics
 
     @torch.no_grad()
     def _imagine(self, start, imag_horizon):

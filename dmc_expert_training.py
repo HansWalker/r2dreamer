@@ -1,4 +1,4 @@
-"""Helpers for launching one offline DMC expert training job."""
+"""Helpers for launching one DMC expert training job."""
 
 import json
 import os
@@ -55,7 +55,7 @@ def start_training(
         "train.py",
         "--config-name",
         config,
-        f"offline.data_path={data}",
+        f"expert_data.data_path={data}",
         f"env.task={task}",
         f"offline.resume={str(bool(resume)).lower()}",
         f"logdir={logdir}",

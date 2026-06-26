@@ -13,6 +13,7 @@ class OnlineTrainer:
         self.steps = int(config.steps)
         self.pretrain = int(config.pretrain)
         self.eval_every = int(config.eval_every)
+        self.save_every = int(getattr(config, "save_every", self.eval_every))
         self.eval_episode_num = int(config.eval_episode_num)
         self.video_pred_log = bool(config.video_pred_log)
         self.params_hist_log = bool(config.params_hist_log)
@@ -23,7 +24,25 @@ class OnlineTrainer:
         self._should_pretrain = tools.Once()
         self._should_log = tools.Every(config.update_log_every)
         self._should_eval = tools.Every(self.eval_every)
+        self._should_save = tools.Every(self.save_every)
         self._action_repeat = config.action_repeat
+        self.last_eval_score = None
+        self.best_eval_score = None
+
+    def _online_console(self, step, update_count, fps, metrics):
+        eta = None
+        fps_value = tools.scalar_float(fps)
+        if fps_value is not None and fps_value > 0:
+            eta = (self.steps - step) / fps_value
+        return (
+            f"phase=online | env_step={int(step)}/{self.steps} ({tools.format_percent(step, self.steps)}) | "
+            f"updates={int(update_count)} | "
+            f"speed={tools.format_scalar(fps, 0)}fps | "
+            f"eta={tools.format_eta(eta)} | "
+            f"loss={tools.format_scalar(metrics.get('opt/loss'), 2)} | "
+            f"eval={tools.format_scalar(self.last_eval_score, 1)} | "
+            f"best={tools.format_scalar(self.best_eval_score, 1)}"
+        )
 
     def eval(self, agent, train_step):
         """Run evaluation episodes.
@@ -76,8 +95,13 @@ class OnlineTrainer:
             once_done |= done
         # dict of (B, T, *)
         cache = torch.stack(cache, dim=1) if len(cache) else None
-        self.logger.scalar("episode/eval_score", returns.mean())
-        self.logger.scalar("episode/eval_length", steps.to(torch.float32).mean())
+        score = float(returns.mean())
+        length = float(steps.to(torch.float32).mean())
+        improved = self.best_eval_score is None or score > self.best_eval_score
+        self.last_eval_score = score
+        self.best_eval_score = score if improved else self.best_eval_score
+        self.logger.scalar("episode/eval_score", score)
+        self.logger.scalar("episode/eval_length", length)
         for key, value in log_metrics.items():
             if key == "log_success":
                 value = torch.clip(value, max=1.0)  # make sure 1.0 for success episode
@@ -95,10 +119,19 @@ class OnlineTrainer:
                     )
                 ),
             )
-        self.logger.write(train_step)
+        self.logger.write(
+            train_step,
+            console_message=(
+                f"phase=eval | env_step={int(train_step)} | "
+                f"score={tools.format_scalar(score, 1)} | "
+                f"length={tools.format_scalar(length, 0)} | "
+                f"best={tools.format_scalar(self.best_eval_score, 1)}"
+            ),
+        )
         agent.train()
+        return improved
 
-    def begin(self, agent):
+    def begin(self, agent, save_callback=None):
         """Main online training loop.
 
         For CPU-based environments the loop overlaps CPU stepping and GPU
@@ -124,7 +157,11 @@ class OnlineTrainer:
         while step < self.steps:
             # Evaluation
             if self._should_eval(step) and self.eval_episode_num > 0 and self.eval_envs is not None:
-                self.eval(agent, step)
+                improved = self.eval(agent, step)
+                if save_callback is not None:
+                    save_callback("latest.pt", update_count, step)
+                    if improved:
+                        save_callback("best.pt", update_count, step)
             # Save metrics
             if done.any():
                 for i, d in enumerate(done):
@@ -192,4 +229,11 @@ class OnlineTrainer:
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
-                    self.logger.write(step, fps=True)
+                    fps = self.logger.compute_fps(step)
+                    self.logger.scalar("fps/fps", fps)
+                    self.logger.write(step, console_message=self._online_console(step, update_count, fps, train_metrics))
+                if save_callback is not None and self._should_save(step):
+                    save_callback("latest.pt", update_count, step)
+        if save_callback is not None:
+            save_callback("latest.pt", update_count, step)
+        return {"step": int(step), "updates": int(update_count)}

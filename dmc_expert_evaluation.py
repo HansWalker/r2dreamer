@@ -1,4 +1,4 @@
-"""Helpers for evaluating one offline DMC expert training run."""
+"""Helpers for evaluating one DMC expert training run."""
 
 import json
 import os
@@ -66,9 +66,9 @@ def eval_run(
         }
 
     overrides = [
-        f"offline.eval_episode_num={int(episodes)}",
+        f"eval_episode_num={int(episodes)}",
         f"logdir={logdir}",
-        f"offline.data_path={Path(data)}",
+        f"expert_data.data_path={Path(data)}",
         f"env.task={task}",
     ]
     with initialize_config_dir(config_dir=str(r2dreamer_dir / "configs"), version_base=None):

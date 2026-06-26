@@ -153,20 +153,47 @@ class CudaBenchmark:
         print(self._comment, self._st.elapsed_time(self._nd) / 1000)
 
 
+def scalar_float(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        value = to_np(value)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def format_scalar(value, digits=1):
+    value = scalar_float(value)
+    if value is None:
+        return "-"
+    return f"{value:.{digits}f}"
+
+
+def format_percent(value, total):
+    if total <= 0:
+        return "-"
+    return f"{100 * float(value) / float(total):.0f}%"
+
+
+def format_eta(seconds):
+    seconds = scalar_float(seconds)
+    if seconds is None or seconds < 0:
+        return "-"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
 class Logger:
     CONSOLE_SCALARS = (
         "train/opt/loss",
-        "train/loss/dyn",
-        "train/loss/rep",
-        "train/loss/barlow",
-        "train/loss/rew",
-        "train/loss/con",
-        "train/loss/policy",
-        "train/loss/value",
-        "train/ret_replay_mean",
         "episode/eval_score",
         "train/timing/sec_per_update",
-        "fps/fps",
     )
 
     def __init__(self, logdir, filename="metrics.jsonl"):
@@ -192,12 +219,16 @@ class Logger:
     def histogram(self, name, value):
         self._histograms[name] = np.array(value)
 
-    def write(self, step, fps=False):
+    def write(self, step, fps=False, console_message=None):
         scalars = list(self._scalars.items())
         if fps:
             scalars.append(("fps/fps", self._compute_fps(step)))
-        console_scalars = [(k, v) for k, v in scalars if k in self.CONSOLE_SCALARS]
-        print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in console_scalars))
+        if console_message:
+            print(console_message)
+        else:
+            console_scalars = [(k, v) for k, v in scalars if k in self.CONSOLE_SCALARS]
+            if console_scalars:
+                print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in console_scalars))
         with (self._logdir / self._filename).open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
         for name, value in scalars:
@@ -232,6 +263,9 @@ class Logger:
         self._last_time += duration
         self._last_step = step
         return steps / duration
+
+    def compute_fps(self, step):
+        return self._compute_fps(step)
 
     def log_hydra_config(self, config, name="config", step=0, log_hparams=False, hparams_run_name="."):
         """

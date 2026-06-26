@@ -387,7 +387,7 @@ class RSSM(nn.Module):
         stoch = torch.zeros(batch_size, self._stoch, self._discrete, dtype=torch.float32, device=self._device)
         return stoch, deter
 
-    def observe(self, embed, action, initial, reset):
+    def observe(self, embed, action, initial, reset, return_cache=True):
         """Posterior rollout using observations."""
         # (B, T, E), (B, T, A), ((B, S, K), (B, D), optional cache tensors), (B, T)
         L = action.shape[1]
@@ -395,7 +395,7 @@ class RSSM(nn.Module):
         if self.uses_context:
             cache = self._ensure_cache(cache, stoch.shape[0], deter.device)
         stochs, deters, logits = [], [], []
-        caches = [] if self.uses_context else None
+        caches = [] if self.uses_context and return_cache else None
         for i in range(L):
             # (B, S, K), (B, D), (B, S, K)
             if self.uses_context:

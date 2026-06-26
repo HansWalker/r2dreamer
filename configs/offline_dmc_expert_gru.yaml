@@ -4,7 +4,7 @@ defaults:
   - override hydra/job_logging: disabled
   - _self_
 
-logdir: logdir/offline_dmc_expert/gru/${now:%Y-%m-%d}/${now:%H-%M-%S}
+logdir: logdir/dmc_expert/gru/${now:%Y-%m-%d}/${now:%H-%M-%S}
 seed: 0
 deterministic_run: False
 device: "cuda:0"
@@ -13,27 +13,70 @@ hydra:
   run:
     dir: ${logdir}
 
-batch_size: 16
+batch_size: 32
 batch_length: 64
+eval_episode_num: 2
+
+training:
+  offline_steps: 2500
+  online_steps: 50000
+
+expert_data:
+  data_path: ${oc.env:DMC_EXPERT_DATA_DIR,data/dmc_expert}/walker_walk
 
 env:
   task: dmc_walker_walk
-  env_num: 1
-  eval_episode_num: ${offline.eval_episode_num}
+  env_num: 16
+  eval_episode_num: ${eval_episode_num}
   action_repeat: 2
   time_limit: 1000
 
+buffer:
+  batch_size: ${batch_size}
+  batch_length: ${batch_length}
+  max_size: 5e5
+  device: ${device}
+  storage_device: ${device}
+
+trainer:
+  steps: ${training.online_steps}
+  pretrain: 0
+  eval_every: 10000
+  save_every: 10000
+  eval_episode_num: ${eval_episode_num}
+  batch_size: ${batch_size}
+  batch_length: ${batch_length}
+  train_ratio: ${env.train_ratio}
+  video_pred_log: False
+  params_hist_log: False
+  update_log_every: 5000
+  action_repeat: ${env.action_repeat}
+
+expert_pretrain:
+  enabled: true
+  data_path: ${expert_data.data_path}
+  device: ${device}
+  seed: ${seed}
+  batch_size: ${batch_size}
+  batch_length: ${batch_length}
+  warmup_length: 0
+  full_episodes: true
+  shuffle: true
+  log_every: 50
+  eval_every: 500
+  save_every: 500
+
 offline:
-  data_path: ${oc.env:DMC_EXPERT_DATA_DIR,data/dmc_expert}/walker_walk
+  data_path: ${expert_data.data_path}
   device: ${device}
   seed: ${seed}
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   warmup_length: 32
   shuffle: true
-  updates: 20000
+  updates: ${training.offline_steps}
   eval_every: 1000
-  eval_episode_num: 2
+  eval_episode_num: ${eval_episode_num}
   log_every: 100
   save_every: 500
   resume: false
