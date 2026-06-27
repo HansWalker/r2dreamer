@@ -13,6 +13,8 @@ image_size: 64
 
 expert:
   mpc: true
+  iterations: 4
+  num_samples: 256
 
 refresh_seconds: 10
 progress_every: 25

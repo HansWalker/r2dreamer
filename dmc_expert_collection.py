@@ -37,6 +37,8 @@ def load_collection_config(path, tdmpc2_dir=None, data_dir=None):
         "tasks": [],
         "expert": {
             "mpc": True,
+            "iterations": 4,
+            "num_samples": 256,
         },
     }
     with path.open("r", encoding="utf-8") as f:
@@ -93,6 +95,8 @@ def make_collect_config(base, task, output_dir, path):
         "progress_every": int(base["progress_every"]),
         "expert": {
             "mpc": bool(base.get("expert", {}).get("mpc", True)),
+            "iterations": int(base.get("expert", {}).get("iterations", 4)),
+            "num_samples": int(base.get("expert", {}).get("num_samples", 256)),
         },
     }
     path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")

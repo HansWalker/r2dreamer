@@ -68,6 +68,8 @@ def load_config(path: Path) -> argparse.Namespace:
         "progress_every": 25,
         "expert": {
             "mpc": True,
+            "iterations": 4,
+            "num_samples": 256,
         },
     }
     with path.open("r", encoding="utf-8") as f:
@@ -213,6 +215,10 @@ def make_tdmpc2_cfg(
     expert = expert or {}
     if "mpc" in expert:
         cfg.mpc = bool(expert["mpc"])
+    for key in ("iterations", "num_samples"):
+        if key in expert:
+            cfg[key] = int(expert[key])
+    cfg.num_elites = min(int(cfg.num_elites), int(cfg.num_samples))
     return cfg_to_dataclass(cfg)
 
 
@@ -411,9 +417,7 @@ def dataset_metadata(
         "task_slug": task.slug,
         "policy": "tdmpc2",
         "policy_mode": "mpc" if bool(args.expert.get("mpc", True)) else "actor",
-        "expert": {
-            "mpc": bool(args.expert.get("mpc", True)),
-        },
+        "expert": args.expert,
         "checkpoint_repo": CHECKPOINT_REPO,
         "checkpoint_path": checkpoint_name(task, checkpoint_seed),
         "checkpoint_local_path": str(checkpoint_path),
