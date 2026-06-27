@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -559,6 +560,14 @@ def write_progress(path: Path, episodes: int, rows: int, target: int):
     (path / "progress.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
 def append_episode(h5, episode_idx: int, episode: dict[str, np.ndarray], episode_return: float):
     h5["complete"][episode_idx] = 0
     length = int(episode["actions"].shape[0])
@@ -683,6 +692,7 @@ def collect_task(args: argparse.Namespace, task: TaskSpec, checkpoint_path: Path
 
     completed = completed_episodes(h5)
     returns = []
+    collect_start = time.perf_counter()
     print(
         f"Collecting {task.dmc_name}: {completed}/{args.num_episodes} episodes already present, "
         f"writing to {store_path}"
@@ -725,10 +735,15 @@ def collect_task(args: argparse.Namespace, task: TaskSpec, checkpoint_path: Path
             if should_log:
                 recent = returns[-progress_every:]
                 recent_mean = float(np.mean(recent)) if recent else float("nan")
+                elapsed = time.perf_counter() - collect_start
+                new_episodes = max(episode_num - completed, 1)
+                sec_per_episode = elapsed / new_episodes
+                eta = (args.num_episodes - episode_num) * sec_per_episode
                 print(
                     f"{task.dmc_name} {episode_num}/{args.num_episodes}: "
                     f"last_return={episode_return:.3f}, recent_mean={recent_mean:.3f}, "
-                    f"rows={final_rows}"
+                    f"rows={final_rows}, elapsed={format_duration(elapsed)}, "
+                    f"sec/ep={sec_per_episode:.2f}, eta={format_duration(eta)}"
                 )
     finally:
         h5.close()
