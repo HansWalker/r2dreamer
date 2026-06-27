@@ -1,0 +1,24 @@
+tdmpc2_root: ${TDMPC2_DIR}
+output_dir: ${DMC_EXPERT_DATA_DIR}
+
+num_episodes: 10000
+checkpoint_seed: 1
+seed: 1
+
+action_repeat: 2
+max_episode_steps: 500
+
+save_images: false
+image_size: 64
+
+expert:
+  mpc: true
+  iterations: 3
+  num_samples: 192
+
+refresh_seconds: 10
+progress_every: 25
+resume: false
+
+tasks:
+  - walker/walk
