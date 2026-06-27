@@ -12,11 +12,11 @@ save_images: false
 image_size: 64
 
 expert:
-  mpc: false
+  mpc: true
 
 refresh_seconds: 10
 progress_every: 25
-resume: true
+resume: false
 
 tasks:
   - cartpole/swingup

@@ -66,7 +66,7 @@ def load_config(path: Path) -> argparse.Namespace:
         "resume": False,
         "progress_every": 25,
         "expert": {
-            "mpc": False,
+            "mpc": True,
         },
     }
     with path.open("r", encoding="utf-8") as f:
@@ -409,6 +409,10 @@ def dataset_metadata(
         "task_name": task.task,
         "task_slug": task.slug,
         "policy": "tdmpc2",
+        "policy_mode": "mpc" if bool(args.expert.get("mpc", True)) else "actor",
+        "expert": {
+            "mpc": bool(args.expert.get("mpc", True)),
+        },
         "checkpoint_repo": CHECKPOINT_REPO,
         "checkpoint_path": checkpoint_name(task, checkpoint_seed),
         "checkpoint_local_path": str(checkpoint_path),
