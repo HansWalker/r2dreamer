@@ -62,6 +62,7 @@ def load_config(path: Path) -> argparse.Namespace:
         "seed": 1,
         "action_repeat": 2,
         "max_episode_steps": 500,
+        "time_limit": None,
         "image_size": 64,
         "save_images": True,
         "resume": False,
@@ -379,14 +380,17 @@ def load_agent(
 # DMC environment and dataset metadata.
 
 
-def make_env(task: TaskSpec, seed: int):
+def make_env(task: TaskSpec, seed: int, time_limit: float | None = None):
     from dm_control import suite
     from dm_control.suite.wrappers import action_scale
 
+    task_kwargs = {"random": seed}
+    if time_limit is not None:
+        task_kwargs["time_limit"] = float(time_limit)
     raw_env = suite.load(
         task.domain,
         task.task,
-        task_kwargs={"random": seed},
+        task_kwargs=task_kwargs,
         visualize_reward=False,
     )
     raw_action_spec = raw_env.action_spec()
@@ -437,6 +441,7 @@ def dataset_metadata(
         "raw_action_max": np.asarray(raw_action_spec.maximum, dtype=np.float32).reshape(-1).tolist(),
         "action_repeat": args.action_repeat,
         "max_episode_steps": args.max_episode_steps,
+        "time_limit": args.time_limit,
         "image_size": args.image_size if args.save_images else None,
         "layout": "episode-major dense arrays; observations[e, t], actions[e, t] -> observations[e, t + 1]",
         "data_file": "data.hdf5",
@@ -656,7 +661,9 @@ def collect_episode(
 
 
 def collect_task(args: argparse.Namespace, task: TaskSpec, checkpoint_path: Path) -> dict[str, Any]:
-    _schema_raw_env, schema_env, raw_action_spec, action_spec = make_env(task, args.seed)
+    _schema_raw_env, schema_env, raw_action_spec, action_spec = make_env(
+        task, args.seed, args.time_limit
+    )
     try:
         first_step = schema_env.reset()
         first_obs = dict(first_step.observation)
@@ -707,7 +714,7 @@ def collect_task(args: argparse.Namespace, task: TaskSpec, checkpoint_path: Path
     try:
         for episode_idx in range(completed, args.num_episodes):
             episode_seed = int(args.seed) + int(episode_idx)
-            raw_env, env, _, _ = make_env(task, episode_seed)
+            raw_env, env, _, _ = make_env(task, episode_seed, args.time_limit)
             try:
                 episode, episode_return = collect_episode(
                     raw_env,
