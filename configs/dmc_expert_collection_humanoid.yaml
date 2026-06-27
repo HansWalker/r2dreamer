@@ -1,7 +1,7 @@
 tdmpc2_root: ${TDMPC2_DIR}
 output_dir: ${DMC_EXPERT_DATA_DIR}
 
-num_episodes: 10000
+num_episodes: 5000
 checkpoint_seed: 1
 seed: 1
 
