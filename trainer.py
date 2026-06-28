@@ -197,11 +197,11 @@ class OnlineTrainer:
             # We keep the observation and the action that produced it together.
             # Mask actions after an episode has ended.
             trans["action"] = act * ~done.unsqueeze(-1)
-            trans["stoch"] = agent_state["stoch"]
-            trans["deter"] = agent_state["deter"]
+            trans["stoch"] = agent_state["stoch"].float()
+            trans["deter"] = agent_state["deter"].float()
             for key in MAMBA_CACHE_KEYS:
                 if key in agent_state.keys():
-                    trans[key] = agent_state[key]
+                    trans[key] = agent_state[key].float()
             trans["episode"] = episode_ids  # Don't lift dim
             if "image" in trans:
                 video_cache.append(trans["image"][0])

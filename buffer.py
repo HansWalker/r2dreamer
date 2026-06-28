@@ -61,15 +61,15 @@ class Buffer:
         # Flatten the data
         index = [ind.reshape(-1) for ind in index]
         # (B, T, S, K) -> (B*T, S, K)
-        stoch = stoch.reshape(-1, *stoch.shape[2:])
+        stoch = stoch.reshape(-1, *stoch.shape[2:]).float()
         # (B, T, D) -> (B*T, D)
-        deter = deter.reshape(-1, *deter.shape[2:])
+        deter = deter.reshape(-1, *deter.shape[2:]).float()
         values = {"stoch": stoch, "deter": deter}
         cache = (mamba_angle_state, mamba_ssm_state, mamba_k_state, mamba_v_state)
         if all(value is not None for value in cache):
             values.update(
                 {
-                    key: value.reshape(-1, *value.shape[2:])
+                    key: value.reshape(-1, *value.shape[2:]).float()
                     for key, value in zip(MAMBA_CACHE_KEYS, cache)
                 }
             )
