@@ -35,6 +35,8 @@ def build_config(args):
         overrides.append(f"online_warmup_length={args.online_warmup_length}")
     if args.train_ratio is not None:
         overrides.append(f"env.train_ratio={args.train_ratio}")
+    if args.train_after is not None:
+        overrides.append(f"trainer.train_after={args.train_after}")
 
     with initialize_config_dir(version_base=None, config_dir=str(ROOT / "configs")):
         return compose(config_name=args.config, overrides=overrides)
@@ -53,6 +55,7 @@ def main():
     parser.add_argument("--batch-length", type=int)
     parser.add_argument("--online-warmup-length", type=int)
     parser.add_argument("--train-ratio", type=int)
+    parser.add_argument("--train-after", type=int)
     args = parser.parse_args()
 
     logdir = Path(args.logdir).expanduser()
@@ -73,6 +76,7 @@ def main():
     print(f"Replay warmup length {int(config.buffer.warmup_length)}")
     print(f"Batch length {int(config.buffer.batch_length)}")
     print(f"Train ratio {int(config.trainer.train_ratio)}")
+    print(f"Train after env step {int(config.trainer.train_after)}")
 
     train_envs = eval_envs = None
     try:

@@ -19,6 +19,7 @@ class OnlineTrainer:
         self.params_hist_log = bool(config.params_hist_log)
         self.batch_length = int(config.batch_length)
         self.warmup_length = int(getattr(config, "warmup_length", 0))
+        self.train_after = int(getattr(config, "train_after", 0))
         batch_steps = int(config.batch_size * config.batch_length)
         # train_ratio is based on data steps rather than environment steps.
         self._updates_needed = tools.Every(batch_steps / config.train_ratio * config.action_repeat)
@@ -209,7 +210,8 @@ class OnlineTrainer:
             self.replay_buffer.add_transition(trans.detach())
             returns += trans["reward"][:, 0]
             # Update models after enough data has accumulated
-            if step // (envs.env_num * self._action_repeat) > self.batch_length + self.warmup_length + 1:
+            enough_sequence = step // (envs.env_num * self._action_repeat) > self.batch_length + self.warmup_length + 1
+            if step >= self.train_after and enough_sequence:
                 if self._should_pretrain():
                     update_num = self.pretrain
                 else:
