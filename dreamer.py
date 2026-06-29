@@ -675,6 +675,8 @@ class Dreamer(nn.Module):
 
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})
+        if post_cache:
+            return (post_stoch, post_deter, *post_cache), metrics
         return (post_stoch, post_deter), metrics
 
     def _cal_expert_pretrain_grad(self, data, initial):
