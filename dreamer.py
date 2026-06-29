@@ -352,9 +352,10 @@ class Dreamer(nn.Module):
 
     def update(self, replay_buffer):
         """Sample a batch from replay and perform one optimization step."""
-        data, index, initial = replay_buffer.sample()
+        warmup_data, data, index, initial = replay_buffer.sample()
         torch.compiler.cudagraph_mark_step_begin()
         p_data = self.preprocess(data)
+        initial = self._replay_initial(initial, warmup_data)
         self._update_slow_target()
         if self.rep_loss == "dreamerpro":
             self.ema_update()
@@ -460,6 +461,20 @@ class Dreamer(nn.Module):
     @torch.no_grad()
     def _offline_initial(self, batch_size, warmup_data=None):
         initial = self._initial_tuple(batch_size)
+        if warmup_data is None or warmup_data.shape[1] == 0:
+            return initial
+        p_warmup = self.preprocess(warmup_data)
+        embed = self.encoder(p_warmup)
+        post = self.rssm.observe(embed, p_warmup["action"], initial, p_warmup["is_first"])
+        stoch, deter = post[:2]
+        out = [stoch[:, -1].detach(), deter[:, -1].detach()]
+        if len(post) > 3:
+            out.extend(value[:, -1].detach().clone() for value in post[3:])
+        return tuple(out)
+
+    @torch.no_grad()
+    def _replay_initial(self, initial, warmup_data=None):
+        initial = self._state_tuple(initial)
         if warmup_data is None or warmup_data.shape[1] == 0:
             return initial
         p_warmup = self.preprocess(warmup_data)
@@ -660,10 +675,7 @@ class Dreamer(nn.Module):
 
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})
-        post_state = (post_stoch, post_deter)
-        if post_cache:
-            post_state = post_state + tuple(post_cache)
-        return post_state, metrics
+        return (post_stoch, post_deter), metrics
 
     def _cal_expert_pretrain_grad(self, data, initial):
         """Compute expert pretraining gradients without imagined policy rollouts."""

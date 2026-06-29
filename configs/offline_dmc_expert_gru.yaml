@@ -15,6 +15,7 @@ hydra:
 
 batch_size: 32
 batch_length: 64
+online_warmup_length: 0
 eval_episode_num: 2
 
 training:
@@ -34,6 +35,7 @@ env:
 buffer:
   batch_size: ${batch_size}
   batch_length: ${batch_length}
+  warmup_length: ${online_warmup_length}
   max_size: 5e5
   device: ${device}
   storage_device: ${device}
@@ -46,6 +48,7 @@ trainer:
   eval_episode_num: ${eval_episode_num}
   batch_size: ${batch_size}
   batch_length: ${batch_length}
+  warmup_length: ${online_warmup_length}
   train_ratio: ${env.train_ratio}
   video_pred_log: False
   params_hist_log: False
