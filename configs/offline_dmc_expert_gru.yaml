@@ -50,6 +50,7 @@ trainer:
   batch_length: ${batch_length}
   warmup_length: ${online_warmup_length}
   train_ratio: ${env.train_ratio}
+  train_after: 0
   video_pred_log: False
   params_hist_log: False
   update_log_every: 5000
