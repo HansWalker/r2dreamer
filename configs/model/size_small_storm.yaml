@@ -2,9 +2,9 @@ defaults:
   - _base_
 
 world_model: storm
-deter: 512
+deter: 128
 hidden: 128
-discrete: 32
+discrete: 20
 depth: 8
 units: 128
 act: 'SiLU'
@@ -14,12 +14,12 @@ compile: False
 storm:
   batch_length: ${batch_length}
   transformer_max_length: 1024
-  transformer_hidden_dim: 512
+  transformer_hidden_dim: 128
   transformer_num_layers: 2
   transformer_num_heads: 8
-  stoch_dim: 32
-  encoder_hidden_dim: 512
+  stoch_dim: 20
+  encoder_hidden_dim: 128
   encoder_layers: 3
-  decoder_hidden_dim: 512
+  decoder_hidden_dim: 128
   decoder_layers: 3
   dropout: 0.1
