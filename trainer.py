@@ -1,6 +1,5 @@
 import torch
 
-from constants import MAMBA_CACHE_KEYS
 import tools
 
 
@@ -201,8 +200,8 @@ class OnlineTrainer:
             trans["action"] = act * ~done.unsqueeze(-1)
             trans["stoch"] = agent_state["stoch"].float()
             trans["deter"] = agent_state["deter"].float()
-            for key in MAMBA_CACHE_KEYS:
-                if key in agent_state.keys():
+            if getattr(agent, "store_cache_in_replay", True):
+                for key in getattr(agent, "cache_keys", ()):
                     trans[key] = agent_state[key].float()
             trans["episode"] = episode_ids  # Don't lift dim
             if "image" in trans:

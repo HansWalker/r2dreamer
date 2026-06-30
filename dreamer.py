@@ -9,13 +9,20 @@ from torch import nn
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
 
-from constants import MAMBA_CACHE_KEYS
-import networks
-import rssm
 import tools
-from networks import Projector
+from constants import MAMBA_CACHE_KEYS
+from models.dreamer import networks, rssm
+from models.dreamer.networks import Projector
+from models.storm import StormDreamerAdapter, StormWorldModel
 from optim import LaProp, clip_grad_agc_
 from tools import to_f32
+
+
+def _cfg_get(config, name, default=None):
+    try:
+        return config[name]
+    except Exception:
+        return default
 
 
 class Dreamer(nn.Module):
@@ -33,13 +40,43 @@ class Dreamer(nn.Module):
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
-        self.encoder = networks.MultiEncoder(config.encoder, shapes)
-        self.embed_size = self.encoder.out_dim
-        self.rssm = rssm.RSSM(
-            config.rssm,
-            self.embed_size,
-            self.act_dim,
+        self.world_model = str(_cfg_get(config, "world_model", "dreamer"))
+        if self.world_model == "storm":
+            storm_cfg = _cfg_get(config, "storm")
+            storm_model = StormWorldModel(
+                shapes,
+                self.act_dim,
+                transformer_max_length=_cfg_get(storm_cfg, "transformer_max_length"),
+                batch_length=_cfg_get(storm_cfg, "batch_length"),
+                transformer_hidden_dim=int(_cfg_get(storm_cfg, "transformer_hidden_dim", 512)),
+                transformer_num_layers=int(_cfg_get(storm_cfg, "transformer_num_layers", 2)),
+                transformer_num_heads=int(_cfg_get(storm_cfg, "transformer_num_heads", 8)),
+                stoch_dim=int(_cfg_get(storm_cfg, "stoch_dim", 32)),
+                encoder_hidden_dim=int(_cfg_get(storm_cfg, "encoder_hidden_dim", 512)),
+                encoder_layers=int(_cfg_get(storm_cfg, "encoder_layers", 3)),
+                decoder_hidden_dim=int(_cfg_get(storm_cfg, "decoder_hidden_dim", 512)),
+                decoder_layers=int(_cfg_get(storm_cfg, "decoder_layers", 3)),
+                dropout=float(_cfg_get(storm_cfg, "dropout", 0.1)),
+            )
+            for module in (storm_model.state_decoder, storm_model.reward_decoder, storm_model.termination_decoder):
+                for param in module.parameters():
+                    param.requires_grad_(False)
+            self.encoder = storm_model.encoder
+            self.embed_size = self.encoder.out_dim
+            self.rssm = StormDreamerAdapter(storm_model)
+        else:
+            self.encoder = networks.MultiEncoder(config.encoder, shapes)
+            self.embed_size = self.encoder.out_dim
+            self.rssm = rssm.RSSM(
+                config.rssm,
+                self.embed_size,
+                self.act_dim,
+            )
+        self.cache_keys = tuple(
+            getattr(self.rssm, "cache_keys", MAMBA_CACHE_KEYS if getattr(self.rssm, "uses_context", False) else ())
         )
+        self.store_cache_in_replay = bool(getattr(self.rssm, "store_cache_in_replay", bool(self.cache_keys)))
+        self.returns_sequence_cache = bool(getattr(self.rssm, "returns_sequence_cache", True))
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
 
@@ -73,8 +110,9 @@ class Dreamer(nn.Module):
             "value": self.value,
             "reward": self.reward,
             "cont": self.cont,
-            "encoder": self.encoder,
         }
+        if self.world_model != "storm":
+            modules["encoder"] = self.encoder
 
         if self.rep_loss == "dreamer":
             self.decoder = networks.MultiDecoder(
@@ -126,16 +164,19 @@ class Dreamer(nn.Module):
         # count number of parameters in each module
         for key, module in modules.items():
             if isinstance(module, nn.Parameter):
-                print(f"{module.numel():>14,}: {key}")
+                count = module.numel() if module.requires_grad else 0
             else:
-                print(f"{sum(p.numel() for p in module.parameters()):>14,}: {key}")
+                count = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            print(f"{count:>14,}: {key}")
         self._named_params = OrderedDict()
         for name, module in modules.items():
             if isinstance(module, nn.Parameter):
-                self._named_params[name] = module
+                if module.requires_grad:
+                    self._named_params[name] = module
             else:
                 for param_name, param in module.named_parameters():
-                    self._named_params[f"{name}.{param_name}"] = param
+                    if param.requires_grad:
+                        self._named_params[f"{name}.{param_name}"] = param
         print(f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters.")
 
         def _agc(params):
@@ -247,14 +288,14 @@ class Dreamer(nn.Module):
         if isinstance(state, (tuple, list)):
             return tuple(state)
         out = [state["stoch"], state["deter"]]
-        if all(key in state.keys() for key in MAMBA_CACHE_KEYS):
-            out.extend(state[key] for key in MAMBA_CACHE_KEYS)
+        if all(key in state.keys() for key in self.cache_keys):
+            out.extend(state[key] for key in self.cache_keys)
         return tuple(out)
 
     def _cache_from_state(self, state):
-        if all(key in state.keys() for key in MAMBA_CACHE_KEYS):
-            return tuple(state[key] for key in MAMBA_CACHE_KEYS)
-        return None
+        if all(key in state.keys() for key in self.cache_keys):
+            return tuple(state[key] for key in self.cache_keys)
+        return ()
 
     @torch.no_grad()
     def act(self, obs, state, eval=False):
@@ -272,7 +313,6 @@ class Dreamer(nn.Module):
         prev_cache = self._cache_from_state(state)
         # (B, S, K), (B, D)
         if self._frozen_rssm.uses_context:
-            prev_cache = prev_cache or (None, None, None, None)
             stoch, deter, _, *cache = self._frozen_rssm.obs_step(
                 prev_stoch,
                 prev_deter,
@@ -297,7 +337,7 @@ class Dreamer(nn.Module):
         action = action_dist.mode if eval else action_dist.rsample()
         next_state = {"stoch": stoch, "deter": deter, "prev_action": action}
         if self._frozen_rssm.uses_context:
-            next_state.update({key: value for key, value in zip(MAMBA_CACHE_KEYS, cache)})
+            next_state.update({key: value for key, value in zip(self.cache_keys, cache)})
         return action, TensorDict(
             next_state,
             batch_size=state.batch_size,
@@ -310,7 +350,7 @@ class Dreamer(nn.Module):
         state = {"stoch": stoch, "deter": deter, "prev_action": action}
         cache = self.rssm.initial_context(B)
         if cache is not None:
-            state.update({key: value for key, value in zip(MAMBA_CACHE_KEYS, cache)})
+            state.update({key: value for key, value in zip(self.cache_keys, cache)})
         return TensorDict(state, batch_size=(B,))
 
     @torch.no_grad()
@@ -387,7 +427,7 @@ class Dreamer(nn.Module):
             mets["opt/update_rms"] = update_rms
         metrics.update(mets)
         # update latent vectors in replay buffer
-        replay_buffer.update(index, *(value.detach() for value in post_state))
+        replay_buffer.update(index, *(value.detach() for value in post_state), cache_keys=self.cache_keys)
         return metrics
 
     def update_offline(self, warmup_data, data):
@@ -465,12 +505,8 @@ class Dreamer(nn.Module):
             return initial
         p_warmup = self.preprocess(warmup_data)
         embed = self.encoder(p_warmup)
-        post = self.rssm.observe(embed, p_warmup["action"], initial, p_warmup["is_first"])
-        stoch, deter = post[:2]
-        out = [stoch[:, -1].detach(), deter[:, -1].detach()]
-        if len(post) > 3:
-            out.extend(value[:, -1].detach().clone() for value in post[3:])
-        return tuple(out)
+        post = self.rssm.observe(embed, p_warmup["action"], initial, p_warmup["is_first"], return_cache=True)
+        return self._final_state_from_post(post)
 
     @torch.no_grad()
     def _replay_initial(self, initial, warmup_data=None):
@@ -479,11 +515,17 @@ class Dreamer(nn.Module):
             return initial
         p_warmup = self.preprocess(warmup_data)
         embed = self.encoder(p_warmup)
-        post = self.rssm.observe(embed, p_warmup["action"], initial, p_warmup["is_first"])
+        post = self.rssm.observe(embed, p_warmup["action"], initial, p_warmup["is_first"], return_cache=True)
+        return self._final_state_from_post(post)
+
+    def _final_state_from_post(self, post):
         stoch, deter = post[:2]
         out = [stoch[:, -1].detach(), deter[:, -1].detach()]
         if len(post) > 3:
-            out.extend(value[:, -1].detach().clone() for value in post[3:])
+            if self.returns_sequence_cache:
+                out.extend(value[:, -1].detach().clone() for value in post[3:])
+            else:
+                out.extend(value.detach().clone() for value in post[3:])
         return tuple(out)
 
     def _initial_tuple(self, batch_size):
@@ -769,17 +811,14 @@ class Dreamer(nn.Module):
     @torch.no_grad()
     def _imagine(self, start, imag_horizon):
         """Roll out the policy in latent space."""
-        # (B, S, K), (B, D), optional Mamba3 cache tensors
+        # (B, S, K), (B, D), optional recurrent/context tensors
         feats = []
         actions = []
-        if len(start) == 6:
+        if len(start) >= 2:
             stoch, deter, *cache = start
             cache = tuple(value.clone() for value in cache)
-        elif len(start) == 2:
-            stoch, deter = start
-            cache = None
         else:
-            raise ValueError(f"Expected imagination start with 2 or 6 tensors, got {len(start)}.")
+            raise ValueError(f"Expected imagination start with at least 2 tensors, got {len(start)}.")
         for _ in range(imag_horizon):
             # (B, F)
             feat = self._frozen_rssm.get_feat(stoch, deter)
@@ -789,7 +828,6 @@ class Dreamer(nn.Module):
             feats.append(feat)
             actions.append(action)
             if self._frozen_rssm.uses_context:
-                cache = cache or (None, None, None, None)
                 stoch, deter, *cache = self._frozen_rssm.img_step(stoch, deter, action, *cache)
                 cache = tuple(cache)
             else:

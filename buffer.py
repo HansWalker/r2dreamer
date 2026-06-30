@@ -3,7 +3,7 @@ from tensordict import TensorDict
 from torchrl.data.replay_buffers import LazyTensorStorage, ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SliceSampler
 
-from constants import MAMBA_CACHE_KEYS
+from constants import replay_cache_keys
 
 
 class Buffer:
@@ -42,8 +42,8 @@ class Buffer:
         # Row 0 seeds the recurrent state. Optional warmup rows rebuild context
         # with current model weights before losses are computed on the suffix.
         initial = [sample_td["stoch"][:, 0], sample_td["deter"][:, 0]]
-        if all(key in sample_td.keys() for key in MAMBA_CACHE_KEYS):
-            initial.extend(sample_td[key][:, 0] for key in MAMBA_CACHE_KEYS)
+        for key in replay_cache_keys(sample_td.keys()):
+            initial.append(sample_td[key][:, 0])
         initial = tuple(initial)
         sequence = sample_td[:, 1:]
         sequence.set_("action", sample_td["action"][:, :-1])  # action is 1 step back
@@ -56,7 +56,7 @@ class Buffer:
         index = [ind.view(-1, self.sample_length)[:, 1 + self.warmup_length :] for ind in info["index"]]
         return warmup_data, data, index, initial
 
-    def update(self, index, stoch, deter, *cache):
+    def update(self, index, stoch, deter, *cache, cache_keys=None):
         # Flatten the data
         index = [ind.reshape(-1) for ind in index]
         # (B, T, S, K) -> (B*T, S, K)
@@ -64,7 +64,7 @@ class Buffer:
         # (B, T, D) -> (B*T, D)
         deter = deter.reshape(-1, *deter.shape[2:]).float()
         values = {"stoch": stoch, "deter": deter}
-        for key, value in zip(MAMBA_CACHE_KEYS, cache):
+        for key, value in zip(cache_keys or (), cache):
             values[key] = value.reshape(-1, *value.shape[2:]).float()
         # In storage, the length is the first dimension, and the batch (number of environments) is the second dimension.
         n = index[0].shape[0]

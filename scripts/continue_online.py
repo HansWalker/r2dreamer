@@ -36,7 +36,7 @@ def build_config(args):
     if args.train_ratio is not None:
         overrides.append(f"env.train_ratio={args.train_ratio}")
     if args.train_after is not None:
-        overrides.append(f"trainer.train_after={args.train_after}")
+        overrides.append(f"++trainer.train_after={args.train_after}")
 
     with initialize_config_dir(version_base=None, config_dir=str(ROOT / "configs")):
         return compose(config_name=args.config, overrides=overrides)
