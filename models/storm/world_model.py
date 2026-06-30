@@ -192,7 +192,7 @@ class ScaledDotProductAttention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None = None):
         attn = torch.matmul(q / self.temperature, k.transpose(2, 3))
         if mask is not None:
-            attn = attn.masked_fill(mask == 0, -1e9)
+            attn = attn.masked_fill(mask == 0, torch.finfo(attn.dtype).min)
         attn = self.dropout(F.softmax(attn, dim=-1))
         return torch.matmul(attn, v), attn
 
