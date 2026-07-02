@@ -47,7 +47,7 @@ def eval_run(
         sys.path.insert(0, str(r2dreamer_dir))
 
     from dreamer import Dreamer
-    from offline_replay import DMCExpertReplay
+    from offline_replay import DMCExpertEpisodeReplay
     from train import close_envs, evaluate_policy, make_eval_envs
     import tools
 
@@ -74,7 +74,7 @@ def eval_run(
     with initialize_config_dir(config_dir=str(r2dreamer_dir / "configs"), version_base=None):
         cfg = compose(config_name=config, overrides=overrides)
 
-    replay = DMCExpertReplay(cfg.offline)
+    replay = DMCExpertEpisodeReplay(cfg.expert_pretrain)
     try:
         obs_space = replay.obs_space()
         act_space = replay.act_space()
@@ -83,7 +83,6 @@ def eval_run(
     agent = Dreamer(cfg.model, obs_space, act_space).to(cfg.device)
     checkpoint = torch.load(checkpoint_path, map_location=agent.device, weights_only=False)
     agent.load_state_dict(checkpoint["agent_state_dict"])
-    agent.clone_and_freeze()
     agent.eval()
 
     eval_envs = make_eval_envs(cfg)

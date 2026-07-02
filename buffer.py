@@ -46,7 +46,9 @@ class Buffer:
             initial.append(sample_td[key][:, 0])
         initial = tuple(initial)
         sequence = sample_td[:, 1:]
-        sequence.set_("action", sample_td["action"][:, :-1])  # action is 1 step back
+
+        # Dynamics receive the previous action for each observation.
+        sequence.set_("action", sample_td["action"][:, :-1])
         if self.warmup_length:
             warmup_data = sequence[:, : self.warmup_length]
             data = sequence[:, self.warmup_length :]

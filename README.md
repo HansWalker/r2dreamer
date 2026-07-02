@@ -1,6 +1,6 @@
 ## R2-Dreamer: Redundancy-Reduced World Models without Decoders or Augmentation
 
-This repository provides the official implementation of [R2-Dreamer][r2dreamer] (ICLR 2026), a decoder-free, augmentation-free world model with redundancy-reducing regularization on latent representations. It also includes an efficient PyTorch DreamerV3 reproduction that trains **~5x faster** than a widely used [codebase][dreamerv3-torch], along with other baselines. Selecting R2-Dreamer via the config provides an additional **~1.6x speedup** over this baseline.
+This working branch is based on the [R2-Dreamer][r2dreamer] implementation, but the active experiment configs use a DreamerV3-style reconstruction recipe with expert pretraining support. The original project also includes an efficient PyTorch DreamerV3 reproduction that trains **~5x faster** than a widely used [codebase][dreamerv3-torch].
 
 ## Instructions
 
@@ -25,12 +25,11 @@ Monitoring results:
 tensorboard --logdir ./logdir
 ```
 
-Switching algorithms:
+Training recipe:
 
 ```bash
-# Choose an algorithm via model.rep_loss:
-# r2dreamer|dreamer|infonce|dreamerpro
-python3 train.py model.rep_loss=r2dreamer
+# The active training path uses DreamerV3-style reconstruction losses.
+python3 train.py
 ```
 
 For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).

@@ -18,8 +18,7 @@ storm:
   transformer_num_layers: 2
   transformer_num_heads: 8
   stoch_dim: 20
+  context_length: 16
   encoder_hidden_dim: 128
   encoder_layers: 3
-  decoder_hidden_dim: 128
-  decoder_layers: 3
   dropout: 0.1

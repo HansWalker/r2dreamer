@@ -1,14 +1,13 @@
 """STORM-style world model adapted to DMC state observations.
 
-This module is intentionally standalone for now. It keeps the upstream STORM
-model structure close to the original implementation while replacing the Atari
-CNN encoder/decoder edges with dense networks for DMC proprioceptive states.
+This module keeps the upstream STORM transformer dynamics close to the original
+implementation while replacing the Atari CNN observation edge with a dense
+encoder for DMC proprioceptive states.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Mapping
 
 import torch
@@ -20,19 +19,6 @@ from torch.distributions import OneHotCategorical
 def get_subsequent_mask_with_batch_length(batch_length: int, device) -> torch.Tensor:
     """Return STORM's causal attention mask where True means visible."""
     return (1 - torch.triu(torch.ones((1, batch_length, batch_length), device=device), diagonal=1)).bool()
-
-
-def get_vector_mask(batch_length: int, device) -> torch.Tensor:
-    """Return the single-token KV-cache attention mask used by STORM."""
-    return torch.ones((1, 1, batch_length), device=device).bool()
-
-
-def symlog(x: torch.Tensor) -> torch.Tensor:
-    return torch.sign(x) * torch.log1p(torch.abs(x))
-
-
-def symexp(x: torch.Tensor) -> torch.Tensor:
-    return torch.sign(x) * torch.expm1(torch.abs(x))
 
 
 def _activation(name: str):
@@ -86,7 +72,9 @@ class MLPObservationEncoder(nn.Module):
         self.obs_shapes = obs_shapes
         if isinstance(obs_shapes, Mapping):
             excluded = {"is_first", "is_last", "is_terminal", "reward"}
-            self.keys = tuple(keys) if keys is not None else tuple(k for k in obs_shapes if k not in excluded)
+            self.keys = tuple(keys) if keys is not None else tuple(
+                k for k in obs_shapes if k not in excluded and not k.startswith("log_")
+            )
             self.in_dim = sum(math.prod(obs_shapes[key]) for key in self.keys)
         else:
             self.keys = None
@@ -113,47 +101,6 @@ class MLPObservationEncoder(nn.Module):
         prefix = x.shape[:-1]
         x = self.backbone(x.reshape(-1, x.shape[-1]))
         return x.reshape(*prefix, -1)
-
-
-class MLPObservationDecoder(nn.Module):
-    """Dense replacement for STORM's image CNN decoder."""
-
-    def __init__(
-        self,
-        obs_shapes: Mapping[str, tuple[int, ...]] | tuple[int, ...],
-        latent_dim: int,
-        hidden_dim: int,
-        layers: int,
-        *,
-        act: str = "ReLU",
-        norm: bool = True,
-        keys: tuple[str, ...] | None = None,
-    ):
-        super().__init__()
-        self.obs_shapes = obs_shapes
-        if isinstance(obs_shapes, Mapping):
-            excluded = {"is_first", "is_last", "is_terminal", "reward"}
-            self.keys = tuple(keys) if keys is not None else tuple(k for k in obs_shapes if k not in excluded)
-            self.out_dim = sum(math.prod(obs_shapes[key]) for key in self.keys)
-        else:
-            self.keys = None
-            self.out_dim = math.prod(obs_shapes)
-        self.backbone = _build_mlp(latent_dim, self.out_dim, hidden_dim, layers, act=act, norm=norm)
-
-    def forward(self, latent: torch.Tensor, *, as_dict: bool = False):
-        # (B, L, Z) -> (B, L, obs_dim), or (B, Z) -> (B, obs_dim)
-        prefix = latent.shape[:-1]
-        pred = self.backbone(latent.reshape(-1, latent.shape[-1])).reshape(*prefix, -1)
-        if not as_dict or not isinstance(self.obs_shapes, Mapping):
-            return pred
-        out = {}
-        offset = 0
-        for key in self.keys:
-            shape = self.obs_shapes[key]
-            size = math.prod(shape)
-            out[key] = pred[..., offset : offset + size].reshape(*prefix, *shape)
-            offset += size
-        return out
 
 
 class PositionalEncoding1D(nn.Module):
@@ -288,7 +235,6 @@ class StochasticTransformerKVCache(nn.Module):
             ]
         )
         self.layer_norm = nn.LayerNorm(self.feat_dim, eps=1e-6)
-        self.kv_cache_list: list[torch.Tensor] = []
 
     def _prepare_action(self, action: torch.Tensor, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         if action.dim() == 2:
@@ -361,16 +307,6 @@ class StochasticTransformerKVCache(nn.Module):
             next_cache.append(current_cache)
         return feats, (position + 1, *next_cache)
 
-    def reset_kv_cache_list(self, batch_size: int, dtype: torch.dtype, device=None) -> None:
-        device = device or next(self.parameters()).device
-        self.kv_cache_list = list(self.initial_cache(batch_size, dtype=dtype, device=device))
-
-    def forward_with_kv_cache(self, samples: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        cache = tuple(self.kv_cache_list) if self.kv_cache_list else None
-        feats, cache = self.forward_step_with_cache(samples, action, cache)
-        self.kv_cache_list = list(cache)
-        return feats
-
 
 class DistHead(nn.Module):
     def __init__(self, encoder_feat_dim: int, transformer_hidden_dim: int, stoch_dim: int):
@@ -395,96 +331,6 @@ class DistHead(nn.Module):
         return self.unimix(logits)
 
 
-class RewardDecoder(nn.Module):
-    def __init__(self, num_classes: int, transformer_hidden_dim: int):
-        super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Linear(transformer_hidden_dim, transformer_hidden_dim, bias=False),
-            nn.LayerNorm(transformer_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(transformer_hidden_dim, transformer_hidden_dim, bias=False),
-            nn.LayerNorm(transformer_hidden_dim),
-            nn.ReLU(inplace=True),
-        )
-        self.head = nn.Linear(transformer_hidden_dim, num_classes)
-
-    def forward(self, feat: torch.Tensor) -> torch.Tensor:
-        return self.head(self.backbone(feat))
-
-
-class TerminationDecoder(nn.Module):
-    def __init__(self, transformer_hidden_dim: int):
-        super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Linear(transformer_hidden_dim, transformer_hidden_dim, bias=False),
-            nn.LayerNorm(transformer_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(transformer_hidden_dim, transformer_hidden_dim, bias=False),
-            nn.LayerNorm(transformer_hidden_dim),
-            nn.ReLU(inplace=True),
-        )
-        self.head = nn.Linear(transformer_hidden_dim, 1)
-
-    def forward(self, feat: torch.Tensor) -> torch.Tensor:
-        return self.head(self.backbone(feat)).squeeze(-1)
-
-
-class SymLogTwoHotLoss(nn.Module):
-    def __init__(self, num_classes: int, lower_bound: float, upper_bound: float):
-        super().__init__()
-        self.num_classes = int(num_classes)
-        self.lower_bound = float(lower_bound)
-        self.upper_bound = float(upper_bound)
-        self.bin_length = (self.upper_bound - self.lower_bound) / (self.num_classes - 1)
-        self.register_buffer("bins", torch.linspace(self.lower_bound, self.upper_bound, self.num_classes), persistent=False)
-
-    def forward(self, output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        target = symlog(target)
-        target = target.squeeze(-1) if target.shape[-1:] == (1,) else target
-        index = torch.bucketize(target, self.bins)
-        index = torch.clamp(index, 1, self.num_classes - 1)
-        diff = target - self.bins[index - 1]
-        weight = torch.clamp(diff / self.bin_length, 0, 1).unsqueeze(-1)
-        target_prob = (1 - weight) * F.one_hot(index - 1, self.num_classes) + weight * F.one_hot(index, self.num_classes)
-        loss = -target_prob * F.log_softmax(output, dim=-1)
-        return loss.sum(dim=-1).mean()
-
-    def decode(self, output: torch.Tensor) -> torch.Tensor:
-        return symexp(F.softmax(output, dim=-1) @ self.bins)
-
-
-class CategoricalKLDivLossWithFreeBits(nn.Module):
-    def __init__(self, free_bits: float):
-        super().__init__()
-        self.free_bits = float(free_bits)
-
-    def forward(self, p_logits: torch.Tensor, q_logits: torch.Tensor):
-        p_dist = OneHotCategorical(logits=p_logits)
-        q_dist = OneHotCategorical(logits=q_logits)
-        kl_div = torch.distributions.kl.kl_divergence(p_dist, q_dist)
-        kl_div = kl_div.sum(dim=-1).mean()
-        real_kl_div = kl_div
-        kl_div = torch.max(torch.ones_like(kl_div) * self.free_bits, kl_div)
-        return kl_div, real_kl_div
-
-
-@dataclass
-class StormWorldModelOutput:
-    embedding: torch.Tensor
-    post_logits: torch.Tensor
-    post_sample: torch.Tensor
-    latent: torch.Tensor
-    reconstruction: torch.Tensor
-    dist_feat: torch.Tensor
-    prior_logits: torch.Tensor
-    reward_logits: torch.Tensor
-    termination_logits: torch.Tensor
-
-    @property
-    def feat(self) -> torch.Tensor:
-        return torch.cat([self.latent, self.dist_feat], dim=-1)
-
-
 class StormWorldModel(nn.Module):
     """STORM world model with MLP observation edges for DMC."""
 
@@ -501,8 +347,6 @@ class StormWorldModel(nn.Module):
         stoch_dim: int = 32,
         encoder_hidden_dim: int = 512,
         encoder_layers: int = 3,
-        decoder_hidden_dim: int = 512,
-        decoder_layers: int = 3,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -523,12 +367,6 @@ class StormWorldModel(nn.Module):
             hidden_dim=encoder_hidden_dim,
             layers=encoder_layers,
         )
-        self.state_decoder = MLPObservationDecoder(
-            obs_shapes,
-            latent_dim=self.stoch_flattened_dim,
-            hidden_dim=decoder_hidden_dim,
-            layers=decoder_layers,
-        )
         self.storm_transformer = StochasticTransformerKVCache(
             stoch_dim=self.stoch_flattened_dim,
             action_dim=action_dim,
@@ -543,15 +381,6 @@ class StormWorldModel(nn.Module):
             transformer_hidden_dim=self.transformer_hidden_dim,
             stoch_dim=self.stoch_dim,
         )
-        self.reward_decoder = RewardDecoder(num_classes=255, transformer_hidden_dim=self.transformer_hidden_dim)
-        self.termination_decoder = TerminationDecoder(transformer_hidden_dim=self.transformer_hidden_dim)
-        self.mse_loss_func = nn.MSELoss(reduction="none")
-        self.bce_with_logits_loss_func = nn.BCEWithLogitsLoss()
-        self.symlog_twohot_loss_func = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20)
-        self.categorical_kl_div_loss = CategoricalKLDivLossWithFreeBits(free_bits=1.0)
-
-    def flatten_obs(self, obs) -> torch.Tensor:
-        return self.encoder._flatten_obs(obs)
 
     def straight_through_gradient(self, logits: torch.Tensor, sample_mode: str = "random_sample") -> torch.Tensor:
         dist = OneHotCategorical(logits=logits)
@@ -565,83 +394,3 @@ class StormWorldModel(nn.Module):
 
     def flatten_sample(self, sample: torch.Tensor) -> torch.Tensor:
         return sample.reshape(*sample.shape[:-2], self.stoch_flattened_dim)
-
-    def encode_obs(self, obs, sample_mode: str = "random_sample") -> torch.Tensor:
-        embedding = self.encoder(obs)
-        post_logits = self.dist_head.forward_post(embedding)
-        sample = self.straight_through_gradient(post_logits, sample_mode=sample_mode)
-        return self.flatten_sample(sample)
-
-    def forward(self, obs, action) -> StormWorldModelOutput:
-        embedding = self.encoder(obs)
-        post_logits = self.dist_head.forward_post(embedding)
-        post_sample = self.straight_through_gradient(post_logits, sample_mode="random_sample")
-        latent = self.flatten_sample(post_sample)
-        reconstruction = self.state_decoder(latent)
-        mask = get_subsequent_mask_with_batch_length(latent.shape[1], latent.device)
-        prev_latent = torch.cat([torch.zeros_like(latent[:, :1]), latent[:, :-1]], dim=1)
-        dist_feat = self.storm_transformer(prev_latent, action, mask)
-        prior_logits = self.dist_head.forward_prior(dist_feat)
-        reward_logits = self.reward_decoder(dist_feat)
-        termination_logits = self.termination_decoder(dist_feat)
-        return StormWorldModelOutput(
-            embedding=embedding,
-            post_logits=post_logits,
-            post_sample=post_sample,
-            latent=latent,
-            reconstruction=reconstruction,
-            dist_feat=dist_feat,
-            prior_logits=prior_logits,
-            reward_logits=reward_logits,
-            termination_logits=termination_logits,
-        )
-
-    def calc_last_dist_feat(self, latent: torch.Tensor, action: torch.Tensor):
-        mask = get_subsequent_mask_with_batch_length(latent.shape[1], latent.device)
-        dist_feat = self.storm_transformer(latent, action, mask)
-        last_dist_feat = dist_feat[:, -1:]
-        prior_logits = self.dist_head.forward_prior(last_dist_feat)
-        prior_sample = self.straight_through_gradient(prior_logits, sample_mode="random_sample")
-        return self.flatten_sample(prior_sample), last_dist_feat
-
-    def predict_next(self, last_flattened_sample: torch.Tensor, action: torch.Tensor, reconstruct: bool = True):
-        dist_feat = self.storm_transformer.forward_with_kv_cache(last_flattened_sample, action)
-        prior_logits = self.dist_head.forward_prior(dist_feat)
-        prior_sample = self.straight_through_gradient(prior_logits, sample_mode="random_sample")
-        prior_flattened_sample = self.flatten_sample(prior_sample)
-        obs_hat = self.state_decoder(prior_flattened_sample) if reconstruct else None
-        reward_hat = self.symlog_twohot_loss_func.decode(self.reward_decoder(dist_feat))
-        termination_hat = self.termination_decoder(dist_feat) > 0
-        return obs_hat, reward_hat, termination_hat, prior_flattened_sample, dist_feat
-
-    def reconstruction_loss(self, reconstruction: torch.Tensor, obs) -> torch.Tensor:
-        target = self.flatten_obs(obs).to(reconstruction.dtype)
-        loss = self.mse_loss_func(reconstruction, target)
-        return loss.sum(dim=-1).mean()
-
-    def losses(self, obs, action, reward, termination) -> dict[str, torch.Tensor]:
-        out = self(obs, action)
-        reward = reward.squeeze(-1) if reward.shape[-1:] == (1,) else reward
-        termination = termination.squeeze(-1) if termination.shape[-1:] == (1,) else termination
-        reconstruction_loss = self.reconstruction_loss(out.reconstruction, obs)
-        reward_loss = self.symlog_twohot_loss_func(out.reward_logits, reward)
-        termination_loss = self.bce_with_logits_loss_func(out.termination_logits, termination.to(out.termination_logits.dtype))
-        dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(
-            out.post_logits.detach(),
-            out.prior_logits,
-        )
-        representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(
-            out.post_logits,
-            out.prior_logits.detach(),
-        )
-        total_loss = reconstruction_loss + reward_loss + termination_loss + 0.5 * dynamics_loss + 0.1 * representation_loss
-        return {
-            "reconstruction": reconstruction_loss,
-            "reward": reward_loss,
-            "termination": termination_loss,
-            "dynamics": dynamics_loss,
-            "dynamics_real_kl": dynamics_real_kl_div,
-            "representation": representation_loss,
-            "representation_real_kl": representation_real_kl_div,
-            "total": total_loss,
-        }

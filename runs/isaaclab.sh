@@ -7,7 +7,7 @@ SEED_START=0
 SEED_END=400
 SEED_STEP=100
 MODAL=vision  # proprio/vision
-METHOD=r2dreamer
+METHOD=dreamer
 
 # ==== Tasks ====
 # Each entry is "isaaclab_<GymID>" — the gym registration ID is extracted
@@ -31,7 +31,6 @@ do
             model.compile=True \
             device=cuda:0 \
             buffer.storage_device=cuda:0 \
-            model.rep_loss=${METHOD} \
             seed=$seed
     done
 done

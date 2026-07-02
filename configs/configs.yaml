@@ -32,7 +32,6 @@ trainer:
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   train_ratio: ${env.train_ratio}
-  video_pred_log: False
   params_hist_log: False
   update_log_every: 5e3
   action_repeat: ${env.action_repeat}

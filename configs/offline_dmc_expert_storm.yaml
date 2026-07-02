@@ -15,11 +15,11 @@ hydra:
 
 batch_size: 32
 batch_length: 64
-online_warmup_length: 64
+online_warmup_length: 0
 eval_episode_num: 2
 
 training:
-  offline_steps: 2500
+  offline_epochs: 16
   online_steps: 50000
 
 expert_data:
@@ -51,7 +51,6 @@ trainer:
   warmup_length: ${online_warmup_length}
   train_ratio: ${env.train_ratio}
   train_after: 0
-  video_pred_log: False
   params_hist_log: False
   update_log_every: 5000
   action_repeat: ${env.action_repeat}
@@ -62,26 +61,7 @@ expert_pretrain:
   device: ${device}
   seed: ${seed}
   batch_size: ${batch_size}
-  batch_length: ${batch_length}
-  warmup_length: 0
-  full_episodes: true
   shuffle: true
   log_every: 50
   eval_every: 500
   save_every: 500
-
-offline:
-  data_path: ${expert_data.data_path}
-  device: ${device}
-  seed: ${seed}
-  batch_size: ${batch_size}
-  batch_length: ${batch_length}
-  warmup_length: ${online_warmup_length}
-  shuffle: true
-  updates: ${training.offline_steps}
-  eval_every: 1000
-  eval_episode_num: ${eval_episode_num}
-  log_every: 100
-  save_every: 500
-  resume: false
-  resume_checkpoint: latest.pt

@@ -14,7 +14,6 @@ class OnlineTrainer:
         self.eval_every = int(config.eval_every)
         self.save_every = int(getattr(config, "save_every", self.eval_every))
         self.eval_episode_num = int(config.eval_episode_num)
-        self.video_pred_log = bool(config.video_pred_log)
         self.params_hist_log = bool(config.params_hist_log)
         self.batch_length = int(config.batch_length)
         self.warmup_length = int(getattr(config, "warmup_length", 0))
@@ -62,8 +61,7 @@ class OnlineTrainer:
         steps = torch.zeros(envs.env_num, dtype=torch.int32, device=agent.device)
         returns = torch.zeros(envs.env_num, dtype=torch.float32, device=agent.device)
         log_metrics = {}
-        # cache is only used for video logging / open-loop prediction.
-        cache = []
+        video_cache = []
         agent_state = agent.get_initial_state(envs.env_num)
         # (B, A)
         act = agent_state["prev_action"].clone()
@@ -80,11 +78,10 @@ class OnlineTrainer:
             # (B,)
             done = step_done.to(agent.device)
 
-            # Store transition.
-            # We keep the observation and the action that produced it together.
+            # Store a short rollout for eval video logging on image tasks.
             trans["action"] = act
-            if len(cache) < self.batch_length:
-                cache.append(trans.clone())
+            if len(video_cache) < self.batch_length:
+                video_cache.append(trans.clone())
             # (B, A)
             act, agent_state = agent.act(trans, agent_state, eval=True)
             returns += trans["reward"][:, 0] * ~once_done
@@ -95,7 +92,7 @@ class OnlineTrainer:
                     log_metrics[key] += value[:, 0] * ~once_done
             once_done |= done
         # dict of (B, T, *)
-        cache = torch.stack(cache, dim=1) if len(cache) else None
+        video_cache = torch.stack(video_cache, dim=1) if len(video_cache) else None
         score = float(returns.mean())
         length = float(steps.to(torch.float32).mean())
         improved = self.best_eval_score is None or score > self.best_eval_score
@@ -107,19 +104,8 @@ class OnlineTrainer:
             if key == "log_success":
                 value = torch.clip(value, max=1.0)  # make sure 1.0 for success episode
             self.logger.scalar(f"episode/eval_{key[4:]}", value.mean())
-        if cache is not None and "image" in cache:
-            self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
-        if self.video_pred_log and cache is not None:
-            initial = agent.get_initial_state(1)
-            self.logger.video(
-                "eval_open_loop",
-                tools.to_np(
-                    agent.video_pred(
-                        cache[:1],  # give only first batch
-                        initial,
-                    )
-                ),
-            )
+        if video_cache is not None and "image" in video_cache:
+            self.logger.video("eval_video", tools.to_np(video_cache["image"][:1]))
         self.logger.write(
             train_step,
             console_message=(
@@ -194,15 +180,13 @@ class OnlineTrainer:
             # (B, A)
             act, agent_state = agent.act(trans.clone(), agent_state, eval=False)
 
-            # Store transition.
-            # We keep the observation and the action that produced it together.
-            # Mask actions after an episode has ended.
+            # Store the action selected from this observation. Replay shifts
+            # actions back by one step before teacher-forced dynamics training.
             trans["action"] = act * ~done.unsqueeze(-1)
             trans["stoch"] = agent_state["stoch"].float()
             trans["deter"] = agent_state["deter"].float()
-            if getattr(agent, "store_cache_in_replay", True):
-                for key in getattr(agent, "cache_keys", ()):
-                    trans[key] = agent_state[key].float()
+            for key in getattr(agent, "cache_keys", ()):
+                trans[key] = agent_state[key].float()
             trans["episode"] = episode_ids  # Don't lift dim
             if "image" in trans:
                 video_cache.append(trans["image"][0])
@@ -225,10 +209,6 @@ class OnlineTrainer:
                         value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
                         self.logger.scalar(f"train/{name}", value)
                     self.logger.scalar("train/opt/updates", update_count)
-                    if self.video_pred_log:
-                        warmup_data, data, _, initial = self.replay_buffer.sample()
-                        initial = agent._replay_initial(initial, warmup_data)
-                        self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))

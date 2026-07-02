@@ -15,9 +15,6 @@ class _DMCExpertDataset:
     def __init__(self, config):
         self.path = Path(config.data_path).expanduser()
         self.batch_size = int(config.batch_size)
-        self.batch_length = int(getattr(config, "batch_length", 0))
-        self.warmup_length = int(getattr(config, "warmup_length", 0))
-        self.total_length = self.warmup_length + self.batch_length
         self.shuffle = bool(getattr(config, "shuffle", True))
         self.rng = np.random.default_rng(int(config.seed))
 
@@ -133,57 +130,6 @@ class _DMCExpertDataset:
             value = np.stack([row[key] for row in rows], axis=0)
             data[key] = torch.as_tensor(value)
         return TensorDict(data, batch_size=(self.batch_size, next(iter(data.values())).shape[1]))
-
-
-class DMCExpertReplay(_DMCExpertDataset):
-    """Sample fixed-length Dreamer training windows from expert data."""
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.episodes = np.flatnonzero(self.complete & (self.lengths >= self.total_length))
-        if len(self.episodes) == 0:
-            raise ValueError(
-                f"{self.root_path} has no episodes long enough for "
-                f"warmup_length={self.warmup_length}, batch_length={self.batch_length}."
-            )
-        self.num_episodes = int(len(self.episodes))
-        self.max_starts = self.lengths[self.episodes] - self.total_length
-        self.num_windows = int((self.max_starts + 1).sum())
-        self._seq_episode = 0
-        self._seq_start = 0
-
-    def sample(self):
-        warmup_rows = []
-        train_rows = []
-        for ep_idx, start in self._next_starts():
-            if self.warmup_length:
-                warmup_rows.append(self._make_window(ep_idx, start, self.warmup_length))
-            train_rows.append(self._make_window(ep_idx, start + self.warmup_length, self.batch_length))
-        warmup = self._stack(warmup_rows) if self.warmup_length else None
-        train = self._stack(train_rows)
-        return warmup, train
-
-    def skip_batches(self, count):
-        for _ in range(int(count)):
-            self._next_starts()
-
-    def _next_starts(self):
-        if self.shuffle:
-            ep_pos = self.rng.integers(0, len(self.episodes), size=self.batch_size)
-            starts = np.array(
-                [self.rng.integers(0, self.max_starts[pos] + 1) for pos in ep_pos],
-                dtype=np.int64,
-            )
-            return np.stack([self.episodes[ep_pos], starts], axis=1)
-
-        rows = []
-        for _ in range(self.batch_size):
-            rows.append((int(self.episodes[self._seq_episode]), int(self._seq_start)))
-            self._seq_start += 1
-            if self._seq_start > self.max_starts[self._seq_episode]:
-                self._seq_start = 0
-                self._seq_episode = (self._seq_episode + 1) % len(self.episodes)
-        return np.asarray(rows, dtype=np.int64)
 
 
 class DMCExpertEpisodeReplay(_DMCExpertDataset):

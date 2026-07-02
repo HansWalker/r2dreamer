@@ -120,9 +120,15 @@ class MultiEncoder(nn.Module):
             self.selectors.append(lambda obs: torch.cat([obs[k] for k in self.cnn_shapes], -1))
             self.out_dim += self.encoders[-1].out_dim
         if self.mlp_shapes:
-            inp_dim = sum([sum(v) for v in self.mlp_shapes.values()])
+            inp_dim = sum(math.prod(v) for v in self.mlp_shapes.values())
             self.encoders.append(MLP(config.mlp, inp_dim))
-            self.selectors.append(lambda obs: torch.cat([obs[k] for k in self.mlp_shapes], -1))
+            self.selectors.append(
+                lambda obs: torch.cat(
+                    [obs[k].reshape(*obs[k].shape[: -len(self.mlp_shapes[k])], math.prod(self.mlp_shapes[k]))
+                     for k in self.mlp_shapes],
+                    -1,
+                )
+            )
             self.out_dim += self.encoders[-1].out_dim
         self.encoders = nn.ModuleList(self.encoders)
 
@@ -144,8 +150,8 @@ class MultiEncoder(nn.Module):
 class MultiDecoder(nn.Module):
     def __init__(self, config, deter, flat_stoch, shapes):
         super().__init__()
-        excluded = ("is_first", "is_last", "is_terminal")
-        shapes = {k: v for k, v in shapes.items() if k not in excluded}
+        excluded = ("is_first", "is_last", "is_terminal", "reward")
+        shapes = {k: v for k, v in shapes.items() if k not in excluded and not k.startswith("log_")}
         self.cnn_shapes = {k: v for k, v in shapes.items() if len(v) == 3 and re.match(config.cnn_keys, k)}
         self.mlp_shapes = {k: v for k, v in shapes.items() if len(v) in (1, 2) and re.match(config.mlp_keys, k)}
         print("Decoder CNN shapes:", self.cnn_shapes)
@@ -164,7 +170,7 @@ class MultiDecoder(nn.Module):
             )
             self._image_dist = partial(getattr(dists, str(config.cnn_dist.name)), **config.cnn_dist)
         if self.mlp_shapes:
-            shape = (sum(sum(x) for x in self.mlp_shapes.values()),)
+            shape = (sum(math.prod(x) for x in self.mlp_shapes.values()),)
             config.mlp.shape = shape
             self._mlp = MLPHead(config.mlp, deter + flat_stoch)
             self._mlp_dist = partial(getattr(dists, str(config.mlp_dist.name)), **config.mlp_dist)
@@ -180,11 +186,15 @@ class MultiDecoder(nn.Module):
             outputs = torch.split(outputs, split_sizes, -1)
             dists.update({key: self._image_dist(output) for key, output in zip(self.cnn_shapes.keys(), outputs)})
         if self.mlp_shapes:
-            split_sizes = [v[0] for v in self.mlp_shapes.values()]
+            split_sizes = [math.prod(v) for v in self.mlp_shapes.values()]
             # (B, T, S*K + D)
             feat = torch.cat([stoch.reshape(*deter.shape[:-1], -1), deter], -1)
             outputs = self._mlp(feat)
             outputs = torch.split(outputs, split_sizes, -1)
+            outputs = [
+                output.reshape(*output.shape[:-1], *shape)
+                for output, shape in zip(outputs, self.mlp_shapes.values())
+            ]
             dists.update({key: self._mlp_dist(output) for key, output in zip(self.mlp_shapes.keys(), outputs)})
         return dists
 
@@ -375,16 +385,6 @@ class MLPHead(nn.Module):
         """Produce a distribution head."""
         # (B, T, F)
         return self._dist(self.last(self.mlp(x)))
-
-
-class Projector(nn.Module):
-    def __init__(self, in_ch1, in_ch2):
-        super().__init__()
-        self.w = nn.Linear(in_ch1, in_ch2, bias=False)
-        self.apply(weight_init_)
-
-    def forward(self, x):
-        return self.w(x)
 
 
 class ReturnEMA(nn.Module):

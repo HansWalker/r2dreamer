@@ -6,23 +6,25 @@ import torch
 from torch import nn
 from torch.distributions import Independent, OneHotCategorical
 
-from constants import storm_cache_keys
 from .world_model import StormWorldModel, get_subsequent_mask_with_batch_length
+
+
+CONTEXT_STOCH_KEY = "storm_context_stoch"
+CONTEXT_ACTION_KEY = "storm_context_action"
+CONTEXT_LENGTH_KEY = "storm_context_length"
 
 
 class StormDreamerAdapter(nn.Module):
     """Expose STORM dynamics through a Dreamer RSSM-like interface."""
 
-    uses_context = True
-
-    def __init__(self, world_model: StormWorldModel):
+    def __init__(self, world_model: StormWorldModel, *, context_length: int = 16):
         super().__init__()
         self.world_model = world_model
         self.flat_stoch = int(world_model.stoch_flattened_dim)
         self._deter = int(world_model.transformer_hidden_dim)
         self.feat_size = self.flat_stoch + self._deter
-        self.cache_keys = storm_cache_keys(len(world_model.storm_transformer.layer_stack))
-        self.store_cache_in_replay = False
+        self.context_length = int(context_length)
+        self.cache_keys = ()
         self.returns_sequence_cache = False
 
     @property
@@ -38,6 +40,22 @@ class StormDreamerAdapter(nn.Module):
     def initial_context(self, batch_size: int, dtype=None):
         dtype = dtype or torch.float32
         return self.world_model.storm_transformer.initial_cache(batch_size, dtype=dtype, device=self.device)
+
+    def initial_actor_state(self, batch_size: int, act_dim: int):
+        stoch, deter = self.initial(batch_size)
+        device = self.device
+        return {
+            "stoch": stoch,
+            "deter": deter,
+            "prev_action": torch.zeros(batch_size, act_dim, dtype=torch.float32, device=device),
+            CONTEXT_STOCH_KEY: torch.zeros(
+                batch_size, self.context_length, self.flat_stoch, dtype=torch.float32, device=device
+            ),
+            CONTEXT_ACTION_KEY: torch.zeros(
+                batch_size, self.context_length, act_dim, dtype=torch.float32, device=device
+            ),
+            CONTEXT_LENGTH_KEY: torch.zeros(batch_size, dtype=torch.long, device=device),
+        }
 
     def _unpack_state(self, state):
         if len(state) < 2:
@@ -60,6 +78,85 @@ class StormDreamerAdapter(nn.Module):
         post_logit = self.world_model.dist_head.forward_post(embed)
         post_sample = self.world_model.straight_through_gradient(post_logit, sample_mode=sample_mode)
         return self.world_model.flatten_sample(post_sample), post_logit
+
+    def _reset_actor_context(self, context_stoch, context_action, context_length, reset):
+        reset = reset.reshape(reset.shape[0], -1).any(dim=-1)
+        reset_stoch = reset.reshape(reset.shape[0], 1, 1)
+        reset_length = reset.reshape(reset.shape[0])
+        context_stoch = torch.where(reset_stoch, torch.zeros_like(context_stoch), context_stoch)
+        context_action = torch.where(reset_stoch, torch.zeros_like(context_action), context_action)
+        context_length = torch.where(reset_length, torch.zeros_like(context_length), context_length)
+        return context_stoch, context_action, context_length
+
+    def _append_context(self, context_stoch, context_action, context_length, stoch, action):
+        max_len = context_stoch.shape[1]
+        full = context_length >= max_len
+        shifted_stoch = torch.cat([context_stoch[:, 1:], stoch.unsqueeze(1)], dim=1)
+        shifted_action = torch.cat([context_action[:, 1:], action.unsqueeze(1)], dim=1)
+
+        batch = torch.arange(context_stoch.shape[0], device=context_stoch.device)
+        insert = torch.clamp(context_length, max=max_len - 1)
+        updated_stoch = context_stoch.clone()
+        updated_action = context_action.clone()
+        updated_stoch[batch, insert] = stoch
+        updated_action[batch, insert] = action
+
+        full_stoch = full.reshape(-1, 1, 1)
+        context_stoch = torch.where(full_stoch, shifted_stoch, updated_stoch)
+        context_action = torch.where(full_stoch, shifted_action, updated_action)
+        context_length = torch.clamp(context_length + 1, max=max_len)
+        return context_stoch, context_action, context_length
+
+    def _last_deter_from_context(self, context_stoch, context_action, context_length):
+        length = context_stoch.shape[1]
+        mask = get_subsequent_mask_with_batch_length(length, context_stoch.device)
+        deters = self.world_model.storm_transformer(context_stoch, context_action, mask)
+        index = torch.clamp(context_length, min=1, max=length) - 1
+        batch = torch.arange(context_stoch.shape[0], device=context_stoch.device)
+        return deters[batch, index]
+
+    def feature_from_context(self, context_stoch, context_action, context_length):
+        deter = self._last_deter_from_context(context_stoch, context_action, context_length)
+        stoch, _ = self.prior(deter)
+        return self.get_feat(stoch, deter), deter
+
+    def actor_step(self, embed, state, reset):
+        context_stoch = state[CONTEXT_STOCH_KEY]
+        context_action = state[CONTEXT_ACTION_KEY]
+        context_length = state[CONTEXT_LENGTH_KEY]
+        context_stoch, context_action, context_length = self._reset_actor_context(
+            context_stoch, context_action, context_length, reset
+        )
+
+        stoch, _ = self._post_from_embed(embed)
+        random_mask = context_length == 0
+        feat, deter = self.feature_from_context(context_stoch, context_action, context_length)
+        feat = torch.where(random_mask.reshape(-1, 1), torch.zeros_like(feat), feat)
+        deter = torch.where(random_mask.reshape(-1, 1), torch.zeros_like(deter), deter)
+
+        state_update = {
+            "stoch": stoch,
+            "deter": deter,
+            CONTEXT_STOCH_KEY: context_stoch,
+            CONTEXT_ACTION_KEY: context_action,
+            CONTEXT_LENGTH_KEY: context_length,
+        }
+        return feat, state_update, random_mask
+
+    def actor_state_after_action(self, state_update, action):
+        context_stoch, context_action, context_length = self._append_context(
+            state_update[CONTEXT_STOCH_KEY],
+            state_update[CONTEXT_ACTION_KEY],
+            state_update[CONTEXT_LENGTH_KEY],
+            state_update["stoch"],
+            action,
+        )
+        state_update[CONTEXT_STOCH_KEY] = context_stoch
+        state_update[CONTEXT_ACTION_KEY] = context_action
+        state_update[CONTEXT_LENGTH_KEY] = context_length
+        state_update["deter"] = self._last_deter_from_context(context_stoch, context_action, context_length)
+        state_update["prev_action"] = action
+        return state_update
 
     def _can_vector_observe(self, cache, reset, return_cache: bool) -> bool:
         if return_cache:
@@ -160,6 +257,16 @@ class StormDreamerAdapter(nn.Module):
             stochs.append(stoch)
             deters.append(deter)
         return torch.stack(stochs, dim=1), torch.stack(deters, dim=1), *cache
+
+    def imagination_start(self, post_stoch, post_deter, data, post_cache=None):
+        return (
+            post_stoch.reshape(-1, self.flat_stoch).detach(),
+            post_deter.reshape(-1, self._deter).detach(),
+        )
+
+    def imagine_step(self, stoch, deter, action, cache):
+        stoch, deter, *cache = self.img_step(stoch, deter, action, *cache)
+        return stoch, deter, tuple(cache)
 
     def get_feat(self, stoch, deter):
         return torch.cat([stoch.reshape(*stoch.shape[:-1], self.flat_stoch), deter], dim=-1)

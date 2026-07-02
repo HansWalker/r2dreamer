@@ -6,7 +6,7 @@ DATE=$(date +%m%d) # auto complete
 SEED_START=0
 SEED_END=400
 SEED_STEP=100
-METHOD=r2dreamer
+METHOD=dreamer
 
 # ==== Tasks ====
 tasks=(
@@ -74,7 +74,6 @@ do
             model.compile=True \
             device=cuda:0 \
             buffer.storage_device=cuda:0 \
-            model.rep_loss=${METHOD} \
             seed=$seed
     done
 done

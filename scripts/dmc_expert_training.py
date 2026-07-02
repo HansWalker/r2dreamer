@@ -39,7 +39,6 @@ def start_training(
     data,
     task,
     logdir,
-    resume=False,
     extra=None,
 ):
     data = Path(data)
@@ -57,7 +56,6 @@ def start_training(
         config,
         f"expert_data.data_path={data}",
         f"env.task={task}",
-        f"offline.resume={str(bool(resume)).lower()}",
         f"logdir={logdir}",
     ]
     cmd.extend(extra or [])

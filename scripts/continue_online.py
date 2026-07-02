@@ -88,7 +88,6 @@ def main():
         checkpoint = torch.load(checkpoint_path, map_location=agent.device, weights_only=False)
         agent.load_state_dict(checkpoint["agent_state_dict"])
         tools.recursively_load_optim_state_dict(agent, checkpoint.get("optims_state_dict", {}))
-        agent.clone_and_freeze()
         print(
             "Loaded source checkpoint: "
             f"update={checkpoint.get('update', '-')}, online_step={checkpoint.get('online_step', '-')}"

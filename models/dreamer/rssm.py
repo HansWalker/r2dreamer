@@ -2,6 +2,7 @@ import torch
 from torch import distributions as torchd
 from torch import nn
 
+from constants import MAMBA_CACHE_KEYS
 from . import distributions as dists
 from .networks import BlockLinear, LambdaLayer
 from .utils import rpad, weight_init_
@@ -344,6 +345,14 @@ class RSSM(nn.Module):
     def uses_context(self):
         return self._core == "mamba3"
 
+    @property
+    def cache_keys(self):
+        return MAMBA_CACHE_KEYS if self.uses_context else ()
+
+    @property
+    def returns_sequence_cache(self):
+        return True
+
     def initial_context(self, batch_size, dtype=None):
         if not self.uses_context:
             return None
@@ -386,6 +395,36 @@ class RSSM(nn.Module):
         deter = torch.zeros(batch_size, self._deter, dtype=torch.float32, device=self._device)
         stoch = torch.zeros(batch_size, self._stoch, self._discrete, dtype=torch.float32, device=self._device)
         return stoch, deter
+
+    def initial_actor_state(self, batch_size, act_dim):
+        stoch, deter = self.initial(batch_size)
+        state = {
+            "stoch": stoch,
+            "deter": deter,
+            "prev_action": torch.zeros(batch_size, act_dim, dtype=torch.float32, device=self._device),
+        }
+        cache = self.initial_context(batch_size)
+        if cache is not None:
+            state.update({key: value for key, value in zip(self.cache_keys, cache)})
+        return state
+
+    def actor_step(self, embed, state, reset):
+        prev_stoch = state["stoch"]
+        prev_deter = state["deter"]
+        prev_action = state["prev_action"]
+        cache = tuple(state[key] for key in self.cache_keys) if self.cache_keys else ()
+        if self.uses_context:
+            stoch, deter, _, *cache = self.obs_step(prev_stoch, prev_deter, prev_action, embed, reset, *cache)
+            state_update = {key: value for key, value in zip(self.cache_keys, cache)}
+        else:
+            stoch, deter, _ = self.obs_step(prev_stoch, prev_deter, prev_action, embed, reset)
+            state_update = {}
+        state_update.update({"stoch": stoch, "deter": deter})
+        return self.get_feat(stoch, deter), state_update, None
+
+    def actor_state_after_action(self, state_update, action):
+        state_update["prev_action"] = action
+        return state_update
 
     def observe(self, embed, action, initial, reset, return_cache=True):
         """Posterior rollout using observations."""
@@ -535,6 +574,22 @@ class RSSM(nn.Module):
         if caches is not None:
             return stochs, deters, *self._stack_cache(caches)
         return stochs, deters
+
+    def imagination_start(self, post_stoch, post_deter, data, post_cache=None):
+        start = (
+            post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
+            post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
+        )
+        if post_cache:
+            start = start + tuple(value.reshape(-1, *value.shape[2:]).detach().clone() for value in post_cache)
+        return start
+
+    def imagine_step(self, stoch, deter, action, cache):
+        if self.uses_context:
+            stoch, deter, *cache = self.img_step(stoch, deter, action, *cache)
+            return stoch, deter, tuple(cache)
+        stoch, deter = self.img_step(stoch, deter, action)
+        return stoch, deter, ()
 
     def get_feat(self, stoch, deter):
         """Flatten stoch and concatenate with deter."""

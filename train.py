@@ -1,5 +1,4 @@
 import atexit
-import json
 import math
 import pathlib
 import sys
@@ -34,49 +33,6 @@ def save_checkpoint(agent, logdir, name, update=None, **metadata):
     torch.save(items_to_save, logdir / name)
 
 
-def latest_logged_update(logdir):
-    path = logdir / "metrics.jsonl"
-    if not path.exists():
-        return 0
-    latest = 0
-    with path.open("r") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if "train/opt/updates" in row:
-                latest = max(latest, int(row["train/opt/updates"]))
-    return latest
-
-
-def maybe_resume_offline(agent, config, logdir):
-    if not bool(getattr(config.offline, "resume", False)):
-        return 0
-    checkpoint_path = logdir / str(getattr(config.offline, "resume_checkpoint", "latest.pt"))
-    if not checkpoint_path.exists():
-        print(f"Resume requested but checkpoint is missing: {checkpoint_path}. Starting from update 0.")
-        return 0
-
-    print(f"Resume offline training from: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=agent.device, weights_only=False)
-    try:
-        agent.load_state_dict(checkpoint["agent_state_dict"])
-        tools.recursively_load_optim_state_dict(agent, checkpoint.get("optims_state_dict", {}))
-    except RuntimeError as exc:
-        raise RuntimeError(
-            "Could not resume offline checkpoint. This usually means the checkpoint "
-            "was created with different model dimensions/config. Use the same model "
-            "config as the checkpoint or start a fresh logdir."
-        ) from exc
-    agent.clone_and_freeze()
-    update = int(checkpoint.get("update", 0)) or latest_logged_update(logdir)
-    print(f"Resumed at update {update}.")
-    return update
-
-
 def close_envs(envs):
     if envs is None:
         return
@@ -105,11 +61,11 @@ def format_eval_console(step_label, step, score, length, best_score):
     )
 
 
-def format_expert_console(update, updates, episode_pass, total_passes, sec_per_update, metrics, eval_score, best_score):
+def format_expert_console(update, updates, epoch, total_epochs, sec_per_update, metrics, eval_score, best_score):
     eta = (updates - update) * sec_per_update
     return (
         f"phase=expert | update={update}/{updates} ({tools.format_percent(update, updates)}) | "
-        f"pass={tools.format_scalar(episode_pass, 1)}/{tools.format_scalar(total_passes, 1)} | "
+        f"epoch={tools.format_scalar(epoch, 1)}/{tools.format_scalar(total_epochs, 1)} | "
         f"speed={tools.format_scalar(sec_per_update, 2)}s/update | "
         f"eta={tools.format_eta(eta)} | "
         f"loss={tools.format_scalar(metrics.get('opt/loss'), 2)} | "
@@ -117,6 +73,20 @@ def format_expert_console(update, updates, episode_pass, total_passes, sec_per_u
         f"eval={tools.format_scalar(eval_score, 1)} | "
         f"best={tools.format_scalar(best_score, 1)}"
     )
+
+
+def expert_pretrain_schedule(config, replay):
+    """Convert user-facing expert epochs into optimizer updates.
+
+    The combined expert-pretrain path is configured in dataset epochs because
+    that is easier to reason about than raw update counts.
+    """
+    min_updates = math.ceil(2 * replay.num_episodes / replay.batch_size)
+    requested_epochs = float(config.training.offline_epochs)
+    requested_updates = math.ceil(requested_epochs * replay.num_episodes / replay.batch_size)
+    updates = max(requested_updates, min_updates)
+    epochs = updates * replay.batch_size / replay.num_episodes
+    return requested_epochs, requested_updates, updates, epochs, min_updates
 
 
 @torch.no_grad()
@@ -138,9 +108,6 @@ def evaluate_policy(agent, eval_envs, logger, step, step_label="step", best_scor
             trans = trans.to(agent.device, non_blocking=True)
             done = step_done.to(agent.device)
             act, agent_state = agent.act(trans, agent_state, eval=True)
-            if not torch.isfinite(act).all():
-                raise RuntimeError("Policy produced non-finite actions during evaluation.")
-            act = torch.clamp(act, -1.0, 1.0)
             returns += trans["reward"][:, 0] * ~once_done
             once_done |= done
         score = float(returns.mean())
@@ -152,101 +119,6 @@ def evaluate_policy(agent, eval_envs, logger, step, step_label="step", best_scor
         return score
     finally:
         agent.train()
-
-
-def train_offline(config, logger, logdir):
-    from offline_replay import DMCExpertReplay
-
-    print(f"Load offline data: {config.offline.data_path}")
-    replay = DMCExpertReplay(config.offline)
-    eval_envs = None
-    try:
-        print(f"Offline data: {replay.path}")
-        print(f"Offline episodes: {len(replay.episodes)}")
-        print(f"Offline windows: {replay.num_windows}")
-
-        if int(config.offline.eval_episode_num) > 0:
-            print("Create eval envs.")
-            eval_envs = make_eval_envs(config)
-
-        print("Create agent.")
-        agent = Dreamer(config.model, replay.obs_space(), replay.act_space()).to(config.device)
-        start_update = maybe_resume_offline(agent, config, logdir)
-        replay.skip_batches(start_update)
-
-        best_score = None
-        train_metrics = {}
-        updates = int(config.offline.updates)
-        eval_every = int(config.offline.eval_every)
-        log_every = int(config.offline.log_every)
-        save_every = int(config.offline.save_every)
-        if start_update >= updates:
-            print(f"Checkpoint is already at update {start_update}; target is {updates}. Nothing to train.")
-            save_checkpoint(agent, logdir, "latest.pt", update=start_update)
-            return
-
-        last_eval_success_update = None
-        train_start_time = time.perf_counter()
-        for update in range(start_update + 1, updates + 1):
-            warmup_data, data = replay.sample()
-            if warmup_data is not None:
-                warmup_data = warmup_data.to(config.device, non_blocking=True)
-            data = data.to(config.device, non_blocking=True)
-            train_metrics = agent.update_offline(warmup_data, data)
-
-            if log_every and update % log_every == 0:
-                completed_updates = update - start_update
-                elapsed = time.perf_counter() - train_start_time
-                sec_per_update = elapsed / max(completed_updates, 1)
-                for name, value in train_metrics.items():
-                    value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
-                    logger.scalar(f"train/{name}", value)
-                logger.scalar("train/opt/updates", update)
-                logger.scalar("train/timing/sec_per_update", sec_per_update)
-                logger.write(update, fps=True)
-
-            if eval_every and update % eval_every == 0:
-                save_checkpoint(agent, logdir, "latest.pt", update=update)
-                try:
-                    score = evaluate_policy(agent, eval_envs, logger, update, step_label="update", best_score=best_score)
-                except Exception as exc:
-                    print(f"Evaluation failed at update {update}: {type(exc).__name__}: {exc}")
-                    logger.scalar("episode/eval_error", 1.0)
-                    logger.write(update)
-                    close_envs(eval_envs)
-                    eval_envs = make_eval_envs(config) if int(config.offline.eval_episode_num) > 0 else None
-                else:
-                    last_eval_success_update = update
-                    if score is not None and (best_score is None or score > best_score):
-                        best_score = score
-                        save_checkpoint(agent, logdir, "best.pt", update=update)
-
-            if save_every and update % save_every == 0:
-                save_checkpoint(agent, logdir, "latest.pt", update=update)
-
-        if train_metrics:
-            completed_updates = updates - start_update
-            elapsed = time.perf_counter() - train_start_time
-            sec_per_update = elapsed / max(completed_updates, 1)
-            for name, value in train_metrics.items():
-                value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
-                logger.scalar(f"train/{name}", value)
-            logger.scalar("train/opt/updates", updates)
-            logger.scalar("train/timing/sec_per_update", sec_per_update)
-            logger.write(updates, fps=True)
-        save_checkpoint(agent, logdir, "latest.pt", update=updates)
-        should_final_eval = int(config.offline.eval_episode_num) > 0 and last_eval_success_update != updates
-        if should_final_eval:
-            try:
-                score = evaluate_policy(agent, eval_envs, logger, updates, step_label="update", best_score=best_score)
-            except Exception as exc:
-                print(f"Final evaluation failed: {type(exc).__name__}: {exc}")
-                score = None
-            if score is not None and (best_score is None or score > best_score):
-                save_checkpoint(agent, logdir, "best.pt", update=updates)
-    finally:
-        replay.close()
-        close_envs(eval_envs)
 
 
 def train_expert_then_online(config, logger, logdir):
@@ -268,14 +140,12 @@ def train_expert_then_online(config, logger, logdir):
         print("Create agent.")
         agent = Dreamer(config.model, replay.obs_space(), replay.act_space()).to(config.device)
 
-        requested_updates = int(config.training.offline_steps)
-        min_updates = math.ceil(2 * replay.num_episodes / replay.batch_size)
-        updates = max(requested_updates, min_updates)
-        passes = updates * replay.batch_size / replay.num_episodes
+        requested_epochs, requested_updates, updates, epochs, min_updates = expert_pretrain_schedule(config, replay)
         print(
             "Offline expert pretrain: "
-            f"{updates} updates, requested={requested_updates}, "
-            f"batch_size={replay.batch_size}, about {passes:.1f} episode passes"
+            f"{epochs:.2f} epochs, {updates} updates, "
+            f"requested_epochs={requested_epochs:.2f}, requested_updates={requested_updates}, "
+            f"minimum_updates={min_updates}, batch_size={replay.batch_size}"
         )
 
         best_score = None
@@ -295,7 +165,7 @@ def train_expert_then_online(config, logger, logdir):
                     value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
                     logger.scalar(f"train/{name}", value)
                 logger.scalar("train/opt/updates", update)
-                logger.scalar("train/expert_pretrain/passes", update * replay.batch_size / replay.num_episodes)
+                logger.scalar("train/expert_pretrain/epochs", update * replay.batch_size / replay.num_episodes)
                 logger.scalar("train/timing/sec_per_update", sec_per_update)
                 logger.write(
                     update,
@@ -303,7 +173,7 @@ def train_expert_then_online(config, logger, logdir):
                         update,
                         updates,
                         update * replay.batch_size / replay.num_episodes,
-                        passes,
+                        epochs,
                         sec_per_update,
                         train_metrics,
                         last_eval_score,
@@ -337,15 +207,15 @@ def train_expert_then_online(config, logger, logdir):
                 value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
                 logger.scalar(f"train/{name}", value)
             logger.scalar("train/opt/updates", updates)
-            logger.scalar("train/expert_pretrain/passes", passes)
+            logger.scalar("train/expert_pretrain/epochs", epochs)
             logger.scalar("train/timing/sec_per_update", sec_per_update)
             logger.write(
                 updates,
                 console_message=format_expert_console(
                     updates,
                     updates,
-                    passes,
-                    passes,
+                    epochs,
+                    epochs,
                     sec_per_update,
                     train_metrics,
                     last_eval_score,
@@ -357,24 +227,33 @@ def train_expert_then_online(config, logger, logdir):
         replay.close()
         close_envs(eval_envs)
 
+    if int(config.training.online_steps) <= 0:
+        save_checkpoint(agent, logdir, "latest.pt", update=updates, online_step=0)
+        return
+
     print("Create online envs.")
     replay_buffer = Buffer(config.buffer)
-    train_envs, eval_envs, _, _ = make_envs(config.env)
+    train_envs = eval_envs = None
+    try:
+        train_envs, eval_envs, _, _ = make_envs(config.env)
 
-    print("Start online Dreamer training.")
-    policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger, logdir, train_envs, eval_envs)
+        print("Start online Dreamer training.")
+        policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger, logdir, train_envs, eval_envs)
 
-    def save_online(name, update, online_step):
-        save_checkpoint(agent, logdir, name, update=update, online_step=online_step)
+        def save_online(name, update, online_step):
+            save_checkpoint(agent, logdir, name, update=update, online_step=online_step)
 
-    online_state = policy_trainer.begin(agent, save_callback=save_online)
-    save_checkpoint(
-        agent,
-        logdir,
-        "latest.pt",
-        update=online_state["updates"],
-        online_step=online_state["step"],
-    )
+        online_state = policy_trainer.begin(agent, save_callback=save_online)
+        save_checkpoint(
+            agent,
+            logdir,
+            "latest.pt",
+            update=online_state["updates"],
+            online_step=online_state["step"],
+        )
+    finally:
+        close_envs(train_envs)
+        close_envs(eval_envs)
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="configs")
@@ -399,35 +278,36 @@ def main(config):
         train_expert_then_online(config, logger, logdir)
         return
 
-    if "offline" in config:
-        train_offline(config, logger, logdir)
-        return
-
     replay_buffer = Buffer(config.buffer)
 
     print("Create envs.")
-    train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
+    train_envs = eval_envs = None
+    try:
+        train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
 
-    print("Simulate agent.")
-    agent = Dreamer(
-        config.model,
-        obs_space,
-        act_space,
-    ).to(config.device)
+        print("Simulate agent.")
+        agent = Dreamer(
+            config.model,
+            obs_space,
+            act_space,
+        ).to(config.device)
 
-    policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger, logdir, train_envs, eval_envs)
+        policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger, logdir, train_envs, eval_envs)
 
-    def save_online(name, update, online_step):
-        save_checkpoint(agent, logdir, name, update=update, online_step=online_step)
+        def save_online(name, update, online_step):
+            save_checkpoint(agent, logdir, name, update=update, online_step=online_step)
 
-    online_state = policy_trainer.begin(agent, save_callback=save_online)
-    save_checkpoint(
-        agent,
-        logdir,
-        "latest.pt",
-        update=online_state["updates"],
-        online_step=online_state["step"],
-    )
+        online_state = policy_trainer.begin(agent, save_callback=save_online)
+        save_checkpoint(
+            agent,
+            logdir,
+            "latest.pt",
+            update=online_state["updates"],
+            online_step=online_state["step"],
+        )
+    finally:
+        close_envs(train_envs)
+        close_envs(eval_envs)
 
 
 if __name__ == "__main__":
