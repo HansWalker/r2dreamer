@@ -59,15 +59,18 @@ class Buffer:
         return warmup_data, data, index, initial
 
     def update(self, index, stoch, deter, *cache, cache_keys=None):
+        def prepare(value):
+            return value.reshape(-1, *value.shape[2:]).to(device=self.storage_device, dtype=torch.float32)
+
         # Flatten the data
         index = [ind.reshape(-1) for ind in index]
         # (B, T, S, K) -> (B*T, S, K)
-        stoch = stoch.reshape(-1, *stoch.shape[2:]).float()
+        stoch = prepare(stoch)
         # (B, T, D) -> (B*T, D)
-        deter = deter.reshape(-1, *deter.shape[2:]).float()
+        deter = prepare(deter)
         values = {"stoch": stoch, "deter": deter}
         for key, value in zip(cache_keys or (), cache):
-            values[key] = value.reshape(-1, *value.shape[2:]).float()
+            values[key] = prepare(value)
         # In storage, the length is the first dimension, and the batch (number of environments) is the second dimension.
         n = index[0].shape[0]
         self._buffer[index[1], index[0]] = TensorDict(values, batch_size=(n,))
