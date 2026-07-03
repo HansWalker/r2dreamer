@@ -136,6 +136,16 @@ class Mamba3Layer(nn.Module):
         return out, angle_state, ssm_state, k_state, v_state
 
 
+def _active_compute_dtype(token):
+    try:
+        if torch.is_autocast_enabled(token.device.type):
+            return torch.get_autocast_dtype(token.device.type)
+    except TypeError:
+        if token.device.type == "cuda" and torch.is_autocast_enabled():
+            return torch.get_autocast_gpu_dtype()
+    return token.dtype
+
+
 class Mamba3Deter(nn.Module):
     def __init__(
         self,
@@ -226,7 +236,7 @@ class Mamba3Deter(nn.Module):
 
     def _prepare_cache(self, cache, token):
         angle_state, ssm_state, k_state, v_state = cache
-        cache_dtype = token.dtype
+        cache_dtype = _active_compute_dtype(token)
         return (
             angle_state.to(device=token.device, dtype=torch.float32).contiguous(),
             ssm_state.to(device=token.device, dtype=cache_dtype).contiguous(),
@@ -244,7 +254,7 @@ class Mamba3Deter(nn.Module):
         stoch = stoch.reshape(B, -1)
         action = self._norm_action(action)
         token = self._token(torch.cat([stoch, action], dim=-1)).contiguous()
-        cache_dtype = token.dtype
+        cache_dtype = _active_compute_dtype(token)
         if angle_state is None or ssm_state is None or k_state is None or v_state is None:
             angle_state, ssm_state, k_state, v_state = self.initial_context(
                 B,

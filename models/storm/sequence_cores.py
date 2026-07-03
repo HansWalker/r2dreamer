@@ -12,6 +12,16 @@ class TransformerSequenceCore(StochasticTransformerKVCache):
     """Native STORM transformer core with a small neutral wrapper name."""
 
 
+def _active_compute_dtype(token: torch.Tensor) -> torch.dtype:
+    try:
+        if torch.is_autocast_enabled(token.device.type):
+            return torch.get_autocast_dtype(token.device.type)
+    except TypeError:
+        if token.device.type == "cuda" and torch.is_autocast_enabled():
+            return torch.get_autocast_gpu_dtype()
+    return token.dtype
+
+
 class MambaSequenceCore(nn.Module):
     """Mamba3 replacement for STORM's transformer sequence core.
 
@@ -75,8 +85,9 @@ class MambaSequenceCore(nn.Module):
         return self.layer.initial_context(batch_size, device=device, dtype=dtype)
 
     def _prepare_cache(self, cache: tuple[torch.Tensor, ...], token: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        cache_dtype = _active_compute_dtype(token)
         return tuple(
-            tensor.to(device=token.device, dtype=torch.float32 if idx == 0 else token.dtype).contiguous()
+            tensor.to(device=token.device, dtype=torch.float32 if idx == 0 else cache_dtype).contiguous()
             for idx, tensor in enumerate(cache)
         )
 
@@ -91,7 +102,7 @@ class MambaSequenceCore(nn.Module):
 
     def forward(self, samples: torch.Tensor, action: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         token = self._token(samples, action)
-        cache = self.initial_cache(token.shape[0], dtype=token.dtype, device=token.device)
+        cache = self.initial_cache(token.shape[0], dtype=_active_compute_dtype(token), device=token.device)
         outputs = []
         for idx in range(token.shape[1]):
             cache = self._prepare_cache(cache, token)
@@ -109,7 +120,7 @@ class MambaSequenceCore(nn.Module):
         assert samples.shape[1] == 1
         token = self._token(samples, action)
         if cache is None:
-            cache = self.initial_cache(token.shape[0], dtype=token.dtype, device=token.device)
+            cache = self.initial_cache(token.shape[0], dtype=_active_compute_dtype(token), device=token.device)
         cache = self._prepare_cache(cache, token)
         out, *cache = self.layer.step(token[:, 0], *cache)
         return out.unsqueeze(1), tuple(cache)
