@@ -76,7 +76,7 @@ class MambaSequenceCore(nn.Module):
 
     def _prepare_cache(self, cache: tuple[torch.Tensor, ...], token: torch.Tensor) -> tuple[torch.Tensor, ...]:
         return tuple(
-            tensor.to(device=token.device, dtype=torch.float32 if idx < 2 else token.dtype).contiguous()
+            tensor.to(device=token.device, dtype=torch.float32 if idx == 0 else token.dtype).contiguous()
             for idx, tensor in enumerate(cache)
         )
 

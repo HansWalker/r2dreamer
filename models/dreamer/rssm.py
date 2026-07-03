@@ -224,6 +224,16 @@ class Mamba3Deter(nn.Module):
     def initial_context(self, batch_size, device=None, dtype=None):
         return self.layer.initial_context(batch_size, device=device, dtype=dtype)
 
+    def _prepare_cache(self, cache, token):
+        angle_state, ssm_state, k_state, v_state = cache
+        cache_dtype = token.dtype
+        return (
+            angle_state.to(device=token.device, dtype=torch.float32).contiguous(),
+            ssm_state.to(device=token.device, dtype=cache_dtype).contiguous(),
+            k_state.to(device=token.device, dtype=cache_dtype).contiguous(),
+            v_state.to(device=token.device, dtype=cache_dtype).contiguous(),
+        )
+
     def _norm_action(self, action):
         action = action / torch.clip(torch.abs(action), min=1.0).detach()
         return action
@@ -241,13 +251,10 @@ class Mamba3Deter(nn.Module):
                 device=token.device,
                 dtype=cache_dtype,
             )
-        else:
-            # Official Mamba3 step keeps angle/SSM states in fp32, while K/V
-            # states must match the projected input dtype under AMP.
-            angle_state = angle_state.to(device=token.device, dtype=torch.float32).contiguous()
-            ssm_state = ssm_state.to(device=token.device, dtype=torch.float32).contiguous()
-            k_state = k_state.to(device=token.device, dtype=cache_dtype).contiguous()
-            v_state = v_state.to(device=token.device, dtype=cache_dtype).contiguous()
+        angle_state, ssm_state, k_state, v_state = self._prepare_cache(
+            (angle_state, ssm_state, k_state, v_state),
+            token,
+        )
         deter, angle_state, ssm_state, k_state, v_state = self.layer.step(
             token,
             angle_state,
