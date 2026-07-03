@@ -332,11 +332,23 @@ def pretrain_world_model_agent(config, logger, logdir, expert_replay, world_mode
     save_checkpoint(logdir / "pretrained.pt", world_model, agent, update=updates)
 
 
+def context_obs_item(obs, idx):
+    return {key: obs[key][idx : idx + 1].unsqueeze(1) for key in obs.keys()}
+
+
+def stack_context_obs(context_obs, device):
+    keys = list(context_obs[0].keys())
+    return {
+        key: torch.cat([item[key] for item in context_obs], dim=1).to(device)
+        for key in keys
+    }
+
+
 @torch.no_grad()
 def act_from_context(world_model, agent, context_obs, context_action, obs, deterministic=False):
     if not context_action:
         return torch.empty(obs.batch_size[0], agent.action_dim, device=world_model.device).uniform_(-1, 1)
-    obs_batch = {key: torch.cat([item[key] for item in context_obs], dim=1).to(world_model.device) for key in context_obs[0]}
+    obs_batch = stack_context_obs(context_obs, world_model.device)
     action_batch = torch.cat(list(context_action), dim=1).to(world_model.device)
     feat, _, _ = world_model.context_feature(obs_batch, action_batch)
     action, _ = agent.sample(feat, deterministic=deterministic)
@@ -375,7 +387,7 @@ def evaluate_policy(config, logger, world_model, agent, eval_envs, step, last_be
         lengths += active
         for idx in range(eval_envs.env_num):
             if not bool(done_once[idx].item()):
-                context_obs[idx].append(obs[idx : idx + 1].unsqueeze(1))
+                context_obs[idx].append(context_obs_item(obs, idx))
                 context_action[idx].append(action[idx : idx + 1].unsqueeze(1))
         done_once |= done
         if done.any():
@@ -443,7 +455,7 @@ def joint_train_world_model_agent(config, logger, logdir, expert_replay, world_m
             next_obs, reward, done = env_step_all(train_envs, action, world_model.device)
             replay_buffer.append(obs, action, reward, done)
             for idx in range(train_envs.env_num):
-                context_obs[idx].append(obs[idx : idx + 1].unsqueeze(1))
+                context_obs[idx].append(context_obs_item(obs, idx))
                 context_action[idx].append(action[idx : idx + 1].unsqueeze(1))
             returns += reward[:, 0]
             lengths += 1
