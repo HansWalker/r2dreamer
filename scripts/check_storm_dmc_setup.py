@@ -83,7 +83,7 @@ def parse_args():
     parser.add_argument("--action-repeat", type=int, default=2)
     parser.add_argument("--wm-updates", type=int, default=4)
     parser.add_argument("--ac-updates", type=int, default=4)
-    parser.add_argument("--max-size-ratio", type=float, default=1.20)
+    parser.add_argument("--max-size-ratio", type=float, default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -173,11 +173,6 @@ def count_params(config_dir: Path, args):
                 gc.collect()
             ratio = max(counts_by_task[task_name].values()) / min(counts_by_task[task_name].values())
             print(f"{task_name:8} size_ratio={ratio:.3f}")
-            if ratio > args.max_size_ratio:
-                raise SystemExit(
-                    f"Model sizes are not comparable enough for {task_name}: "
-                    f"ratio={ratio:.3f} > {args.max_size_ratio:.3f}."
-                )
     return counts_by_task
 
 

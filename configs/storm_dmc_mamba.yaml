@@ -8,3 +8,11 @@ storm_model:
   sequence_core: mamba
   num_layers: 1
   dropout: 0.0
+  mamba:
+    d_state: 32
+    expand: 8
+    headdim: 64
+    chunk_size: 16
+    is_mimo: false
+    mimo_rank: 1
+    is_outproj_norm: false
