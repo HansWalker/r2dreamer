@@ -30,6 +30,44 @@ CONFIGS = (
     ("mamba", "storm_dmc_mamba"),
 )
 
+SHARED_CONFIG_PATHS = (
+    "batch_size",
+    "batch_length",
+    "training.expert_epochs",
+    "training.online_steps",
+    "env.env_num",
+    "env.action_repeat",
+    "env.time_limit",
+    "storm_model.hidden_dim",
+    "storm_model.num_heads",
+    "storm_model.max_length",
+    "storm_model.stoch_dim",
+    "storm_model.encoder_hidden_dim",
+    "storm_model.encoder_layers",
+    "storm_model.decoder_hidden_dim",
+    "storm_model.decoder_layers",
+    "storm_model.head_hidden_dim",
+    "storm_model.head_layers",
+    "storm_model.act",
+    "storm_model.kl_free",
+    "storm_model.dyn_scale",
+    "storm_model.rep_scale",
+    "actor_critic.hidden_dim",
+    "actor_critic.layers",
+    "actor_critic.gamma",
+    "actor_critic.lambd",
+    "actor_critic.entropy_coef",
+    "storm_train.batch_size",
+    "storm_train.batch_length",
+    "storm_train.context_length",
+    "storm_train.imagine_context_length",
+    "storm_train.imagine_horizon",
+    "storm_train.imagine_batch_size",
+    "storm_train.warmup_steps",
+    "storm_train.world_model_updates",
+    "storm_train.actor_critic_updates",
+)
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -60,9 +98,10 @@ def check_data(data_root: Path):
         raise SystemExit("Missing expert data:\n" + "\n".join(str(path) for path in missing))
 
 
-def count_params(config_dir: Path, args):
-    data_root = Path(args.data_root)
-    common = [
+def config_overrides(args, data: str, task: str):
+    return [
+        f"expert_data.data_path={Path(args.data_root) / data}",
+        f"env.task={task}",
         f"training.expert_epochs={args.expert_epochs}",
         f"training.online_steps={args.online_steps}",
         f"batch_size={args.batch_size}",
@@ -74,19 +113,49 @@ def count_params(config_dir: Path, args):
         "eval_episode_num=2",
         "env.time_limit=1000",
     ]
+
+
+def get_path(config, path: str):
+    value = config
+    for part in path.split("."):
+        value = getattr(value, part)
+    return value
+
+
+def check_shared_config(configs_by_core: dict[str, object], task_name: str):
+    reference_name = "transformer"
+    reference = configs_by_core[reference_name]
+    mismatches = []
+    for core, config in configs_by_core.items():
+        if core == reference_name:
+            continue
+        for path in SHARED_CONFIG_PATHS:
+            left = get_path(reference, path)
+            right = get_path(config, path)
+            if left != right:
+                mismatches.append(f"{path}: {reference_name}={left!r}, {core}={right!r}")
+    if mismatches:
+        raise SystemExit(
+            f"Shared config mismatch for {task_name}. "
+            "Only sequence-core-specific settings should differ:\n"
+            + "\n".join(mismatches)
+        )
+
+
+def count_params(config_dir: Path, args):
     counts_by_task = {}
     with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
         for task_name, data, task in TASKS:
             counts_by_task[task_name] = {}
+            configs_by_core = {}
             for core, config_name in CONFIGS:
                 config = compose(
                     config_name=config_name,
-                    overrides=[
-                        f"expert_data.data_path={data_root / data}",
-                        f"env.task={task}",
-                        *common,
-                    ],
+                    overrides=config_overrides(args, data, task),
                 )
+                configs_by_core[core] = config
+            check_shared_config(configs_by_core, task_name)
+            for core, config in configs_by_core.items():
                 replay = ExpertReplay(config.expert, config.storm_train.batch_length)
                 world_model = build_world_model(config, replay.obs_space(), replay.act_space())
                 agent = build_agent(config, world_model.feat_size, replay.act_space())

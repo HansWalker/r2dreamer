@@ -6,29 +6,5 @@ logdir: logdir/storm_dmc/mamba/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 storm_model:
   sequence_core: mamba
-  hidden_dim: 256
   num_layers: 1
-  num_heads: 8
-  max_length: 1024
   dropout: 0.0
-  stoch_dim: 16
-  encoder_hidden_dim: 256
-  encoder_layers: 3
-  decoder_hidden_dim: 256
-  decoder_layers: 2
-  head_hidden_dim: 256
-  head_layers: 2
-  act: ReLU
-  kl_free: 1.0
-  dyn_scale: 0.5
-  rep_scale: 0.1
-  use_amp: true
-  amp_dtype: bfloat16
-  mamba:
-    d_state: 32
-    expand: 4
-    headdim: 64
-    chunk_size: 16
-    is_mimo: false
-    mimo_rank: 1
-    is_outproj_norm: false
