@@ -74,6 +74,12 @@ class MambaSequenceCore(nn.Module):
         device = device or next(self.parameters()).device
         return self.layer.initial_context(batch_size, device=device, dtype=dtype)
 
+    def _prepare_cache(self, cache: tuple[torch.Tensor, ...], token: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            tensor.to(device=token.device, dtype=torch.float32 if idx < 2 else token.dtype).contiguous()
+            for idx, tensor in enumerate(cache)
+        )
+
     def reset_cache(self, cache: tuple[torch.Tensor, ...], reset: torch.Tensor) -> tuple[torch.Tensor, ...]:
         out = []
         for tensor in cache:
@@ -88,6 +94,7 @@ class MambaSequenceCore(nn.Module):
         cache = self.initial_cache(token.shape[0], dtype=token.dtype, device=token.device)
         outputs = []
         for idx in range(token.shape[1]):
+            cache = self._prepare_cache(cache, token)
             out, *cache = self.layer.step(token[:, idx], *cache)
             cache = tuple(cache)
             outputs.append(out)
@@ -103,9 +110,6 @@ class MambaSequenceCore(nn.Module):
         token = self._token(samples, action)
         if cache is None:
             cache = self.initial_cache(token.shape[0], dtype=token.dtype, device=token.device)
-        cache = tuple(
-            tensor.to(device=token.device, dtype=torch.float32 if i < 2 else token.dtype).contiguous()
-            for i, tensor in enumerate(cache)
-        )
+        cache = self._prepare_cache(cache, token)
         out, *cache = self.layer.step(token[:, 0], *cache)
         return out.unsqueeze(1), tuple(cache)
