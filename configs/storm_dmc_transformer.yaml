@@ -101,7 +101,7 @@ storm_train:
   imagine_horizon: 16
   imagine_batch_size: 512
   warmup_steps: 1024
-  world_model_updates: 1
-  actor_critic_updates: 1
+  world_model_updates: 4
+  actor_critic_updates: 4
   log_every: 5000
   eval_every: 10000
