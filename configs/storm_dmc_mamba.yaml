@@ -26,7 +26,7 @@ storm_model:
   amp_dtype: bfloat16
   mamba:
     d_state: 32
-    expand: 2
+    expand: 4
     headdim: 64
     chunk_size: 16
     is_mimo: false

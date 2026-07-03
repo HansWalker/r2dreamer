@@ -42,17 +42,17 @@ expert:
 
 storm_model:
   sequence_core: transformer
-  hidden_dim: 256
+  hidden_dim: 128
   num_layers: 2
   num_heads: 8
   max_length: 1024
   dropout: 0.1
-  stoch_dim: 16
-  encoder_hidden_dim: 256
+  stoch_dim: 12
+  encoder_hidden_dim: 128
   encoder_layers: 3
-  decoder_hidden_dim: 256
+  decoder_hidden_dim: 128
   decoder_layers: 2
-  head_hidden_dim: 256
+  head_hidden_dim: 128
   head_layers: 2
   act: ReLU
   kl_free: 1.0
@@ -73,7 +73,7 @@ storm_model:
     is_outproj_norm: false
 
 actor_critic:
-  hidden_dim: 256
+  hidden_dim: 128
   layers: 2
   act: ReLU
   gamma: 0.985
