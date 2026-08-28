@@ -1,10 +1,10 @@
 act_entropy: 3e-4
 kl_free: 1.0
 imag_horizon: 15
+imag_batch_size: ${actor_critic.imagine_batch_size}
 horizon: 333
 lamb: 0.95
 compile: False
-log_grads: False
 device: ${device}
 
 lr: 4e-5
@@ -30,70 +30,73 @@ loss_scales:
 
 rssm:
   core: block_gru
-  warmup: 0
-  stoch: 32
   deter: ${model.deter}
-  hidden: ${model.hidden}
-  discrete: ${model.discrete}
-  img_layers: 2
-  obs_layers: 1
-  dyn_layers: 1
-  blocks: 8
-  act: ${model.act}
-  norm: ${model.norm}
-  unimix_ratio: 0.01
-  initial: 'learned'
+  posterior:
+    stoch_dim: 32
+    discrete_dim: ${model.discrete}
+    hidden_dim: ${model.hidden}
+    layers: 1
+    act: ${model.act}
+    unimix_ratio: 0.01
+  prior:
+    hidden_dim: ${model.hidden}
+    layers: 2
+    act: ${model.act}
+  gru:
+    hidden_dim: 443
+    dyn_layers: 1
+    blocks: 16
+    act: ${model.act}
   device: ${device}
   mamba3:
     n_layers: 1
-    d_state: 32
+    d_state: 128
     expand: 1
     headdim: 64
-    is_mimo: False
-    mimo_rank: 1
     chunk_size: 16
-    is_outproj_norm: False
+    is_mimo: false
+    mimo_rank: 1
+    is_outproj_norm: false
+  s5:
+    state_dim: 128
+    blocks: 1
+    dt_min: 0.001
+    dt_max: 0.1
+    discretization: zoh
+    ffn_dim: 444
+    dropout: 0.0
+  hyena:
+    width: 352
+    max_length: ${replay.sequence_length}
+    order: 2
+    ffn_dim: 280
+    filter_order: 64
+    filter_layers: 2
+    embedding_dim: 3
+    frequency: 1.0
+    modulation_target: 0.01
+    fast_decay: 0.3
+    slow_decay: 1.5
+    dropout: 0.0
+  sliding_window:
+    width: 352
+    num_heads: 8
+    ffn_dim: 474
+    window_size: ${replay.sequence_length}
+    dropout: 0.0
+    act: ${model.act}
 
 encoder:
-  mlp_keys: ${env.encoder.mlp_keys}
-  cnn_keys: ${env.encoder.cnn_keys}
-  mlp:
-    shape: null
-    layers: 3
-    units: ${model.units}
-    act: ${model.act}
-    norm: ${model.norm}
-    device: ${device}
-    outscale: null
-    symlog_inputs: True
-    name: 'mlp_encoder'
   cnn:
     act: ${model.act}
     norm: ${model.norm}
     kernel_size: 5
-    minres: 4
     depth: ${model.depth}
     mults: [2, 3, 4, 4]
 
 decoder:
-  mlp_keys: ${env.decoder.mlp_keys}
-  cnn_keys: ${env.decoder.cnn_keys}
-  mlp_dist:
-    name: 'symlog_mse'
   cnn_dist:
     name: 'mse'
-  mlp:
-    shape: null
-    layers: 3
-    units: ${model.units}
-    act: ${model.act}
-    norm: ${model.norm}
-    dist:
-      name: 'identity'
-    device: ${device}
-    outscale: 1.0
-    symlog_inputs: False
-    name: 'mlp_decoder'
   cnn:
     depth: ${model.depth}
     units: ${model.units}
@@ -102,40 +105,17 @@ decoder:
     act: ${model.act}
     norm: ${model.norm}
     kernel_size: 5
-    minres: 4
-    outscale: 1.0
 
-reward:
-  shape: [255,]
-  layers: 1
-  units: ${model.units}
+heads:
+  hidden_dim: ${heads.hidden_dim}
+  layers: ${heads.layers}
+  reward_bins: ${heads.reward_bins}
   act: ${model.act}
-  norm: ${model.norm}
-  dist:
-    name: 'symexp_twohot'
-    bin_num: 255
-  outscale: 0.0
-  device: ${device}
-  symlog_inputs: False
-  name: 'reward'
-
-cont:
-  shape: [1,]
-  layers: 1
-  units: ${model.units}
-  act: ${model.act}
-  norm: ${model.norm}
-  dist:
-    name: 'binary'
-  outscale: 1.0
-  device: ${device}
-  symlog_inputs: False
-  name: 'cont'
 
 actor:
   shape: null
-  layers: 3
-  units: ${model.units}
+  layers: ${actor_critic.layers}
+  units: ${actor_critic.hidden_dim}
   act: ${model.act}
   norm: ${model.norm}
   device: ${device}
@@ -144,26 +124,21 @@ actor:
       name: 'bounded_normal'
       min_std: 0.1
       max_std: 1.0
-    disc:
-      name: 'onehot'
-      unimix_ratio: 0.01
-    multi_disc:
-      name: 'multi_onehot'
-      unimix_ratio: 0.01
   outscale: 0.01
   symlog_inputs: False
   name: 'actor'
 
 critic:
-  shape: [255,]
-  layers: 3
-  units: ${model.units}
+  shape:
+    - ${actor_critic.value_bins}
+  layers: ${actor_critic.layers}
+  units: ${actor_critic.hidden_dim}
   act: ${model.act}
   norm: ${model.norm}
   device: ${device}
   dist:
     name: 'symexp_twohot'
-    bin_num: 255
+    bin_num: ${actor_critic.value_bins}
   outscale: 0.0
   symlog_inputs: False
   name: 'value'

@@ -1,0 +1,9 @@
+defaults:
+  - offline_dmc_expert_gru_vision
+  - _self_
+
+logdir: logdir/dmc_expert_vision/${scenario.name}/mamba3/seed_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+model:
+  rssm:
+    core: mamba3

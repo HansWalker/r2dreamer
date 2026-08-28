@@ -1,0 +1,18 @@
+name: ball_in_cup
+task: dmc_ball_in_cup_catch
+collection_task: ball_in_cup/catch
+dataset: ball_in_cup_catch
+planning_horizon: 25
+proprio_dim: 4
+proprio:
+  # The first two coordinates belong to the actuated cup; the ball remains visual.
+  position: [0, 1]
+  velocity: [0, 1]
+
+goal:
+  geometry: box
+  tolerance: [0.025, 0.025]
+
+action:
+  kind: continuous
+  shape: [2]

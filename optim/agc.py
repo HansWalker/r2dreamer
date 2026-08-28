@@ -43,7 +43,7 @@ def clip_grad_agc_(parameters: _tensor_or_tensors, clip: float, pmin: float, for
             scale = torch._foreach_reciprocal(torch._foreach_maximum(torch._foreach_div(gnorm, upper), 1.0))
             torch._foreach_mul_(device_grads, scale)
         elif not foreach:
-            for p, g in zip(device_params, device_grads):
+            for p, g in zip(device_params, device_grads, strict=True):
                 pnorm = torch.norm(p, p=2)
                 gnorm = torch.norm(g, p=2)
                 upper = torch.tensor(clip) * torch.maximum(torch.tensor(pmin), pnorm)

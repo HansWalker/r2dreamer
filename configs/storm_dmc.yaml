@@ -1,0 +1,102 @@
+defaults:
+  - dmc_experiment
+  - _self_
+
+logdir: logdir/storm_dmc_vision/${scenario.name}/${storm_model.sequence_core}/seed_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+model_family: storm
+
+training:
+  expert:
+    enabled: true
+
+replay:
+  batch_size: 16
+  max_size: 100000
+
+storm_model:
+  sequence_core: transformer
+  hidden_dim: 512
+  recurrent:
+    layers: 1
+    dropout: 0.0
+    transformer:
+      num_heads: 8
+      max_length: 64
+      ffn_dim: 1430
+    sliding_window:
+      window_size: ${storm_model.recurrent.transformer.max_length}
+    mamba3:
+      d_state: 128
+      expand: 3
+      headdim: 64
+      chunk_size: 16
+      is_mimo: false
+      mimo_rank: 1
+      is_outproj_norm: false
+    s5:
+      state_dim: 256
+      blocks: 1
+      dt_min: 0.001
+      dt_max: 0.1
+      discretization: zoh
+      ffn_dim: 1314
+      dropout: ${storm_model.recurrent.dropout}
+    hyena:
+      max_length: ${replay.sequence_length}
+      order: 2
+      ffn_dim: 942
+      filter_order: 64
+      filter_layers: 2
+      embedding_dim: 3
+      frequency: 1.0
+      modulation_target: 0.01
+      fast_decay: 0.3
+      slow_decay: 1.5
+      dropout: ${storm_model.recurrent.dropout}
+  posterior:
+    stoch_dim: 20
+    unimix_ratio: 0.01
+  prior:
+    unimix_ratio: ${storm_model.posterior.unimix_ratio}
+  encoder: ${encoder}
+  decoder: ${decoder}
+  heads: ${heads}
+  act: ReLU
+  kl_free: 1.0
+  dyn_scale: 0.5
+  rep_scale: 0.1
+  use_amp: true
+  amp_dtype: bfloat16
+  lr: ${optim.world_model_lr}
+  eps: ${optim.eps}
+  grad_clip: ${optim.world_model_grad_clip}
+
+actor_critic:
+  hidden_dim: 292
+  imagine_batch_size: 1024
+  act: ReLU
+  gamma: 0.985
+  lambd: 0.95
+  entropy_coef: 3e-4
+  slow_critic_decay: 0.98
+  use_amp: true
+  amp_dtype: bfloat16
+  lr: ${optim.actor_critic_lr}
+  eps: ${optim.eps}
+  grad_clip: ${optim.actor_critic_grad_clip}
+
+optim:
+  world_model_lr: 1e-4
+  actor_critic_lr: 3e-5
+  eps: 1e-5
+  world_model_grad_clip: 1000.0
+  actor_critic_grad_clip: 100.0
+
+storm_train:
+  context_length: 16
+  imagine_context_length: 8
+  imagine_horizon: 16
+  imagine_batch_size: ${actor_critic.imagine_batch_size}
+  warmup_steps: 1024
+  world_model_updates: ${env.env_num}
+  actor_critic_updates: ${env.env_num}

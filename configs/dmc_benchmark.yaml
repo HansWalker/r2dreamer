@@ -1,0 +1,53 @@
+defaults:
+  - scenario@scenario_configs.point_mass: point_mass
+  - scenario@scenario_configs.reacher: reacher
+  - scenario@scenario_configs.ball_in_cup: ball_in_cup
+  - _self_
+
+stages:
+  collect: true
+  train: true
+  evaluate: true
+
+# Every model below runs on every scenario and seed.
+scenarios:
+  - point_mass
+  - reacher
+  - ball_in_cup
+
+models:
+  dreamer:
+    gru: offline_dmc_expert_gru_vision
+    sliding_window: offline_dmc_expert_sliding_window_vision
+    mamba3: offline_dmc_expert_mamba3_vision
+    s5: offline_dmc_expert_s5_vision
+    hyena: offline_dmc_expert_hyena_vision
+  storm:
+    transformer: storm_dmc_transformer_vision
+    sliding_window: storm_dmc_sliding_window_vision
+    mamba3: storm_dmc_mamba_vision
+    s5: storm_dmc_s5_vision
+    hyena: storm_dmc_hyena_vision
+  tdmpc2:
+    default: tdmpc2_dmc_vision
+  leworldmodel:
+    default: leworldmodel_dmc_vision
+  temporal_straightening:
+    default: temporal_straightening_dmc_vision
+
+seeds: [0]
+output_dir: runs/dmc_vision
+device: cuda:0
+
+collection:
+  configs:
+    - dmc_expert_collection
+    - dmc_expert_collection_eval_vision
+
+training:
+  resume: true
+  overwrite: false
+  overrides: []
+
+evaluation:
+  dataset_root: ${oc.env:DMC_EXPERT_EVAL_DATA_DIR,data/dmc_expert_eval_vision}

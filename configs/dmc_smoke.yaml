@@ -1,0 +1,199 @@
+defaults:
+  - dmc_benchmark
+  - _self_
+
+# One scenario exercises collection, every model family, checkpointing, and evaluation.
+scenarios: [ball_in_cup]
+seeds: [0]
+output_dir: runs/dmc_smoke
+device: cuda:0
+
+collection:
+  configs:
+    - dmc_expert_collection_smoke
+    - dmc_expert_collection_eval_smoke
+
+training:
+  resume: false
+  overwrite: true
+  overrides:
+    - deterministic_run=True
+    - env.dataset_root=${oc.env:DMC_SMOKE_DATA_DIR,data/dmc_smoke/train}
+    - env.env_num=1
+    - env.eval_episode_num=0
+    - env.time_limit=8
+    - replay.batch_size=1
+    - replay.sequence_length=4
+    - replay.max_size=32
+    - replay.windows_per_episode=1
+    - training.expert.epochs=1
+    - training.expert.log_every=1
+    - training.expert.eval_every=0
+    - training.expert.save_every=1
+    - training.online.steps=0
+    - evaluation.final.checkpoint=pretrained.pt
+    - evaluation.final.episodes=1
+    - evaluation.final.context_length=3
+    - evaluation.final.horizons=[1]
+    - evaluation.final.probe_train_windows=1
+    - evaluation.final.probe_test_windows=1
+    - evaluation.final.probe_batch_size=1
+
+evaluation:
+  dataset_root: ${oc.env:DMC_SMOKE_EVAL_DATA_DIR,data/dmc_smoke/eval}
+
+models:
+  dreamer:
+    gru:
+      config: offline_dmc_expert_gru_vision
+      overrides: ${smoke_models.dreamer}
+    sliding_window:
+      config: offline_dmc_expert_sliding_window_vision
+      overrides: ${smoke_models.dreamer}
+    mamba3:
+      config: offline_dmc_expert_mamba3_vision
+      overrides: ${smoke_models.dreamer}
+    s5:
+      config: offline_dmc_expert_s5_vision
+      overrides: ${smoke_models.dreamer}
+    hyena:
+      config: offline_dmc_expert_hyena_vision
+      overrides: ${smoke_models.dreamer}
+  storm:
+    transformer:
+      config: storm_dmc_transformer_vision
+      overrides: ${smoke_models.storm}
+    sliding_window:
+      config: storm_dmc_sliding_window_vision
+      overrides: ${smoke_models.storm}
+    mamba3:
+      config: storm_dmc_mamba_vision
+      overrides: ${smoke_models.storm}
+    s5:
+      config: storm_dmc_s5_vision
+      overrides: ${smoke_models.storm}
+    hyena:
+      config: storm_dmc_hyena_vision
+      overrides: ${smoke_models.storm}
+  tdmpc2:
+    default:
+      config: tdmpc2_dmc_vision
+      overrides: ${smoke_models.tdmpc2}
+  leworldmodel:
+    default:
+      config: leworldmodel_dmc_vision
+      overrides: ${smoke_models.leworldmodel}
+  temporal_straightening:
+    default:
+      config: temporal_straightening_dmc_vision
+      overrides: ${smoke_models.temporal_straightening}
+
+smoke_models:
+  dreamer:
+    - model.deter=64
+    - model.hidden=64
+    - model.discrete=4
+    - model.depth=4
+    - model.units=64
+    - model.rssm.posterior.stoch_dim=8
+    - model.rssm.gru.hidden_dim=32
+    - model.rssm.gru.blocks=8
+    - model.rssm.mamba3.d_state=32
+    - model.rssm.mamba3.expand=8
+    - model.rssm.mamba3.chunk_size=4
+    - model.rssm.s5.state_dim=32
+    - model.rssm.s5.ffn_dim=64
+    - model.rssm.hyena.width=64
+    - model.rssm.hyena.ffn_dim=64
+    - model.rssm.hyena.filter_order=16
+    - model.rssm.sliding_window.width=64
+    - model.rssm.sliding_window.num_heads=4
+    - model.rssm.sliding_window.ffn_dim=64
+    - heads.hidden_dim=64
+    - heads.layers=1
+    - heads.reward_bins=31
+    - actor_critic.hidden_dim=64
+    - actor_critic.layers=1
+    - actor_critic.value_bins=31
+    - actor_critic.imagine_batch_size=1
+    - model.imag_horizon=2
+  storm:
+    - storm_model.hidden_dim=64
+    - storm_model.posterior.stoch_dim=4
+    - storm_model.recurrent.transformer.num_heads=4
+    - storm_model.recurrent.transformer.max_length=4
+    - storm_model.recurrent.transformer.ffn_dim=128
+    - storm_model.recurrent.mamba3.d_state=32
+    - storm_model.recurrent.mamba3.expand=8
+    - storm_model.recurrent.mamba3.chunk_size=4
+    - storm_model.recurrent.s5.state_dim=32
+    - storm_model.recurrent.s5.ffn_dim=128
+    - storm_model.recurrent.hyena.ffn_dim=128
+    - storm_model.recurrent.hyena.filter_order=16
+    - encoder.vision.stem_channels=4
+    - decoder.vision.stem_channels=4
+    - heads.hidden_dim=32
+    - heads.layers=1
+    - heads.reward_bins=31
+    - actor_critic.hidden_dim=32
+    - actor_critic.layers=1
+    - actor_critic.value_bins=31
+    - actor_critic.imagine_batch_size=1
+    - storm_model.use_amp=false
+    - actor_critic.use_amp=false
+    - storm_train.context_length=3
+    - storm_train.imagine_context_length=2
+    - storm_train.imagine_horizon=2
+    - storm_train.imagine_batch_size=1
+    - storm_train.warmup_steps=4
+    - storm_train.world_model_updates=1
+    - storm_train.actor_critic_updates=1
+  tdmpc2:
+    - tdmpc2_model.num_channels=8
+    - tdmpc2_model.latent_dim=128
+    - tdmpc2_model.mlp_dim=64
+    - tdmpc2_model.num_q=2
+    - tdmpc2_model.num_bins=11
+    - tdmpc2_model.planner.horizon=2
+    - tdmpc2_model.planner.samples=4
+    - tdmpc2_model.planner.elites=2
+    - tdmpc2_model.planner.policy_samples=1
+    - tdmpc2_model.planner.iterations=1
+    - planning_train.warmup_steps=4
+    - planning_train.random_steps=4
+    - planning_train.initial_updates=1
+    - planning_train.updates_per_collect=1
+  leworldmodel:
+    - jepa_model.encoder.embedding_dim=64
+    - jepa_model.encoder.vision.patch_size=16
+    - jepa_model.encoder.vision.layers=1
+    - jepa_model.encoder.vision.heads=2
+    - jepa_model.encoder.vision.mlp_dim=128
+    - jepa_model.predictor.layers=1
+    - jepa_model.predictor.heads=2
+    - jepa_model.predictor.dim_head=32
+    - jepa_model.predictor.mlp_dim=128
+    - jepa_model.predictor.action_embedding_dim=4
+    - jepa_model.projector_dim=64
+    - jepa_model.sigreg.knots=5
+    - jepa_model.sigreg.projections=16
+    - jepa_model.planner.horizon=2
+    - jepa_model.planner.samples=4
+    - jepa_model.planner.elites=2
+    - jepa_model.planner.iterations=1
+  temporal_straightening:
+    - jepa_model.encoder.embedding_dim=64
+    - jepa_model.encoder.proprio_embedding_dim=4
+    - jepa_model.encoder.vision.base_channels=4
+    - jepa_model.predictor.layers=1
+    - jepa_model.predictor.heads=2
+    - jepa_model.predictor.dim_head=32
+    - jepa_model.predictor.mlp_dim=128
+    - jepa_model.predictor.action_embedding_dim=4
+    - jepa_model.projector_dim=64
+    - jepa_model.sigreg.knots=5
+    - jepa_model.sigreg.projections=16
+    - jepa_model.decoder.vision.base_channels=4
+    - jepa_model.planner.horizon=2
+    - jepa_model.planner.samples=2
+    - jepa_model.planner.iterations=1

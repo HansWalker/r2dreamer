@@ -1,0 +1,8 @@
+defaults:
+  - dmc_expert_collection_smoke
+  - _self_
+
+# Two episodes are the minimum for disjoint probe-fit and probe-test splits.
+output_dir: ${oc.env:DMC_SMOKE_EVAL_DATA_DIR,data/dmc_smoke/eval}
+num_episodes: 2
+seed: 3000000

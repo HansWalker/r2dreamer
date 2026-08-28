@@ -1,0 +1,16 @@
+defaults:
+  - offline_dmc_expert
+  - _self_
+
+logdir: logdir/dmc_expert_vision/${scenario.name}/gru/seed_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+model:
+  depth: 16
+  units: 622
+  hidden: 178
+
+heads:
+  hidden_dim: 254
+
+actor_critic:
+  hidden_dim: 222

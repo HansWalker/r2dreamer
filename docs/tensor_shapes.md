@@ -17,4 +17,6 @@ To make the code easier to understand, some comments include **inline tensor sha
 | `U` | Hidden units (generic intermediate dimension) |
 | `H`, `W` | Image height and width |
 | `C` | Image channels |
+| `P` | Number of spatial image tokens or patches |
+| `Z` | Latent representation width |
 | `H_feat`, `W_feat`, `C_feat` | Intermediate feature map shape (spatial resolution and channels) inside CNN modules |

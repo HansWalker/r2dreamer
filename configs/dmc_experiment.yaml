@@ -1,0 +1,60 @@
+defaults:
+  - scenario: point_mass
+  - env: dmc_vision
+  - dmc_model
+  - override hydra/job_logging: disabled
+  - _self_
+
+seed: 0
+deterministic_run: False
+device: "cuda:0"
+model_family: dreamer
+model_io: ${env.model_io}
+resume_from: null
+
+hydra:
+  run:
+    dir: ${logdir}
+
+evaluation:
+  # An episode succeeds once its action-repeat-normalized DMC reward reaches this value.
+  success_threshold: 0.8
+  final:
+    checkpoint: best.pt
+    episodes: 50
+    seed: 3000000
+    context_length: 64
+    horizons: [1, 5, 10, 25]
+    probe_train_windows: 32
+    probe_test_windows: 32
+    probe_batch_size: 8
+    probe_ridge: 0.001
+    probe_seed: 2000000
+
+replay:
+  batch_size: 32
+  sequence_length: 64
+  max_size: 5e5
+  storage_device: cpu
+  windows_per_episode: 4
+  device: ${device}
+  seed: ${seed}
+
+training:
+  expert:
+    enabled: false
+    data_path: ${env.dataset_root}/${scenario.dataset}
+    epochs: 16
+    shuffle: true
+    log_every: 50
+    eval_every: 500
+    save_every: 500
+  online:
+    steps: 80000
+    log_every: 5000
+    eval_every: 10000
+    save_every: 10000
+
+dreamer_train:
+  initial_updates: 0
+  train_after: 0

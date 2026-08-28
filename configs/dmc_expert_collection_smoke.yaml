@@ -1,0 +1,17 @@
+defaults:
+  - dmc_expert_collection
+  - _self_
+
+output_dir: ${oc.env:DMC_SMOKE_DATA_DIR,data/dmc_smoke/train}
+num_episodes: 1
+max_episode_steps: 4
+resume: false
+progress_every: 1
+
+expert:
+  mpc: false
+  iterations: 1
+  num_samples: 4
+
+tasks:
+  - ball_in_cup/catch

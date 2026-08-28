@@ -1,0 +1,31 @@
+defaults:
+  - storm_dmc
+  - _self_
+
+logdir: logdir/storm_dmc_vision/${scenario.name}/transformer/seed_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+storm_model:
+  hidden_dim: 384
+  posterior:
+    stoch_dim: 15
+  recurrent:
+    transformer:
+      ffn_dim: 1688
+    mamba3:
+      expand: 4
+    hyena:
+      ffn_dim: 1112
+
+encoder:
+  vision:
+    stem_channels: 17
+
+decoder:
+  vision:
+    stem_channels: 28
+
+actor_critic:
+  hidden_dim: 259
+
+heads:
+  hidden_dim: 224

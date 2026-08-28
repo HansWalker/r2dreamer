@@ -1,0 +1,54 @@
+defaults:
+  - dmc_experiment
+  - _self_
+
+model_family: tdmpc2
+logdir: logdir/tdmpc2_dmc_vision/${scenario.name}/seed_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+training:
+  expert:
+    enabled: true
+
+replay:
+  batch_size: 256
+  sequence_length: 4
+  max_size: 1000000
+
+planning_train:
+  warmup_steps: 2500
+  random_steps: 2500
+  initial_updates: 2500
+  updates_per_collect: ${env.env_num}
+
+tdmpc2_model:
+  num_channels: 32
+  mlp_dim: 538
+  latent_dim: 512
+  num_q: 5
+  dropout: 0.01
+  simnorm_dim: 8
+  horizon: 3
+  rho: 0.5
+  gamma: 0.99
+  consistency_coef: 20.0
+  reward_coef: 0.1
+  value_coef: 0.1
+  lr: 3e-4
+  encoder_lr_scale: 0.3
+  grad_clip: 20.0
+  tau: 0.01
+  entropy_coef: 1e-4
+  log_std_min: -10.0
+  log_std_max: 2.0
+  num_bins: 101
+  vmin: -10.0
+  vmax: 10.0
+  planner:
+    horizon: 3
+    samples: 512
+    elites: 64
+    policy_samples: 24
+    iterations: 6
+    min_std: 0.05
+    max_std: 2.0
+    temperature: 0.5

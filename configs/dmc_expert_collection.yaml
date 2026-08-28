@@ -1,14 +1,15 @@
-tdmpc2_root: ${TDMPC2_DIR}
-output_dir: ${DMC_EXPERT_DATA_DIR}
+tdmpc2_root: ${oc.env:TDMPC2_DIR}
+output_dir: ${oc.env:DMC_EXPERT_VISION_DATA_DIR,data/dmc_expert_vision}
 
-num_episodes: 5000
+num_episodes: 10000
 checkpoint_seed: 1
 seed: 1
 
+# Match TD-MPC2: each policy action spans two DMC control steps for 500 transitions.
 action_repeat: 2
 max_episode_steps: 500
+time_limit: null
 
-save_images: false
 image_size: 64
 
 expert:
@@ -16,11 +17,15 @@ expert:
   iterations: 4
   num_samples: 256
 
-refresh_seconds: 10
 progress_every: 25
-resume: false
+resume: true
 
 tasks:
-  - cartpole/swingup
-  - walker/walk
-  - humanoid/run
+  - point_mass/easy
+  - reacher/easy
+  - ball_in_cup/catch
+
+# TD-MPC2 does not publish a Point Mass checkpoint; use a locally trained
+# 5M single-task checkpoint for that expert dataset.
+checkpoints:
+  point_mass/easy: ${oc.env:TDMPC2_POINT_MASS_CHECKPOINT,null}

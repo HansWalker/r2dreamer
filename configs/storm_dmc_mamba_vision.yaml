@@ -1,0 +1,8 @@
+defaults:
+  - storm_dmc_transformer_vision
+  - _self_
+
+logdir: logdir/storm_dmc_vision/${scenario.name}/mamba/seed_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+storm_model:
+  sequence_core: mamba

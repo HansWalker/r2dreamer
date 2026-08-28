@@ -1,0 +1,19 @@
+# Shared architecture budget for the Dreamer and STORM comparison models.
+encoder:
+  vision:
+    stem_channels: 16
+
+decoder:
+  vision:
+    stem_channels: 16
+
+heads:
+  hidden_dim: 264
+  layers: 2
+  reward_bins: 255
+
+actor_critic:
+  hidden_dim: 264
+  layers: 3
+  value_bins: 255
+  imagine_batch_size: 512

@@ -1,0 +1,16 @@
+defaults:
+  - jepa_dmc
+  - _self_
+
+model_family: leworldmodel
+logdir: logdir/leworldmodel_dmc_vision/${scenario.name}/seed_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+jepa_model:
+  encoder:
+    vision:
+      layers: 6
+      mlp_dim: 296
+  predictor:
+    mlp_dim: 361
+  planner:
+    iterations: 30

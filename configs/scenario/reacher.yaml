@@ -1,0 +1,17 @@
+name: reacher
+task: dmc_reacher_easy
+collection_task: reacher/easy
+dataset: reacher_easy
+planning_horizon: 10
+proprio_dim: 4
+proprio:
+  position: [0, 1]
+  velocity: [0, 1]
+
+goal:
+  geometry: radial
+  tolerance: [0.06]
+
+action:
+  kind: continuous
+  shape: [2]

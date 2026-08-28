@@ -1,0 +1,9 @@
+defaults:
+  - offline_dmc_expert_gru_vision
+  - _self_
+
+logdir: logdir/dmc_expert_vision/${scenario.name}/sliding_window/seed_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+model:
+  rssm:
+    core: sliding_window

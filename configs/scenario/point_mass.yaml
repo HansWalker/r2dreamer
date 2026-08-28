@@ -1,0 +1,17 @@
+name: point_mass
+task: dmc_point_mass_easy
+collection_task: point_mass/easy
+dataset: point_mass_easy
+planning_horizon: 5
+proprio_dim: 4
+proprio:
+  position: [0, 1]
+  velocity: [0, 1]
+
+goal:
+  geometry: radial
+  tolerance: [0.015]
+
+action:
+  kind: continuous
+  shape: [2]

@@ -1,266 +1,149 @@
 import atexit
 import contextlib
-import enum
-import os
 import sys
-import time
 import traceback
-from functools import partial as bind
+from functools import partial
 
 import numpy as np
 import torch
 from tensordict import TensorDict
 
-import tools
+
+def _stack(rows):
+    tensors = {key: torch.as_tensor(np.stack([row[key] for row in rows])) for key in rows[0]}
+    batch = TensorDict(tensors, batch_size=(len(rows),), device="cpu")
+    for key in batch.keys():
+        if batch[key].ndim == 1:
+            batch[key] = batch[key].unsqueeze(-1)
+    return batch
 
 
 class ParallelEnv:
-    def __init__(self, constructor, env_num, device):
-        self.envs = [Parallel(constructor(i), "process") for i in range(env_num)]
-        self.device = device
-
-    @property
-    def observation_space(self):
-        return self.envs[0].observation_space
-
-    @property
-    def action_space(self):
-        return self.envs[0].action_space
+    def __init__(self, constructor, env_num, pin_memory=False):
+        self.workers = [ProcessEnv(constructor(index)) for index in range(env_num)]
+        self.pin_memory = bool(pin_memory)
 
     @property
     def env_num(self):
-        return len(self.envs)
+        return len(self.workers)
 
-    def lift_dim(self, td):
-        for key in td.keys():
-            if td[key].ndim == 1:
-                td[key] = td[key].unsqueeze(-1)
-        return td
+    def close(self):
+        for worker in self.workers:
+            worker.close()
 
-    def step(self, action, done):
-        """Step all environments.
+    def reset(self):
+        promises = [worker.reset() for worker in self.workers]
+        obs = _stack([promise() for promise in promises])
+        return obs.pin_memory() if self.pin_memory else obs
 
-        Notes
-        -----
-        This implementation intentionally steps the environment processes on CPU.
-        The returned TensorDict is pinned in CPU memory so that the caller can
-        transfer it to GPU asynchronously (H2D with non_blocking=True).
+    def reset_done(self, obs, done):
+        indices = done.nonzero(as_tuple=False).flatten()
+        if not len(indices):
+            return obs
+        promises = [self.workers[index].reset() for index in indices.cpu().tolist()]
+        obs = obs.clone()
+        reset_obs = _stack([promise() for promise in promises])
+        obs[indices] = reset_obs.pin_memory() if self.pin_memory else reset_obs
+        return obs
 
-        ``action`` and ``done`` may arrive on any device (CPU or CUDA).
-        They are moved to CPU internally before dispatching to workers.
-        """
-        # Ensure inputs are on CPU for worker processes.
-        action_np = tools.to_np(action)  # handles any device via .detach().cpu().numpy()
-        done = done.cpu() if done.is_cuda else done
-        promise = [e.reset() if d else e.step(a) for e, a, d in zip(self.envs, action_np, done)]
-        new_o, new_r, new_d = [], [], []
-        for p, d in zip(promise, done):
-            if d:
-                new_o.append(p())
-                new_r.append(0.0)
-                new_d.append(False)
+    def step(self, action, reset_mask=None):
+        """Step active environments and optionally reset selected workers."""
+        values = action.detach().cpu().numpy()
+        reset = [False] * self.env_num if reset_mask is None else reset_mask.detach().cpu().reshape(-1).tolist()
+        promises = [
+            worker.reset() if flag else worker.step(value)
+            for worker, value, flag in zip(self.workers, values, reset, strict=True)
+        ]
+
+        rows, rewards, dones = [], [], []
+        for promise, was_reset in zip(promises, reset, strict=True):
+            if was_reset:
+                rows.append(promise())
+                rewards.append(0.0)
+                dones.append(False)
             else:
-                o, r, d, _ = p()
-                new_o.append(o)
-                new_r.append(r)
-                new_d.append(d)
-        obs_stacked = {k: np.stack([o[k] for o in new_o]) for k in new_o[0].keys()}
+                obs, reward, finished, _ = promise()
+                rows.append(obs)
+                rewards.append(reward)
+                dones.append(finished)
 
-        # Build CPU tensors first to avoid implicit GPU syncs and enable async H2D in caller.
-        obs_tensors = {k: torch.as_tensor(v, device="cpu") for k, v in obs_stacked.items()}
-        rew_stacked = torch.as_tensor(new_r, dtype=torch.float32, device="cpu")
-
-        # Keep data on CPU; caller will .to(device, non_blocking=True) after pinning.
-        # TensorDict batch size is (B,).
-        td = TensorDict({**obs_tensors, "reward": rew_stacked}, batch_size=(self.env_num,), device="cpu").pin_memory()
-        done = torch.as_tensor(new_d, device="cpu")
-        return self.lift_dim(td), done
+        obs = _stack(rows)
+        reward = torch.as_tensor(rewards, dtype=torch.float32).reshape(-1, 1)
+        done = torch.as_tensor(dones, dtype=torch.bool)
+        if self.pin_memory:
+            obs, reward, done = obs.pin_memory(), reward.pin_memory(), done.pin_memory()
+        return obs, reward, done
 
 
-class Parallel:
-    def __init__(self, constructor, strategy):
-        self.worker = Worker(bind(self._respond, constructor), strategy, state=True)
-        self.callables = {}
-
-    def __getattr__(self, name):
-        if name.startswith("_"):
-            raise AttributeError(name)
-        try:
-            if name not in self.callables:
-                self.callables[name] = self.worker(PMessage.CALLABLE, name)()
-            if self.callables[name]:
-                return bind(self.worker, PMessage.CALL, name)
-            return self.worker(PMessage.READ, name)()
-        except AttributeError:
-            raise ValueError(name)
-
-    def __len__(self):
-        return self.worker(PMessage.CALL, "__len__")()
-
-    def close(self):
-        self.worker.close()
-
-    @staticmethod
-    def _respond(constructor, state, message, name, *args, **kwargs):
-        state = state or constructor()  # Instantiate at first time
-        if message == PMessage.CALLABLE:
-            assert not args and not kwargs, (args, kwargs)
-            result = callable(getattr(state, name))
-        elif message == PMessage.CALL:
-            result = getattr(state, name)(*args, **kwargs)
-        elif message == PMessage.READ:
-            assert not args and not kwargs, (args, kwargs)
-            result = getattr(state, name)
-        return state, result
-
-
-class PMessage(enum.Enum):
-    CALLABLE = 2
-    CALL = 3
-    READ = 4
-
-
-class Worker:
-    initializers = []
-
-    def __init__(self, fn, strategy="thread", state=False):
-        if not state:
-
-            def fn_wrapper(s, *args, **kwargs):
-                return (s, fn(*args, **kwargs))
-
-            fn = fn_wrapper
-        inits = self.initializers
-        self.impl = {
-            "process": bind(ProcessPipeWorker, initializers=inits),
-            "daemon": bind(ProcessPipeWorker, initializers=inits, daemon=True),
-        }[strategy](fn)
-        self.promise = None
-
-    def __call__(self, *args, **kwargs):
-        self.promise and self.promise()  # Raise previous exception if any.
-        self.promise = self.impl(*args, **kwargs)
-        return self.promise
-
-    def wait(self):
-        return self.impl.wait()
-
-    def close(self):
-        self.impl.close()
-
-
-class ProcessPipeWorker:
-    def __init__(self, fn, initializers=(), daemon=False):
+class ProcessEnv:
+    def __init__(self, constructor):
         import multiprocessing
 
         import cloudpickle
 
-        self._context = multiprocessing.get_context("spawn")
-        self._pipe, pipe = self._context.Pipe()
-        fn = cloudpickle.dumps(fn)
-        initializers = cloudpickle.dumps(initializers)
-        self._process = self._context.Process(target=self._loop, args=(pipe, fn, initializers), daemon=daemon)
+        context = multiprocessing.get_context("spawn")
+        self._pipe, pipe = context.Pipe()
+        constructor = cloudpickle.dumps(constructor)
+        self._process = context.Process(target=self._loop, args=(pipe, constructor))
         self._process.start()
-        self._nextid = 0
+        self._next_id = 0
         self._results = {}
-        assert self._submit(Message.OK)()
         atexit.register(self.close)
 
-    def __call__(self, *args, **kwargs):
-        return self._submit(Message.RUN, (args, kwargs))
+    def reset(self):
+        return self._submit("reset")
 
-    def wait(self):
-        pass
+    def step(self, action):
+        return self._submit("step", action)
 
     def close(self):
-        try:
-            self._pipe.send((Message.STOP, self._nextid, None))
+        with contextlib.suppress(AttributeError, OSError):
+            self._pipe.send((None, None, None))
             self._pipe.close()
-        except (AttributeError, OSError):
-            pass  # The connection was already closed.
-        try:
+        with contextlib.suppress(AttributeError, AssertionError):
             self._process.join(0.1)
-            if self._process.exitcode is None:
-                try:
-                    os.kill(self._process.pid, 9)
-                    time.sleep(0.1)
-                except Exception:
-                    pass
-        except (AttributeError, AssertionError):
-            pass
+            if self._process.is_alive():
+                self._process.kill()
+                self._process.join(0.1)
 
-    def _submit(self, message, payload=None):
-        callid = self._nextid
-        self._nextid += 1
-        self._pipe.send((message, callid, payload))
-        return Future(self._receive, callid)
+    def _submit(self, method, *args):
+        call_id = self._next_id
+        self._next_id += 1
+        self._pipe.send((call_id, method, args))
+        return partial(self._receive, call_id)
 
-    def _receive(self, callid):
-        while callid not in self._results:
+    def _receive(self, call_id):
+        while call_id not in self._results:
             try:
-                message, received_callid, payload = self._pipe.recv()
-            except (OSError, EOFError):
-                raise RuntimeError("Lost connection to worker.")
-            if message == Message.ERROR:
-                raise Exception(payload)
-            if message == Message.RESULT:
-                self._results[received_callid] = payload
-            else:
-                raise RuntimeError(f"Unexpected message: {message}")
-        return self._results.pop(callid)
+                received_id, result, error = self._pipe.recv()
+            except (OSError, EOFError) as error:
+                raise RuntimeError("Lost connection to worker.") from error
+            if error:
+                raise RuntimeError(error)
+            self._results[received_id] = result
+        return self._results.pop(call_id)
 
     @staticmethod
-    def _loop(pipe, function, initializers):
+    def _loop(pipe, constructor):
+        call_id = None
+        env = None
         try:
-            callid = None
-            state = None
             import cloudpickle
 
-            initializers = cloudpickle.loads(initializers)
-            function = cloudpickle.loads(function)
-            [fn() for fn in initializers]
+            env = cloudpickle.loads(constructor)()
             while True:
-                if not pipe.poll(0.1):
-                    continue  # Wake up for keyboard interrupts.
-                message, callid, payload = pipe.recv()
-                if message == Message.STOP:
+                call_id, method, args = pipe.recv()
+                if method is None:
                     return
-                if message == Message.OK:
-                    pipe.send((Message.RESULT, callid, True))
-                elif message == Message.RUN:
-                    args, kwargs = payload
-                    state, result = function(state, *args, **kwargs)
-                    pipe.send((Message.RESULT, callid, result))
-                else:
-                    raise KeyError(f"Invalid message: {message}")
+                pipe.send((call_id, getattr(env, method)(*args), None))
         except (EOFError, KeyboardInterrupt):
             pass
         except Exception:
             stacktrace = "".join(traceback.format_exception(*sys.exc_info()))
             print(f"Error inside process worker: {stacktrace}.", flush=True)
-            pipe.send((Message.ERROR, callid, stacktrace))
+            pipe.send((call_id, None, stacktrace))
         finally:
             with contextlib.suppress(Exception):
+                env.close()
+            with contextlib.suppress(Exception):
                 pipe.close()
-
-
-class Message(enum.Enum):
-    OK = 1
-    RUN = 2
-    RESULT = 3
-    STOP = 4
-    ERROR = 5
-
-
-class Future:
-    def __init__(self, receive, callid):
-        self._receive = receive
-        self._callid = callid
-        self._result = None
-        self._complete = False
-
-    def __call__(self):
-        if not self._complete:
-            self._result = self._receive(self._callid)
-            self._complete = True
-        return self._result

@@ -1,0 +1,29 @@
+defaults:
+  - jepa_dmc
+  - _self_
+
+model_family: temporal_straightening
+logdir: logdir/temporal_straightening_dmc_vision/${scenario.name}/seed_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+env:
+  proprio: ${scenario.proprio}
+  model_io:
+    observations:
+      proprio:
+        - ${scenario.proprio_dim}
+
+jepa_model:
+  encoder:
+    proprio_embedding_dim: 10
+  predictor:
+    mlp_dim: 754
+  decoder:
+    vision:
+      base_channels: 34
+  optim:
+    weight_decay: 1e-2
+    grad_clip: .inf
+  planner:
+    type: gradient
+    samples: 16
+    iterations: 64
