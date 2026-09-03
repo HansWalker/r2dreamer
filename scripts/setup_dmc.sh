@@ -69,10 +69,13 @@ PY
 
 "$PY" -m pip install -e ".[dmc]" "pytest>=8,<9" "pre-commit>=4,<5"
 QUACK_REQUIREMENT=$(grep '^quack-kernels==' requirements/mamba3-cu128.txt)
-"$PY" -m pip install -r <(grep -v '^quack-kernels==' requirements/mamba3-cu128.txt)
+TRITON_REQUIREMENT=$(grep '^triton==' requirements/mamba3-cu128.txt)
+"$PY" -m pip install -r <(grep -Ev '^(quack-kernels|triton)==' requirements/mamba3-cu128.txt)
 # Quack 0.5.3 declares an unreleased CUTLASS 4.6 dependency, but this Mamba
 # commit uses its helper API with the tested CUTLASS 4.5.2 runtime above.
-"$PY" -m pip install --no-deps "$QUACK_REQUIREMENT"
+# Torch 2.8 pins Triton 3.4, but Mamba3 requires the small matrix support added
+# in Triton 3.5. Neither override changes Torch's compiled CUDA extensions.
+"$PY" -m pip install --no-deps "$QUACK_REQUIREMENT" "$TRITON_REQUIREMENT"
 
 MAMBA_FORCE_BUILD=TRUE MAMBA_SKIP_CUDA_BUILD=FALSE \
     "$PY" -m pip install \

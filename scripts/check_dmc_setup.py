@@ -15,7 +15,6 @@ def expected_versions():
     expected = {
         "mamba-ssm": "2.3.2.post1",
         "torch": "2.8.0",
-        "triton": "3.4.0",
     }
     for line in (REPO_DIR / "requirements/mamba3-cu128.txt").read_text().splitlines():
         if line and not line.startswith("#"):
