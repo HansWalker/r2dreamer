@@ -68,7 +68,11 @@ if torch.version.cuda != toolkit:
 PY
 
 "$PY" -m pip install -e ".[dmc]" "pytest>=8,<9" "pre-commit>=4,<5"
-"$PY" -m pip install -r requirements/mamba3-cu128.txt
+QUACK_REQUIREMENT=$(grep '^quack-kernels==' requirements/mamba3-cu128.txt)
+"$PY" -m pip install -r <(grep -v '^quack-kernels==' requirements/mamba3-cu128.txt)
+# Quack 0.5.3 declares an unreleased CUTLASS 4.6 dependency, but this Mamba
+# commit uses its helper API with the tested CUTLASS 4.5.2 runtime above.
+"$PY" -m pip install --no-deps "$QUACK_REQUIREMENT"
 
 MAMBA_FORCE_BUILD=TRUE MAMBA_SKIP_CUDA_BUILD=FALSE \
     "$PY" -m pip install \
