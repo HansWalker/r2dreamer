@@ -6,15 +6,15 @@ STORM, TD-MPC2, LeWorldModel, and Temporal Straightening models on DeepMind Cont
 
 ## Instructions
 
-This repository is tested with Ubuntu 24.04 and Python 3.10 or 3.11. Use the pinned setup script for
-the DMC comparison models. It creates or updates the
-shared `environment/` virtual environment in the parent directory, installs PyTorch 2.8 for CUDA
-12.8, builds the Mamba3 release used by this repo, and checks the production Mamba kernels. The
-NVIDIA driver, CUDA 12.8 toolkit, and `libz3-dev` must already be installed. The initial Mamba source
-build and checks can take several minutes.
+This repository is tested with Ubuntu 22.04 and Python 3.10; the pinned wheels also support Python
+3.11. The setup script creates or updates the shared `environment/` virtual environment, installs
+PyTorch 2.8 for CUDA 12.8, builds Mamba3, and checks the dependency graph, DMC rendering, TD-MPC2
+(when configured), and production Mamba kernels. The NVIDIA driver, CUDA 12.8 toolkit, and system
+libraries below must already be installed. The initial Mamba source build and checks can take several
+minutes.
 
 ```bash
-sudo apt-get install -y build-essential git libz3-dev
+sudo apt-get install -y build-essential git libegl1 libglew2.2 libz3-dev python3.10-venv
 PYTHON=python3.10 CUDA_HOME=/usr/local/cuda-12.8 bash scripts/setup_dmc.sh
 source ../environment/bin/activate
 ```
