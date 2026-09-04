@@ -41,14 +41,18 @@ def check_dependencies():
         raise RuntimeError("libz3.so is unavailable; install libz3-dev")
 
     expected = expected_versions()
+    version_errors = []
     for package, version in expected.items():
         try:
             installed = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError as exc:
-            raise RuntimeError(f"Missing required package {package}=={version}") from exc
+        except importlib.metadata.PackageNotFoundError:
+            version_errors.append(f"missing {package}=={version}")
+            continue
         comparable = installed.split("+", maxsplit=1)[0] if package == "torch" else installed
         if comparable != version:
-            raise RuntimeError(f"Expected {package}=={version}, got {installed}")
+            version_errors.append(f"expected {package}=={version}, got {installed}")
+    if version_errors:
+        raise RuntimeError("Pinned package check failed:\n  " + "\n  ".join(version_errors))
 
     pending = [("r2dreamer", ("", "dmc")), *[(name, ("",)) for name in expected]]
     checked = set()
