@@ -11,11 +11,6 @@ if [[ -z ${TDMPC2_DIR:-} ]]; then
     echo "Set TDMPC2_DIR to the local TD-MPC2 checkout before running the preflight." >&2
     exit 2
 fi
-if [[ -e $PREFLIGHT_ROOT ]]; then
-    echo "PREFLIGHT_ROOT already exists: $PREFLIGHT_ROOT" >&2
-    exit 2
-fi
-
 export CUDA_HOME
 export TDMPC2_DIR
 export PATH="$CUDA_HOME/bin:$PATH"
@@ -25,6 +20,15 @@ export PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM:-egl}
 export DMC_SMOKE_DATA_DIR="$PREFLIGHT_ROOT/data"
 
 RUN_DIR="$PREFLIGHT_ROOT/runs"
+RUN_OVERRIDES=()
+if [[ -d $PREFLIGHT_ROOT ]]; then
+    echo "Preflight | resuming=$PREFLIGHT_ROOT"
+    RUN_OVERRIDES=(
+        --override stages.collect=false
+        --override training.resume=true
+        --override training.overwrite=false
+    )
+fi
 mkdir -p "$PREFLIGHT_ROOT"
 cd "$REPO_DIR"
 
@@ -34,7 +38,8 @@ echo "Preflight | dependency and GPU runtime checks"
 echo "Preflight | collection, training, and evaluation"
 "$PYTHON" -u main.py \
     --config-name dmc_preflight \
-    --override "output_dir=$RUN_DIR"
+    --override "output_dir=$RUN_DIR" \
+    "${RUN_OVERRIDES[@]}"
 
 "$PYTHON" - "$RUN_DIR" <<'PY'
 import json
@@ -90,7 +95,9 @@ for path in files:
     )
 
 for path in root.rglob("*.log"):
-    if "Traceback (most recent call last):" in path.read_text(errors="replace"):
+    text = path.read_text(errors="replace")
+    latest_attempt = text.rsplit("\n$ ", 1)[-1]
+    if "Traceback (most recent call last):" in latest_attempt:
         errors.append(f"traceback in {path}")
 
 if errors:
