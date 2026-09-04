@@ -100,7 +100,7 @@ smoke_models:
     - model.rssm.gru.blocks=8
     - model.rssm.mamba3.d_state=32
     - model.rssm.mamba3.expand=8
-    - model.rssm.mamba3.chunk_size=4
+    - model.rssm.mamba3.chunk_size=16
     - model.rssm.s5.state_dim=32
     - model.rssm.s5.ffn_dim=64
     - model.rssm.hyena.width=64
@@ -125,7 +125,7 @@ smoke_models:
     - storm_model.recurrent.transformer.ffn_dim=128
     - storm_model.recurrent.mamba3.d_state=32
     - storm_model.recurrent.mamba3.expand=8
-    - storm_model.recurrent.mamba3.chunk_size=4
+    - storm_model.recurrent.mamba3.chunk_size=16
     - storm_model.recurrent.s5.state_dim=32
     - storm_model.recurrent.s5.ffn_dim=128
     - storm_model.recurrent.hyena.ffn_dim=128

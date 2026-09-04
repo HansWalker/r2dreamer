@@ -89,6 +89,7 @@ def _validate_step_config(d_model, config):
     d_state = int(config.d_state)
     expand = int(config.expand)
     headdim = int(config.headdim)
+    chunk_size = int(config.chunk_size)
     is_mimo = bool(config.is_mimo)
     mimo_rank = int(config.mimo_rank)
     is_outproj_norm = bool(config.is_outproj_norm)
@@ -105,6 +106,8 @@ def _validate_step_config(d_model, config):
             "Mamba3 step mode requires a positive expand and headdim that is a multiple of 64, "
             f"got expand={expand}, headdim={headdim}."
         )
+    if chunk_size < 16:
+        raise ValueError(f"Mamba3 sequence mode requires chunk_size >= 16, got chunk_size={chunk_size}.")
 
     inner = d_model * expand
     if inner % headdim:
