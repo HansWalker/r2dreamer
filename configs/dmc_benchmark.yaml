@@ -35,16 +35,16 @@ models:
   temporal_straightening:
     default: temporal_straightening_dmc_vision
 
-# Five independent runs are the minimum production comparison. The smoke
-# matrix remains single-seed.
-seeds: [0, 1, 2, 3, 4]
+# Run one complete seed first. Additional seeds can be added later; resume mode
+# skips seed 0 and reuses the shared datasets.
+seeds: [0]
 output_dir: runs/dmc_vision
 device: cuda:0
 
 collection:
-  configs:
-    - dmc_expert_collection
-    - dmc_expert_collection_eval_vision
+  config: dmc_expert_collection
+  # Each worker collects one scenario and writes its own HDF5 dataset.
+  parallelism: 3
 
 training:
   resume: true
@@ -52,4 +52,4 @@ training:
   overrides: []
 
 evaluation:
-  dataset_root: ${oc.env:DMC_EXPERT_EVAL_DATA_DIR,data/dmc_expert_eval_vision}
+  dataset_root: ${oc.env:DMC_EXPERT_VISION_DATA_DIR,data/dmc_expert_vision}

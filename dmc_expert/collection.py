@@ -108,6 +108,9 @@ def _dataset_metadata(
     config,
 ) -> dict[str, Any]:
     custom_checkpoint = task.dmc_name in config.checkpoints
+    train_episodes = int(config.episodes.train)
+    heldout_episodes = int(config.episodes.heldout)
+    total_episodes = train_episodes + heldout_episodes
     return {
         "format": DATA_FORMAT,
         "env_type": "dmc",
@@ -125,7 +128,11 @@ def _dataset_metadata(
         "checkpoint_seed": config.checkpoint_seed,
         "seed": config.seed,
         "episode_seed_rule": "seed + episode_index",
-        "num_episodes": config.num_episodes,
+        "num_episodes": total_episodes,
+        "episode_splits": {
+            "train": [0, train_episodes],
+            "heldout": [train_episodes, total_episodes],
+        },
         "obs_dim": int(flatten_obs(obs).shape[0]),
         "action_dim": int(np.prod(action_spec.shape)),
         "observation_keys": list(obs.keys()),
@@ -242,17 +249,19 @@ def collect_task(config, task: TaskSpec, checkpoint_path: Path):
     )
 
     store_path = Path(config.output_dir).expanduser() / task.store_name
+    metadata = _dataset_metadata(
+        task,
+        checkpoint_path,
+        first_obs,
+        action_spec,
+        raw_action_spec,
+        goal_relation,
+        config,
+    )
+    target_episodes = int(metadata["num_episodes"])
     h5, metadata_path, data_path = open_dataset(
         store_path,
-        _dataset_metadata(
-            task,
-            checkpoint_path,
-            first_obs,
-            action_spec,
-            raw_action_spec,
-            goal_relation,
-            config,
-        ),
+        metadata,
         resume=config.resume,
     )
 
@@ -263,12 +272,12 @@ def collect_task(config, task: TaskSpec, checkpoint_path: Path):
     started = time.perf_counter()
     progress_every = max(int(config.progress_every), 1)
     print(
-        f"Collection | task={task.dmc_name} | episodes={completed}/{config.num_episodes} | "
+        f"Collection | task={task.dmc_name} | episodes={completed}/{target_episodes} | "
         f"output={store_path}"
     )
-    write_progress(store_path, final_episodes, final_rows, config.num_episodes)
+    write_progress(store_path, final_episodes, final_rows, target_episodes)
     try:
-        for episode_idx in range(completed, config.num_episodes):
+        for episode_idx in range(completed, target_episodes):
             episode_seed = int(config.seed) + episode_idx
             seed_episode(episode_seed)
             raw_env, env, _, _ = make_env(task, episode_seed, config.time_limit)
@@ -281,21 +290,21 @@ def collect_task(config, task: TaskSpec, checkpoint_path: Path):
             h5.flush()
             final_episodes = episode_idx + 1
             final_rows += int(episode["actions"].shape[0])
-            write_progress(store_path, final_episodes, final_rows, config.num_episodes)
+            write_progress(store_path, final_episodes, final_rows, target_episodes)
             returns.append(float(episode_return))
 
             should_log = (
                 final_episodes == completed + 1
-                or final_episodes == config.num_episodes
+                or final_episodes == target_episodes
                 or final_episodes % progress_every == 0
             )
             if should_log:
                 elapsed = time.perf_counter() - started
                 sec_per_episode = elapsed / max(final_episodes - completed, 1)
-                eta = (config.num_episodes - final_episodes) * sec_per_episode
+                eta = (target_episodes - final_episodes) * sec_per_episode
                 print(
-                    f"Collection | task={task.dmc_name} | episodes={final_episodes}/{config.num_episodes} "
-                    f"({100 * final_episodes / config.num_episodes:.0f}%) | "
+                    f"Collection | task={task.dmc_name} | episodes={final_episodes}/{target_episodes} "
+                    f"({100 * final_episodes / target_episodes:.0f}%) | "
                     f"return={episode_return:.2f} | recent_return={float(np.mean(returns[-progress_every:])):.2f} | "
                     f"transitions={final_rows} | speed={sec_per_episode:.2f}s/episode | "
                     f"elapsed={_format_duration(elapsed)} | eta={_format_duration(eta)}"

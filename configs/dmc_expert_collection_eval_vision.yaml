@@ -1,7 +1,0 @@
-defaults:
-  - dmc_expert_collection
-  - _self_
-
-output_dir: ${oc.env:DMC_EXPERT_EVAL_DATA_DIR,data/dmc_expert_eval_vision}
-num_episodes: 500
-seed: 3000000

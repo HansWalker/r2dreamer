@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from .storage import DATA_FORMAT, observation_indices
+from .storage import DATA_FORMAT, observation_indices, split_episode_indices
 
 
 class DMCExpertDataset:
@@ -55,7 +55,11 @@ class DMCExpertDataset:
         self.obs_keys = list(requested)
         self.obs_shapes = requested
         self._check_array_shapes()
-        self.episodes = np.flatnonzero(self.complete & (self.lengths > 0))
+        train_episodes = split_episode_indices(self.metadata, "train", len(self.complete))
+        incomplete = train_episodes[~self.complete[train_episodes]]
+        if len(incomplete):
+            raise ValueError(f"{self.path} is missing {len(incomplete)} training episodes.")
+        self.episodes = train_episodes[self.lengths[train_episodes] > 0]
         if len(self.episodes) == 0:
             raise ValueError(f"{self.path} has no complete episodes.")
         self.num_episodes = len(self.episodes)
@@ -247,15 +251,18 @@ class DMCExpertSequenceReplay(DMCExpertDataset):
         self.num_episodes = len(self.episodes)
         self.reconstruct_context = str(config.storm_model.sequence_core) != "transformer"
 
-        reward = np.asarray(self.rewards[..., 0], dtype=np.float32)
-        terminal = np.asarray(self.terminations[..., 0], dtype=np.float32)
-        self.returns = np.zeros_like(reward)
-        running = np.zeros(reward.shape[0], dtype=np.float32)
+        first, stop = int(self.episodes[0]), int(self.episodes[-1]) + 1
+        offsets = self.episodes - first
+        reward = np.asarray(self.rewards[first:stop, :, 0], dtype=np.float32)[offsets]
+        terminal = np.asarray(self.terminations[first:stop, :, 0], dtype=np.float32)[offsets]
+        self.returns = np.zeros(self.rewards.shape[:2], dtype=np.float32)
+        running = np.zeros(len(self.episodes), dtype=np.float32)
+        lengths = self.lengths[self.episodes]
         gamma = float(config.actor_critic.gamma)
         for step in reversed(range(reward.shape[1])):
-            valid = step < self.lengths
+            valid = step < lengths
             running = np.where(valid, reward[:, step] + gamma * (1.0 - terminal[:, step]) * running, 0.0)
-            self.returns[:, step] = running
+            self.returns[self.episodes, step] = running
 
     def sample_episode_batch(self):
         indices = self._next_episode_indices()

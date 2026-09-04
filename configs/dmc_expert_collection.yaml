@@ -1,7 +1,11 @@
 tdmpc2_root: ${oc.env:TDMPC2_DIR}
 output_dir: ${oc.env:DMC_EXPERT_VISION_DATA_DIR,data/dmc_expert_vision}
 
-num_episodes: 10000
+# One collection per task. Training and evaluation read disjoint episode ranges
+# from this dataset.
+episodes:
+  train: 10000
+  heldout: 500
 checkpoint_seed: 1
 seed: 1
 

@@ -11,7 +11,7 @@ device: "cuda:0"
 model_family: dreamer
 model_io: ${env.model_io}
 resume_from: null
-experiment_protocol: dmc_frozen_defaults_v1
+experiment_protocol: dmc_frozen_defaults_v2
 
 hydra:
   run:
@@ -55,8 +55,8 @@ training:
   online:
     steps: 80000
     log_every: 5000
-    eval_every: 10000
-    save_every: 10000
+    eval_every: 20000
+    save_every: 20000
 
 dreamer_train:
   initial_updates: 0

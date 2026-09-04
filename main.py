@@ -9,8 +9,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -19,6 +21,8 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 ROOT = Path(__file__).resolve().parent
+ACTIVE_PROCESSES = set()
+ACTIVE_PROCESSES_LOCK = threading.Lock()
 CONSOLE_PREFIXES = (
     "Run |",
     "Model |",
@@ -77,6 +81,26 @@ def build_runs(config, scenario_name, scenario):
     return runs
 
 
+def stop_process(process):
+    if process.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+
+
+def stop_active_processes():
+    with ACTIVE_PROCESSES_LOCK:
+        processes = tuple(ACTIVE_PROCESSES)
+    for process in processes:
+        stop_process(process)
+
+
 def execute(label, command, log_path, *, dry_run=False):
     rendered = shlex.join(map(str, command))
     if dry_run:
@@ -98,6 +122,8 @@ def execute(label, command, log_path, *, dry_run=False):
             bufsize=1,
             start_new_session=True,
         )
+        with ACTIVE_PROCESSES_LOCK:
+            ACTIVE_PROCESSES.add(process)
         try:
             for line in process.stdout:
                 log.write(line)
@@ -107,16 +133,11 @@ def execute(label, command, log_path, *, dry_run=False):
                     print(f"  {message}", flush=True)
             returncode = process.wait()
         except BaseException:
-            if process.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+            stop_process(process)
             raise
+        finally:
+            with ACTIVE_PROCESSES_LOCK:
+                ACTIVE_PROCESSES.discard(process)
     if returncode:
         elapsed = timedelta(seconds=round(time.perf_counter() - started))
         print(f"FAILED | {label} | elapsed={elapsed}", flush=True)
@@ -133,26 +154,53 @@ def execute(label, command, log_path, *, dry_run=False):
     print(f"DONE | {label} | elapsed={elapsed}", flush=True)
 
 
-def collect(config, scenario_name, scenario, *, dry_run=False):
-    logdir = resolve_path(config["output_dir"]) / "orchestrator" / scenario_name
-    configs = config["collection"]["configs"]
-    for index, config_name in enumerate(configs, 1):
-        command = [
-            sys.executable,
-            "-u",
-            "-m",
-            "scripts.collect_dmc_expert_data",
-            "--config-name",
-            config_name,
-            "--task",
-            scenario["collection_task"],
-        ]
-        execute(
-            f"collect {index}/{len(configs)} | {scenario_name} | config={config_name}",
-            command,
-            logdir / f"{config_name}.log",
-            dry_run=dry_run,
+def execute_parallel(jobs, parallelism, *, dry_run=False):
+    if dry_run or parallelism <= 1:
+        for job in jobs:
+            execute(*job, dry_run=dry_run)
+        return
+
+    executor = ThreadPoolExecutor(max_workers=min(parallelism, len(jobs)))
+    futures = [executor.submit(execute, *job) for job in jobs]
+    try:
+        for future in as_completed(futures):
+            future.result()
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        stop_active_processes()
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    executor.shutdown()
+
+
+def collect_scenarios(config, scenarios, *, dry_run=False):
+    config_name = config["collection"]["config"]
+    logdir = resolve_path(config["output_dir"]) / "orchestrator"
+    jobs = [
+        (
+            f"collect | {name} | config={config_name}",
+            [
+                sys.executable,
+                "-u",
+                "-m",
+                "scripts.collect_dmc_expert_data",
+                "--config-name",
+                config_name,
+                "--task",
+                scenario["collection_task"],
+            ],
+            logdir / name / f"{config_name}.log",
         )
+        for name, scenario in scenarios.items()
+    ]
+    parallelism = min(int(config["collection"]["parallelism"]), len(jobs))
+    print(f"\nCollection | scenarios={len(jobs)} | parallelism={parallelism}", flush=True)
+    started = time.perf_counter()
+    execute_parallel(jobs, parallelism, dry_run=dry_run)
+    if not dry_run:
+        elapsed = timedelta(seconds=round(time.perf_counter() - started))
+        print(f"Collection | complete | scenarios={len(jobs)} | elapsed={elapsed}", flush=True)
 
 
 def run_models(config, runs, stages, *, dry_run=False):
@@ -269,11 +317,12 @@ def main():
         flush=True,
     )
 
-    for index, (scenario_name, scenario) in enumerate(scenarios.items(), 1):
-        print(f"\nScenario {index}/{len(scenarios)} | {scenario_name} | runs={runs_per_scenario}", flush=True)
-        if stages["collect"]:
-            collect(config, scenario_name, scenario, dry_run=args.dry_run)
-        if stages["train"] or stages["evaluate"]:
+    if stages["collect"]:
+        collect_scenarios(config, scenarios, dry_run=args.dry_run)
+
+    if stages["train"] or stages["evaluate"]:
+        for index, (scenario_name, scenario) in enumerate(scenarios.items(), 1):
+            print(f"\nScenario {index}/{len(scenarios)} | {scenario_name} | runs={runs_per_scenario}", flush=True)
             scenario_runs = build_runs(config, scenario_name, scenario)
             run_models(config, scenario_runs, stages, dry_run=args.dry_run)
     elapsed = timedelta(seconds=round(time.perf_counter() - started))

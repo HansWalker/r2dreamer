@@ -9,6 +9,8 @@ model_family: storm
 training:
   expert:
     enabled: true
+    # Online evaluation selects this family's final checkpoint.
+    eval_every: 0
 
 replay:
   batch_size: 16

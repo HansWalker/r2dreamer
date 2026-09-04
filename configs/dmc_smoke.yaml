@@ -8,17 +8,21 @@ seeds: [0]
 output_dir: runs/dmc_smoke
 device: cuda:0
 
+smoke:
+  expert_epochs: 1
+  online_steps: 0
+  online_checkpoint: pretrained.pt
+
 collection:
-  configs:
-    - dmc_expert_collection_smoke
-    - dmc_expert_collection_eval_smoke
+  config: dmc_expert_collection_smoke
+  parallelism: 1
 
 training:
   resume: false
   overwrite: true
   overrides:
     - deterministic_run=True
-    - env.dataset_root=${oc.env:DMC_SMOKE_DATA_DIR,data/dmc_smoke/train}
+    - env.dataset_root=${oc.env:DMC_SMOKE_DATA_DIR,data/dmc_smoke}
     - env.env_num=1
     - env.eval_episode_num=0
     - env.time_limit=8
@@ -26,7 +30,7 @@ training:
     - replay.sequence_length=4
     - replay.max_size=32
     - replay.windows_per_episode=1
-    - training.expert.epochs=1
+    - training.expert.epochs=${smoke.expert_epochs}
     - training.expert.log_every=1
     - training.expert.eval_every=0
     - training.expert.save_every=1
@@ -40,7 +44,7 @@ training:
     - evaluation.final.probe_batch_size=1
 
 evaluation:
-  dataset_root: ${oc.env:DMC_SMOKE_EVAL_DATA_DIR,data/dmc_smoke/eval}
+  dataset_root: ${oc.env:DMC_SMOKE_DATA_DIR,data/dmc_smoke}
 
 models:
   dreamer:
@@ -90,6 +94,8 @@ models:
 
 smoke_models:
   dreamer:
+    - training.online.steps=${smoke.online_steps}
+    - evaluation.final.checkpoint=${smoke.online_checkpoint}
     - model.deter=64
     - model.hidden=64
     - model.discrete=4
@@ -118,6 +124,8 @@ smoke_models:
     - actor_critic.imagine_batch_size=1
     - model.imag_horizon=2
   storm:
+    - training.online.steps=${smoke.online_steps}
+    - evaluation.final.checkpoint=${smoke.online_checkpoint}
     - storm_model.hidden_dim=64
     - storm_model.posterior.stoch_dim=4
     - storm_model.recurrent.transformer.num_heads=4
@@ -149,6 +157,8 @@ smoke_models:
     - storm_train.world_model_updates=1
     - storm_train.actor_critic_updates=1
   tdmpc2:
+    - training.online.steps=${smoke.online_steps}
+    - evaluation.final.checkpoint=${smoke.online_checkpoint}
     - tdmpc2_model.num_channels=8
     - tdmpc2_model.latent_dim=128
     - tdmpc2_model.mlp_dim=64

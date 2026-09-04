@@ -2,6 +2,7 @@
 
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import ModuleType
@@ -106,75 +107,100 @@ def pretrain(run, replay, checkpoint=None):
     start_update = state.updates
     if hasattr(run.model, "configure_pretraining"):
         run.model.configure_pretraining(updates)
+    pin_memory = str(run.config.device).startswith("cuda") and torch.cuda.is_available()
+
+    def pin(value):
+        method = getattr(value, "pin_memory", None)
+        if method is not None:
+            return method()
+        if isinstance(value, dict):
+            return {key: pin(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(pin(item) for item in value)
+        if isinstance(value, list):
+            return [pin(item) for item in value]
+        return value
+
+    def load_batch():
+        batch = replay.sample_episode_batch()
+        return pin(batch) if pin_memory else batch
+
     print(
         f"Expert | target_epochs={epochs:.2f} | updates={state.updates}/{updates} | "
         f"segments={updates * replay.batch_size:,} | batch_size={replay.batch_size} | "
-        f"sequence_length={replay.sequence_length}"
+        f"sequence_length={replay.sequence_length} | prefetch=1 | "
+        f"pin_memory={str(pin_memory).lower()}"
     )
 
-    for update in range(state.updates + 1, updates + 1):
-        metrics = run.family.expert_update(run.model, replay.sample_episode_batch())
-        state.updates = update
+    replay_state = replay.state_dict()
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="expert-replay") as executor:
+        future = executor.submit(load_batch) if state.updates < updates else None
+        for update in range(state.updates + 1, updates + 1):
+            batch = future.result()
+            replay_state = replay.state_dict()
+            future = executor.submit(load_batch) if update < updates else None
+            metrics = run.family.expert_update(run.model, batch)
+            state.updates = update
 
-        if (log_every and update % log_every == 0) or update == updates:
-            sec_per_update = (time.perf_counter() - started) / (update - start_update)
-            epoch = update * replay.batch_size / replay.num_episodes
-            detail = " | ".join(
-                f"{label}={tools.format_scalar(metrics.get(key), 2)}"
-                for label, key in run.family.EXPERT_METRICS.items()
-            )
-            scalars = {f"train/{name}": value for name, value in metrics.items()}
-            scalars.update({
-                "train/opt/updates": update,
-                "train/expert/epochs": epoch,
-                "train/timing/sec_per_update": sec_per_update,
-            })
-            run.logger.write(
-                update,
-                scalars,
-                console_message=(
-                    f"Expert | update={update}/{updates} ({100 * update / updates:.0f}%) | "
-                    f"epoch={tools.format_scalar(epoch, 1)}/{tools.format_scalar(epochs, 1)} | "
-                    f"speed={tools.format_scalar(sec_per_update, 2)}s/update | "
-                    f"eta={tools.format_eta((updates - update) * sec_per_update)} | {detail} | "
-                    f"eval={tools.format_scalar(state.last_eval_score, 1)} | "
-                    f"best={tools.format_scalar(state.best_eval_score, 1)}"
-                ),
-            )
-
-        if eval_every and (update % eval_every == 0 or update == updates):
-            state.last_eval_score, state.best_eval_score, improved = evaluate(
-                run,
-                update,
-                state.best_eval_score,
-                step_label="expert_update",
-            )
-            if improved:
-                save_checkpoint(
-                    run,
-                    run.logdir / "pretrained_best.pt",
-                    phase="expert",
-                    state=state,
-                    replay_state=replay.state_dict(),
-                    expert_updates=update,
+            if (log_every and update % log_every == 0) or update == updates:
+                sec_per_update = (time.perf_counter() - started) / (update - start_update)
+                epoch = update * replay.batch_size / replay.num_episodes
+                detail = " | ".join(
+                    f"{label}={tools.format_scalar(metrics.get(key), 2)}"
+                    for label, key in run.family.EXPERT_METRICS.items()
+                )
+                scalars = {f"train/{name}": value for name, value in metrics.items()}
+                scalars.update({
+                    "train/opt/updates": update,
+                    "train/expert/epochs": epoch,
+                    "train/timing/sec_per_update": sec_per_update,
+                })
+                run.logger.write(
+                    update,
+                    scalars,
+                    console_message=(
+                        f"Expert | update={update}/{updates} ({100 * update / updates:.0f}%) | "
+                        f"epoch={tools.format_scalar(epoch, 1)}/{tools.format_scalar(epochs, 1)} | "
+                        f"speed={tools.format_scalar(sec_per_update, 2)}s/update | "
+                        f"eta={tools.format_eta((updates - update) * sec_per_update)} | {detail} | "
+                        f"eval={tools.format_scalar(state.last_eval_score, 1)} | "
+                        f"best={tools.format_scalar(state.best_eval_score, 1)}"
+                    ),
                 )
 
-        if (save_every and update % save_every == 0) or update == updates:
-            save_checkpoint(
-                run,
-                run.logdir / "pretrain_latest.pt",
-                phase="expert",
-                state=state,
-                replay_state=replay.state_dict(),
-                expert_updates=update,
-            )
+            if eval_every and (update % eval_every == 0 or update == updates):
+                state.last_eval_score, state.best_eval_score, improved = evaluate(
+                    run,
+                    update,
+                    state.best_eval_score,
+                    step_label="expert_update",
+                )
+                if improved:
+                    save_checkpoint(
+                        run,
+                        run.logdir / "pretrained_best.pt",
+                        phase="expert",
+                        state=state,
+                        replay_state=replay_state,
+                        expert_updates=update,
+                    )
+
+            if (save_every and update % save_every == 0) or update == updates:
+                save_checkpoint(
+                    run,
+                    run.logdir / "pretrain_latest.pt",
+                    phase="expert",
+                    state=state,
+                    replay_state=replay_state,
+                    expert_updates=update,
+                )
 
     save_checkpoint(
         run,
         run.logdir / "pretrained.pt",
         phase="expert",
         state=state,
-        replay_state=replay.state_dict(),
+        replay_state=replay_state,
         expert_updates=state.updates,
     )
     print(f"Checkpoint | saved=pretrained.pt | expert_updates={state.updates}")

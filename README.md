@@ -35,7 +35,6 @@ and image-dataset root before collecting or training:
 ```bash
 export TDMPC2_DIR=/absolute/path/to/tdmpc2
 export DMC_EXPERT_VISION_DATA_DIR=/absolute/path/to/data/dmc_expert_vision
-export DMC_EXPERT_EVAL_DATA_DIR=/absolute/path/to/data/dmc_expert_eval_vision
 export TDMPC2_POINT_MASS_CHECKPOINT=/absolute/path/to/pointmass-easy.pt
 
 python3 -m scripts.collect_dmc_expert_data --config-name dmc_expert_collection
@@ -74,20 +73,29 @@ Ball-in-Cup dataset and one update per model:
 ./scripts/run_smoke.sh
 ```
 
-Both wrappers use the `environment/` created by `scripts/setup_dmc.sh`. Set `PYTHON` to use another
-interpreter. They forward any additional arguments to `main.py`, whose configs can also be invoked
-directly with `python3 main.py --config-name dmc_smoke` or `dmc_benchmark`.
+Immediately before the production run, use the fuller preflight. It checks the installed GPU stack,
+runs two expert updates for every model, exercises the short online lifecycle for Dreamer, STORM, and
+TD-MPC2, evaluates all thirteen variants, and validates the resulting checkpoints and metrics:
+
+```bash
+./scripts/run_preflight.sh
+```
+
+The wrappers use the `environment/` created by `scripts/setup_dmc.sh`. Set `PYTHON` to use another
+interpreter. The smoke and full-run wrappers forward additional arguments to `main.py`; all three
+configs can also be invoked directly as `dmc_smoke`, `dmc_preflight`, or `dmc_benchmark`.
 
 The orchestrator keeps the terminal focused on stage progress, timing, training metrics, and final
 results. Full commands, dependency warnings, and raw tracebacks remain in each collection or run log;
 on failure, the useful end of the traceback and the exact log path are printed automatically.
 
-The default production matrix runs all thirteen image-model variants on all three scenarios with five
-independent training seeds. For each scenario, it creates the training and held-out evaluation datasets,
-then trains and evaluates every model before moving to the next scenario. Training writes each run under
+The default production matrix first runs all thirteen image-model variants on all three scenarios with
+seed 0. It collects the three independent scenario datasets concurrently on the shared GPU, then trains
+and evaluates every model one at a time, scenario by scenario. Set `collection.parallelism=1` to collect
+serially. Training writes each run under
 `runs/dmc_vision/<scenario>/<family>/<variant>/seed_<seed>`, and evaluation writes
 `evaluation.json` beside each checkpoint. Set the booleans under `stages` to run only part of the
-lifecycle, add values under `seeds` for independent replicates, and select the compute device with
+lifecycle, add seeds after the initial matrix succeeds, and select the compute device with
 `device`. With `training.resume: true`, rerunning the same command skips completed evaluations,
 evaluates finished training runs, and resumes interrupted expert or online training. Set
 `training.overwrite: true` to delete existing runs and start them again.
@@ -119,6 +127,11 @@ validation-return state, and `final.pt` is the completed online state. Checkpoin
 JSON are written atomically so an interrupted write does not replace the previous valid file. Final
 evaluation selects one exact checkpoint name from the model config and never falls back across phases.
 
+Intermediate checkpoint selection uses five policy episodes. Online families skip rollout evaluation
+during expert pretraining, then evaluate at the start of online training and every 20,000 steps through
+80,000 steps. The offline-only LeWorldModel and Temporal Straightening runs instead evaluate four
+evenly spaced pretraining checkpoints. Reported final metrics still use 50 fresh episodes.
+
 The image models keep each family's visual design rather than routing pixels through shared state
 MLPs:
 
@@ -130,20 +143,16 @@ MLPs:
   reconstructs the visual tokens with a convolutional decoder.
 - TD-MPC2 uses its four-layer pixel encoder and random-shift augmentation.
 
-At the default 10,000 episodes, each RGB array is about 57 GiB before HDF5 compression. Collection
-also stores the simulator state for the held-out physical-state probe. Temporal Straightening alone
-receives its configured four-value proprioceptive subset; target-relative state remains excluded.
+Each scenario is collected once into one 10,500-episode dataset. Episodes 0 through 9,999 are available
+to training, while episodes 10,000 through 10,499 are reserved for evaluation. The RGB array is about
+60 GiB before HDF5 compression. Collection also stores simulator state for the held-out physical-state
+probe. Temporal Straightening alone receives its configured four-value proprioceptive subset;
+target-relative state remains excluded.
 
 Collection stores a two-coordinate task relation beside each image: mass-to-target for Point Mass,
 finger-to-target for Reacher, and ball-to-moving-cup-target for Ball-in-Cup. LeWorldModel and
 Temporal Straightening train a detached readout for this label; it does not alter their encoder or
-predictor objective. Collect a separate held-out set for physical-state prediction metrics:
-
-```bash
-export DMC_EXPERT_EVAL_DATA_DIR=/absolute/path/to/data/dmc_expert_eval_vision
-python3 -m scripts.collect_dmc_expert_data \
-  --config-name dmc_expert_collection_eval_vision
-```
+predictor objective. The held-out range in the same HDF5 file supplies physical-state prediction data.
 
 Evaluate an image-model checkpoint on that held-out dataset. Every family reports fresh policy
 return and task success as well as physical-state prediction. LeWorldModel and Temporal
@@ -156,7 +165,7 @@ python3 -m scripts.evaluate_dmc \
   --config-name leworldmodel_dmc_vision \
   --scenario point_mass \
   --logdir /absolute/path/to/the/run \
-  --dataset "$DMC_EXPERT_EVAL_DATA_DIR/point_mass_easy"
+  --dataset "$DMC_EXPERT_VISION_DATA_DIR/point_mass_easy"
 ```
 
 The image cohort is the comparison. Each family retains its native input branches, visual frontend,
@@ -235,7 +244,7 @@ STORM use 64-frame sequences; the planning families retain their native four-fra
 Replay batch, sequence, and online update settings remain family-specific where the reference recipes
 differ.
 
-The production configs use the predeclared `dmc_frozen_defaults_v1` hyperparameter protocol. Recurrent
+The production configs use the predeclared `dmc_frozen_defaults_v2` hyperparameter protocol. Recurrent
 variants inherit one unchanged family recipe: Dreamer uses LaProp at `4e-5`, batch size 32, 1,000-update
 warmup, and AGC 0.3; STORM uses Adam at `1e-4` for the world model and `3e-5` for the actor-critic,
 batch size 16, and its reference gradient limits. TD-MPC2 uses its `3e-4` reference learning rate,

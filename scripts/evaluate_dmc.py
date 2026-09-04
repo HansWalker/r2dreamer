@@ -18,7 +18,6 @@ def parse_args():
     parser.add_argument("--scenario", required=True, help="Scenario config name, such as point_mass.")
     parser.add_argument("--logdir", type=Path, required=True, help="Training run directory.")
     parser.add_argument("--dataset", type=Path, required=True, help="Held-out HDF5 dataset for prediction metrics.")
-    parser.add_argument("--allow-training-dataset", action="store_true", help="Allow an explicitly in-sample probe.")
     parser.add_argument("--device", help="Optional device override, such as cuda:0.")
     parser.add_argument("--override", action="append", default=[], help="Additional Hydra override; repeat as needed.")
     parser.add_argument("--output", type=Path, help="JSON output path; defaults to <logdir>/evaluation.json.")
@@ -76,9 +75,6 @@ def main():
     finally:
         close_envs(envs)
 
-    training_dataset = _path(str(config.training.expert.data_path)).resolve()
-    if dataset_path == training_dataset and not args.allow_training_dataset:
-        raise ValueError("Prediction metrics require held-out data; pass a different --dataset path.")
     print(f"Evaluation | state_prediction=running | dataset={dataset_path}")
     tools.configure_randomness(int(settings.probe_seed), bool(config.deterministic_run))
     prediction = evaluate_state_prediction(
@@ -124,7 +120,7 @@ def main():
         "goal_spec": goal_spec,
         "physical_state_prediction": prediction,
         "dataset": str(dataset_path),
-        "dataset_role": "training" if dataset_path == training_dataset else "held_out",
+        "dataset_role": "held_out",
     }
     output = _path(args.output).resolve() if args.output else logdir / "evaluation.json"
     output.parent.mkdir(parents=True, exist_ok=True)

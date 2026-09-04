@@ -7,7 +7,8 @@ defaults:
 training:
   expert:
     enabled: true
-    eval_every: 500
+    # Offline-only families select among four evenly spaced checkpoints.
+    eval_every: 1250
   # The representation methods remain offline; reward is used only to select
   # among checkpoints through their task-relative planners.
   online:

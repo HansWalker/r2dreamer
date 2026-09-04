@@ -27,6 +27,7 @@ METADATA_KEYS = (
     "time_limit",
     "seed",
     "episode_seed_rule",
+    "episode_splits",
     "action_min",
     "action_max",
     "raw_action_min",
@@ -86,8 +87,14 @@ def open_dataset(path: Path, metadata: dict[str, Any], resume: bool):
                 "Convert or delete the old dataset before collecting with the dense HDF5 format."
             )
         _check_metadata(existing, metadata)
+        changed = False
         if int(metadata["num_episodes"]) > int(existing.get("num_episodes", 0)):
             existing["num_episodes"] = int(metadata["num_episodes"])
+            changed = True
+        if "episode_splits" not in existing and "episode_splits" in metadata:
+            existing["episode_splits"] = metadata["episode_splits"]
+            changed = True
+        if changed:
             metadata_path.write_text(json.dumps(existing, indent=2, default=str), encoding="utf-8")
         metadata = existing
     else:
@@ -96,6 +103,21 @@ def open_dataset(path: Path, metadata: dict[str, Any], resume: bool):
     h5 = h5py.File(data_path, "a")
     ensure_arrays(h5, metadata)
     return h5, metadata_path, data_path
+
+
+def split_episode_indices(metadata: dict[str, Any], name: str, total: int) -> np.ndarray:
+    """Return the configured episode range, with legacy datasets treated as training-only."""
+    splits = metadata.get("episode_splits")
+    if not splits:
+        if name == "train":
+            return np.arange(total, dtype=np.int64)
+        raise ValueError("Dataset metadata has no held-out episode split.")
+    if name not in splits or len(splits[name]) != 2:
+        raise ValueError(f"Dataset metadata has no valid {name!r} episode split.")
+    start, stop = map(int, splits[name])
+    if not 0 <= start < stop <= total:
+        raise ValueError(f"Dataset {name!r} split [{start}, {stop}) exceeds {total} episodes.")
+    return np.arange(start, stop, dtype=np.int64)
 
 
 def _require_array(h5, name: str, shape: tuple[int, ...], dtype, chunks: tuple[int, ...], **options):

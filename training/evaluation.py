@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from dmc_expert.storage import DATA_FORMAT, observation_indices
+from dmc_expert.storage import DATA_FORMAT, observation_indices, split_episode_indices
 from models.dreamer import Dreamer
 from models.planning import LatentPlanner
 from models.shared.utils import parse_model_io
@@ -199,6 +199,7 @@ class ProbeDataset:
             if self.observation_shapes["proprio"] != (len(self.proprio_indices),):
                 raise ValueError("Configured proprioception does not match the held-out dataset metadata.")
         self.h5 = h5py.File(self.path / "data.hdf5", "r")
+        self.episodes = split_episode_indices(self.metadata, "heldout", self.h5["complete"].shape[0])
         self.action_dim = math.prod(action_shape)
         if self.h5["actions"].shape[-1] != self.action_dim:
             raise ValueError(
@@ -217,7 +218,10 @@ class ProbeDataset:
     def split_windows(self, train_count, test_count, length, seed):
         lengths = np.asarray(self.h5["lengths"], dtype=np.int64)
         complete = np.asarray(self.h5["complete"], dtype=bool)
-        episodes = np.flatnonzero(complete & (lengths >= length - 1))
+        incomplete = self.episodes[~complete[self.episodes]]
+        if len(incomplete):
+            raise ValueError(f"{self.path} is missing {len(incomplete)} held-out episodes.")
+        episodes = self.episodes[lengths[self.episodes] >= length - 1]
         if len(episodes) < 2:
             raise ValueError(f"{self.path} needs at least two complete episodes with {length - 1} transitions.")
         rng = np.random.default_rng(seed)
@@ -348,6 +352,8 @@ def evaluate_state_prediction(
             "probe": "ridge linear",
             "ridge": float(ridge),
             "episode_split": "disjoint probe-fit and probe-test episodes",
+            "dataset_split": "heldout",
+            "dataset_episode_range": [int(dataset.episodes[0]), int(dataset.episodes[-1]) + 1],
             "horizons": list(horizons),
             "context_length": context_length,
             "probe_train_windows": int(train_windows),

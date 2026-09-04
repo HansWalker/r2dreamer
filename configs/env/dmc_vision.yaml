@@ -1,6 +1,7 @@
 task: ${scenario.task}
 env_num: 16
-eval_episode_num: 10
+# Checkpoint selection uses a small rollout set; final evaluation uses 50 episodes.
+eval_episode_num: 5
 action_repeat: 2
 train_ratio: 512
 time_limit: 1000
