@@ -1,0 +1,12 @@
+defaults:
+  - dmc_smoke
+  - _self_
+
+output_dir: runs/dmc_preflight
+
+# Exercise prefetching and each online-capable family without changing the
+# deliberately minimal defaults in dmc_smoke.yaml.
+smoke:
+  expert_epochs: 2
+  online_steps: 8
+  online_checkpoint: final.pt
