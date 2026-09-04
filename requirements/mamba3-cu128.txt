@@ -8,6 +8,8 @@ cuda-core==1.0.0
 cuda-pathfinder==1.5.5
 cuda-python==13.3.1
 einops==0.8.1
+# TileLang leaves this unbounded, but 0.6 requires NumPy 2.
+ml-dtypes==0.5.4
 nvidia-cutlass-dsl==4.5.2
 nvidia-cutlass-dsl-libs-base==4.5.2
 quack-kernels==0.5.3
