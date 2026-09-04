@@ -1,0 +1,18 @@
+name: cartpole_balance_sparse
+task: dmc_cartpole_balance_sparse
+collection_task: cartpole/balance_sparse
+dataset: cartpole_balance_sparse
+planning_horizon: 5
+proprio_dim: 5
+proprio:
+  position: [0, 1, 2]
+  velocity: [0, 1]
+
+goal:
+  # Native sparse reward bounds: centered cart and pole within acos(0.995) of upright.
+  geometry: box
+  tolerance: [0.25, 0.1000417136]
+
+action:
+  kind: continuous
+  shape: [1]
