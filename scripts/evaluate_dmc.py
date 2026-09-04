@@ -54,6 +54,11 @@ def main():
     config.env.eval_seed = int(settings.seed)
 
     checkpoint_path = logdir / str(settings.checkpoint)
+    horizons = tuple(map(int, settings.horizons))
+    print(
+        f"Evaluation | checkpoint={checkpoint_path.name} | episodes={settings.episodes} | "
+        f"context={settings.context_length} | horizons={','.join(map(str, horizons))}"
+    )
     seed = int(config.env.eval_seed)
     tools.configure_randomness(seed, bool(config.deterministic_run))
     family = load_model_family(str(config.model_family))
@@ -64,6 +69,7 @@ def main():
 
     goal_conditioned = bool(getattr(model, "goal_conditioned", False))
     goal_spec = OmegaConf.to_container(config.jepa_model.goal, resolve=True) if goal_conditioned else None
+    print("Evaluation | policy_rollout=running")
     envs = make_eval_envs(config.env)
     try:
         episode_return, episode_length, extra = family.evaluate(config, model, envs)
@@ -73,6 +79,7 @@ def main():
     training_dataset = _path(str(config.training.expert.data_path)).resolve()
     if dataset_path == training_dataset and not args.allow_training_dataset:
         raise ValueError("Prediction metrics require held-out data; pass a different --dataset path.")
+    print(f"Evaluation | state_prediction=running | dataset={dataset_path}")
     tools.configure_randomness(int(settings.probe_seed), bool(config.deterministic_run))
     prediction = evaluate_state_prediction(
         model,
@@ -80,7 +87,7 @@ def main():
         dataset_path,
         proprio=config.env.proprio,
         context_length=int(settings.context_length),
-        horizons=tuple(map(int, settings.horizons)),
+        horizons=horizons,
         train_windows=int(settings.probe_train_windows),
         test_windows=int(settings.probe_test_windows),
         batch_size=int(settings.probe_batch_size),
@@ -122,8 +129,12 @@ def main():
     temporary = Path(f"{output}.tmp")
     temporary.write_text(json.dumps(result, indent=2), encoding="utf-8")
     temporary.replace(output)
-    print(json.dumps(result, indent=2))
-    print(f"Saved {output}")
+    print(
+        f"Result | return={result['mean_return']:.2f} +/- {result['return_standard_error']:.2f} | "
+        f"success={100 * result['task_success_rate']:.1f}% | "
+        f"state_nrmse={prediction['mean_nrmse']:.3f} | episode_length={result['mean_episode_length']:.1f}"
+    )
+    print(f"Output | evaluation={output}")
 
 
 if __name__ == "__main__":

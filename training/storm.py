@@ -26,10 +26,7 @@ __all__ = [
 
 
 def build_model(config):
-    model = StormModel(config, config.model_io).to(config.device)
-    print(f"World model params: {sum(parameter.numel() for parameter in model.world_model.parameters()):,}")
-    print(f"Actor critic params: {sum(parameter.numel() for parameter in model.actor_critic.parameters()):,}")
-    return model
+    return StormModel(config, config.model_io).to(config.device)
 
 
 def checkpoint(model):

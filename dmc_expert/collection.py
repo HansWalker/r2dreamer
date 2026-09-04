@@ -232,6 +232,7 @@ def collect_task(config, task: TaskSpec, checkpoint_path: Path):
     finally:
         schema_raw_env.close()
 
+    print(f"Collection | task={task.dmc_name} | loading_checkpoint={checkpoint_path.name}")
     agent = load_agent(
         config,
         checkpoint_path,
@@ -262,8 +263,8 @@ def collect_task(config, task: TaskSpec, checkpoint_path: Path):
     started = time.perf_counter()
     progress_every = max(int(config.progress_every), 1)
     print(
-        f"Collecting {task.dmc_name}: {completed}/{config.num_episodes} episodes already present, "
-        f"writing to {store_path}"
+        f"Collection | task={task.dmc_name} | episodes={completed}/{config.num_episodes} | "
+        f"output={store_path}"
     )
     write_progress(store_path, final_episodes, final_rows, config.num_episodes)
     try:
@@ -293,11 +294,11 @@ def collect_task(config, task: TaskSpec, checkpoint_path: Path):
                 sec_per_episode = elapsed / max(final_episodes - completed, 1)
                 eta = (config.num_episodes - final_episodes) * sec_per_episode
                 print(
-                    f"{task.dmc_name} {final_episodes}/{config.num_episodes}: "
-                    f"last_return={episode_return:.3f}, "
-                    f"recent_mean={float(np.mean(returns[-progress_every:])):.3f}, "
-                    f"rows={final_rows}, elapsed={_format_duration(elapsed)}, "
-                    f"sec/ep={sec_per_episode:.2f}, eta={_format_duration(eta)}"
+                    f"Collection | task={task.dmc_name} | episodes={final_episodes}/{config.num_episodes} "
+                    f"({100 * final_episodes / config.num_episodes:.0f}%) | "
+                    f"return={episode_return:.2f} | recent_return={float(np.mean(returns[-progress_every:])):.2f} | "
+                    f"transitions={final_rows} | speed={sec_per_episode:.2f}s/episode | "
+                    f"elapsed={_format_duration(elapsed)} | eta={_format_duration(eta)}"
                 )
     finally:
         h5.close()

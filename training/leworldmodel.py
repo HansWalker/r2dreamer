@@ -23,6 +23,4 @@ EXPERT_METRICS = {
 
 
 def build_model(config):
-    model = LeWorldModel(config, config.model_io).to(config.device)
-    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    return model
+    return LeWorldModel(config, config.model_io).to(config.device)

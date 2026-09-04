@@ -33,6 +33,4 @@ ONLINE_METRICS = EXPERT_METRICS
 
 
 def build_model(config):
-    model = TDMPC2(config, config.model_io).to(config.device)
-    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    return model
+    return TDMPC2(config, config.model_io).to(config.device)

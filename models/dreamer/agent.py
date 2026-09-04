@@ -35,18 +35,12 @@ class Dreamer(DreamerModel):
         recon = self._loss_scales.pop("recon")
         self._loss_scales.update({k: recon for k in self.decoder.all_keys})
         module_names = ("rssm", "encoder", "actor", "value", "reward", "cont", "decoder")
-        for key in module_names:
-            module = getattr(self, key)
-            count = sum(p.numel() for p in module.parameters() if p.requires_grad)
-            print(f"{count:>14,}: {key}")
         self._named_params = OrderedDict(
             (f"{name}.{param_name}", param)
             for name in module_names
             for param_name, param in getattr(self, name).named_parameters()
             if param.requires_grad
         )
-        print(f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters.")
-
         self._agc = partial(
             clip_grad_agc_,
             clip=float(config.agc),
@@ -69,7 +63,7 @@ class Dreamer(DreamerModel):
 
         self.train()
         if config.compile:
-            print("Compiling update function with torch.compile...")
+            print("Model | compiling=torch.compile")
             self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")
 
     def training_state_dict(self):

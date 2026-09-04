@@ -26,9 +26,7 @@ EXPERT_METRICS = {
 
 
 def build_model(config):
-    model = TemporalStraightening(config, config.model_io).to(config.device)
-    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    return model
+    return TemporalStraightening(config, config.model_io).to(config.device)
 
 
 def configure_expert_replay(model, replay):

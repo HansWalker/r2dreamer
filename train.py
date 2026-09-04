@@ -11,7 +11,7 @@ def main(config):
     tools.configure_randomness(config.seed, config.deterministic_run)
     logdir = Path(config.logdir).expanduser()
     logdir.mkdir(parents=True, exist_ok=True)
-    print("Logdir", logdir)
+    print(f"Run | output={logdir}")
 
     checkpoint = Path(config.resume_from).expanduser() if config.resume_from else None
     with tools.Logger(logdir) as logger:

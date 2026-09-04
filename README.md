@@ -78,6 +78,10 @@ Both wrappers use the `environment/` created by `scripts/setup_dmc.sh`. Set `PYT
 interpreter. They forward any additional arguments to `main.py`, whose configs can also be invoked
 directly with `python3 main.py --config-name dmc_smoke` or `dmc_benchmark`.
 
+The orchestrator keeps the terminal focused on stage progress, timing, training metrics, and final
+results. Full commands, dependency warnings, and raw tracebacks remain in each collection or run log;
+on failure, the useful end of the traceback and the exact log path are printed automatically.
+
 The default matrix runs all thirteen image-model variants on all three scenarios. For each scenario,
 it creates the training and held-out evaluation datasets, then trains and evaluates every model before
 moving to the next scenario. Training writes each run under

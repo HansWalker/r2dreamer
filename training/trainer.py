@@ -66,7 +66,7 @@ def evaluate(
     envs = make_eval_envs(run.config.env)
     tools.configure_randomness(int(run.config.env.eval_seed), bool(run.config.deterministic_run))
     try:
-        print("Evaluating policy...")
+        print(f"Evaluation | running | {step_label}={int(step)}")
         score, length, extra = run.family.evaluate(run.config, run.model, envs)
     finally:
         close_envs(envs)
@@ -78,7 +78,7 @@ def evaluate(
         step,
         scalars,
         console_message=(
-            f"phase=eval | {step_label}={int(step)} | score={tools.format_scalar(score, 1)} | "
+            f"Evaluation | {step_label}={int(step)} | return={tools.format_scalar(score, 1)} | "
             f"length={tools.format_scalar(length, 0)} | best={tools.format_scalar(best_score, 1)}"
         ),
     )
@@ -105,7 +105,10 @@ def pretrain(run, replay, checkpoint=None):
     start_update = state.updates
     if hasattr(run.model, "configure_pretraining"):
         run.model.configure_pretraining(updates)
-    print(f"Expert pretrain: {epochs:.2f} epochs, {updates} updates, batch_size={replay.batch_size}")
+    print(
+        f"Expert | target_epochs={epochs:.2f} | updates={state.updates}/{updates} | "
+        f"batch_size={replay.batch_size}"
+    )
 
     for update in range(state.updates + 1, updates + 1):
         metrics = run.family.expert_update(run.model, replay.sample_episode_batch())
@@ -128,7 +131,7 @@ def pretrain(run, replay, checkpoint=None):
                 update,
                 scalars,
                 console_message=(
-                    f"phase=expert | update={update}/{updates} ({100 * update / updates:.0f}%) | "
+                    f"Expert | update={update}/{updates} ({100 * update / updates:.0f}%) | "
                     f"epoch={tools.format_scalar(epoch, 1)}/{tools.format_scalar(epochs, 1)} | "
                     f"speed={tools.format_scalar(sec_per_update, 2)}s/update | "
                     f"eta={tools.format_eta((updates - update) * sec_per_update)} | {detail} | "
@@ -172,6 +175,7 @@ def pretrain(run, replay, checkpoint=None):
         replay_state=replay.state_dict(),
         expert_updates=state.updates,
     )
+    print(f"Checkpoint | saved=pretrained.pt | expert_updates={state.updates}")
     return state.updates
 
 
@@ -191,6 +195,10 @@ def train_online(run, session, checkpoint=None, expert_updates=0):
     save_every = int(settings.save_every)
     log_every = int(settings.log_every)
     eval_enabled = bool(eval_every and int(run.config.env.eval_episode_num) > 0)
+    print(
+        f"Online | steps={state.env_steps}/{total_steps} | replay={session.replay.count()} | "
+        f"resumed={str(resumed).lower()}"
+    )
 
     def save(name):
         replay_state = session.replay.state_dict() if name == "latest.pt" else None
@@ -267,7 +275,7 @@ def train_online(run, session, checkpoint=None, expert_updates=0):
                 state.env_steps,
                 scalars,
                 console_message=(
-                    f"phase=online | env_step={state.env_steps}/{total_steps} "
+                    f"Online | env_step={state.env_steps}/{total_steps} "
                     f"({100 * state.env_steps / total_steps:.0f}%) | "
                     f"wm_updates={state.world_model_updates} | "
                     f"speed={tools.format_scalar(fps, 0)}fps | "
@@ -284,13 +292,24 @@ def train_online(run, session, checkpoint=None, expert_updates=0):
     elif last_saved_step != state.env_steps:
         save("latest.pt")
     save("final.pt")
+    print(f"Checkpoint | saved=final.pt | env_steps={state.env_steps}")
     return asdict(state)
 
 
 def train(config, logger, logdir, checkpoint_path=None):
-    family = load_model_family(config.model_family)
+    family_name = str(config.model_family)
+    if family_name == "dreamer":
+        variant = str(config.model.rssm.core)
+    elif family_name == "storm":
+        variant = str(config.storm_model.sequence_core)
+    else:
+        variant = "default"
+    print(f"Model | building | name={family_name}/{variant} | device={config.device}")
+    family = load_model_family(family_name)
     model = family.build_model(config)
     run = TrainingRun(config, logger, Path(logdir), family, model)
+    parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    print(f"Model | ready | name={family_name}/{variant} | parameters={parameters:,}")
     checkpoint = None
     expert_updates = 0
 
@@ -301,19 +320,25 @@ def train(config, logger, logdir, checkpoint_path=None):
         run.family.load_checkpoint(run.model, checkpoint, training=True)
         tools.set_rng_state(checkpoint.get("rng_state"))
         expert_updates = int(checkpoint.get("expert_updates", 0))
+        print(
+            f"Checkpoint | loaded={checkpoint_path} | phase={checkpoint['phase']} | "
+            f"expert_updates={expert_updates}"
+        )
 
     if bool(config.training.expert.enabled) and (checkpoint is None or checkpoint["phase"] == "expert"):
-        expert = config.training.expert
-        print(f"Load expert data: {expert.data_path}")
         with run.family.ExpertReplay(config) as replay:
             replay.validate_model_io(config.model_io)
             if hasattr(run.family, "configure_expert_replay"):
                 run.family.configure_expert_replay(run.model, replay)
-            print(f"Expert data: {replay.path}")
-            print(f"Expert episodes: {replay.num_episodes}")
+            print(f"Data | expert={replay.path} | episodes={replay.num_episodes}")
             expert_updates = pretrain(run, replay, checkpoint)
+    elif not bool(config.training.expert.enabled):
+        print("Expert | skipped | disabled")
+    else:
+        print(f"Expert | complete | updates={expert_updates}")
 
     if not int(config.training.online.steps):
+        print("Online | skipped | target_steps=0")
         return {"expert_updates": expert_updates} if expert_updates else None
 
     train_envs = None
