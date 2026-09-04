@@ -121,7 +121,7 @@ smoke_models:
     - actor_critic.hidden_dim=64
     - actor_critic.layers=1
     - actor_critic.value_bins=31
-    - actor_critic.imagine_batch_size=1
+    - actor_critic.imagine_batch_size=4
     - model.imag_horizon=2
   storm:
     - training.online.steps=${smoke.online_steps}
