@@ -2,6 +2,8 @@ defaults:
   - dmc_experiment
   - _self_
 
+# Frozen representation-learning recipe. Family configs only override settings
+# required by their original objectives and planners.
 training:
   expert:
     enabled: true

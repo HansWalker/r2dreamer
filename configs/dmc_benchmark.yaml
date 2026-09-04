@@ -35,7 +35,9 @@ models:
   temporal_straightening:
     default: temporal_straightening_dmc_vision
 
-seeds: [0]
+# Five independent runs are the minimum production comparison. The smoke
+# matrix remains single-seed.
+seeds: [0, 1, 2, 3, 4]
 output_dir: runs/dmc_vision
 device: cuda:0
 

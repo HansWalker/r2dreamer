@@ -82,9 +82,9 @@ The orchestrator keeps the terminal focused on stage progress, timing, training 
 results. Full commands, dependency warnings, and raw tracebacks remain in each collection or run log;
 on failure, the useful end of the traceback and the exact log path are printed automatically.
 
-The default matrix runs all thirteen image-model variants on all three scenarios. For each scenario,
-it creates the training and held-out evaluation datasets, then trains and evaluates every model before
-moving to the next scenario. Training writes each run under
+The default production matrix runs all thirteen image-model variants on all three scenarios with five
+independent training seeds. For each scenario, it creates the training and held-out evaluation datasets,
+then trains and evaluates every model before moving to the next scenario. Training writes each run under
 `runs/dmc_vision/<scenario>/<family>/<variant>/seed_<seed>`, and evaluation writes
 `evaluation.json` beside each checkpoint. Set the booleans under `stages` to run only part of the
 lifecycle, add values under `seeds` for independent replicates, and select the compute device with
@@ -230,8 +230,18 @@ separate policy update, and soft target-Q update; LeWorldModel keeps AdamW and i
 SIGReg objective; and Temporal Straightening keeps separate Adam/AdamW optimizers for its encoder,
 predictor, action encoder, and decoder. The common 16-epoch expert phase, 64x64 images, and matched
 parameter budget are deliberate comparison adaptations rather than claims about the original paper
-defaults. Replay batch, sequence, and online update settings remain
-family-specific where the reference recipes differ.
+defaults. One expert epoch means one randomly positioned sequence from every episode. Dreamer and
+STORM use 64-frame sequences; the planning families retain their native four-frame training clips.
+Replay batch, sequence, and online update settings remain family-specific where the reference recipes
+differ.
+
+The production configs use the predeclared `dmc_frozen_defaults_v1` hyperparameter protocol. Recurrent
+variants inherit one unchanged family recipe: Dreamer uses LaProp at `4e-5`, batch size 32, 1,000-update
+warmup, and AGC 0.3; STORM uses Adam at `1e-4` for the world model and `3e-5` for the actor-critic,
+batch size 16, and its reference gradient limits. TD-MPC2 uses its `3e-4` reference learning rate,
+while LeWorldModel and Temporal Straightening retain their native optimizer separation. Core widths are
+set only by the shared parameter budget. These defaults must be frozen before production runs and must
+not be adjusted for individual tasks or variants after observing results.
 
 All active STORM variants live under `models/storm`. Collection loads an external TD-MPC2
 checkout from `TDMPC2_DIR`; neither training path imports an upstream reference checkout from this

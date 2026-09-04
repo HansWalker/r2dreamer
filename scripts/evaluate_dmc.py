@@ -97,6 +97,8 @@ def main():
 
     trainer_state = checkpoint.get("trainer_state", {})
     result = {
+        "experiment_protocol": checkpoint.get("experiment_protocol", "legacy_unversioned"),
+        "evaluation_protocol": str(config.experiment_protocol),
         "config": args.config_name,
         "model_family": str(config.model_family),
         "scenario": args.scenario,

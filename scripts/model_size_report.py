@@ -158,7 +158,7 @@ def model_groups(family, model):
 
 
 def build(config_name, scenario, overrides=()):
-    from models.dreamer.model import DreamerModel
+    from models.dreamer import Dreamer
     from models.leworldmodel import LeWorldModel
     from models.storm.model import StormModel
     from models.tdmpc2 import TDMPC2
@@ -170,7 +170,7 @@ def build(config_name, scenario, overrides=()):
     )
     family_name = str(config.model_family)
     constructors = {
-        "dreamer": lambda: DreamerModel(config.model, config.model_io),
+        "dreamer": lambda: Dreamer(config.model, config.model_io),
         "storm": lambda: StormModel(config, config.model_io),
         "tdmpc2": lambda: TDMPC2(config, config.model_io),
         "leworldmodel": lambda: LeWorldModel(config, config.model_io),

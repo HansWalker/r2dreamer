@@ -4,7 +4,7 @@ defaults:
 
 output_dir: ${oc.env:DMC_SMOKE_DATA_DIR,data/dmc_smoke/train}
 num_episodes: 1
-max_episode_steps: 4
+max_episode_steps: 8
 resume: false
 progress_every: 1
 

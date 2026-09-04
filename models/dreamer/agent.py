@@ -135,11 +135,11 @@ class Dreamer(DreamerModel):
         self._optimizer_step(metrics)
         return metrics
 
-    def update_expert_pretrain(self, data):
-        """Perform one supervised expert pretraining update from full episodes."""
+    def update_expert_pretrain(self, data, contexts=None):
+        """Perform one supervised expert update from a reconstructed replay state."""
         torch.compiler.cudagraph_mark_step_begin()
         p_data = self.preprocess(data)
-        initial = self._initial_tuple(data.shape[0])
+        initial = self._replay_initial(contexts) if contexts is not None else self._initial_tuple(data.shape[0])
         self._update_slow_target()
         with autocast(device_type=self.device.type, dtype=torch.float16):
             metrics = self._cal_expert_pretrain_grad(p_data, initial)

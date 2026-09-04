@@ -9,8 +9,5 @@ training:
   expert:
     enabled: true
 
-replay:
-  batch_size: 16
-
 model:
   hidden: 713

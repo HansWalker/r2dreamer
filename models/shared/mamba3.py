@@ -179,6 +179,7 @@ class Mamba3Layer(nn.Module):
         )
 
         batch_size = token.shape[0]
+        # Match the forward and step paths in the pinned Mamba3 commit.
         a = -F.softplus(a.float())
         a = torch.clamp(a, max=-self.mamba.A_floor)
         delta = F.softplus(delta.float() + self.mamba.dt_bias)

@@ -1,3 +1,4 @@
+# Frozen Dreamer recipe shared by every recurrent-core variant.
 act_entropy: 3e-4
 kl_free: 1.0
 imag_horizon: 15

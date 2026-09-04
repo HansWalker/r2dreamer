@@ -2,6 +2,8 @@ defaults:
   - dmc_experiment
   - _self_
 
+# Frozen TD-MPC2 recipe; values follow the reference family rather than the
+# Dreamer or STORM optimizer settings.
 model_family: tdmpc2
 logdir: logdir/tdmpc2_dmc_vision/${scenario.name}/seed_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 

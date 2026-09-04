@@ -11,6 +11,7 @@ device: "cuda:0"
 model_family: dreamer
 model_io: ${env.model_io}
 resume_from: null
+experiment_protocol: dmc_frozen_defaults_v1
 
 hydra:
   run:
@@ -32,6 +33,8 @@ evaluation:
     probe_seed: 2000000
 
 replay:
+  # Shared exposure for Dreamer and the representation models. STORM and
+  # TD-MPC2 retain their reference-family batch sizes in their base configs.
   batch_size: 32
   sequence_length: 64
   max_size: 5e5

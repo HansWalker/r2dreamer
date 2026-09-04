@@ -42,6 +42,7 @@ class TrainingRun:
 def save_checkpoint(run, path, phase, state, replay_state=None, expert_updates=0):
     payload = {
         **run.family.checkpoint(run.model),
+        "experiment_protocol": str(run.config.experiment_protocol),
         "phase": phase,
         "training_seed": int(run.config.seed),
         "rng_state": tools.get_rng_state(),
@@ -107,7 +108,8 @@ def pretrain(run, replay, checkpoint=None):
         run.model.configure_pretraining(updates)
     print(
         f"Expert | target_epochs={epochs:.2f} | updates={state.updates}/{updates} | "
-        f"batch_size={replay.batch_size}"
+        f"segments={updates * replay.batch_size:,} | batch_size={replay.batch_size} | "
+        f"sequence_length={replay.sequence_length}"
     )
 
     for update in range(state.updates + 1, updates + 1):
@@ -190,7 +192,11 @@ def train_online(run, session, checkpoint=None, expert_updates=0):
         if replay_state is None:
             raise ValueError("Online training can only resume from latest.pt, which contains replay state.")
         session.replay.load_state_dict(replay_state)
-    session.start(resumed=resumed)
+    session.start(
+        resumed=resumed,
+        env_steps=state.env_steps,
+        world_model_updates=state.world_model_updates,
+    )
     eval_every = int(settings.eval_every)
     save_every = int(settings.save_every)
     log_every = int(settings.log_every)
@@ -218,9 +224,9 @@ def train_online(run, session, checkpoint=None, expert_updates=0):
             state.best_eval_score,
         )
         state.last_eval_step = state.env_steps
-        save("latest.pt")
         if improved:
             save("best.pt")
+        save("latest.pt")
 
     if not resumed and eval_enabled:
         run_evaluation()
@@ -317,6 +323,12 @@ def train(config, logger, logdir, checkpoint_path=None):
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         if checkpoint.get("phase") not in {"expert", "online"}:
             raise ValueError("Checkpoint does not contain a supported training phase.")
+        protocol = checkpoint.get("experiment_protocol")
+        if protocol != str(config.experiment_protocol):
+            raise ValueError(
+                f"Checkpoint protocol {protocol or 'legacy_unversioned'} does not match "
+                f"{config.experiment_protocol}. Start a fresh run for this protocol."
+            )
         run.family.load_checkpoint(run.model, checkpoint, training=True)
         tools.set_rng_state(checkpoint.get("rng_state"))
         expert_updates = int(checkpoint.get("expert_updates", 0))

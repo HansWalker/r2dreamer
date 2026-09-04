@@ -44,7 +44,12 @@ def load_checkpoint(model, payload, training=True):
 
 
 def expert_update(model, batch):
-    return model.update_expert_pretrain(batch.to(model.device, non_blocking=True))
+    if isinstance(batch, tuple):
+        contexts, batch = batch
+        contexts = [(context.to(model.device, non_blocking=True), starts) for context, starts in contexts]
+    else:
+        contexts = None
+    return model.update_expert_pretrain(batch.to(model.device, non_blocking=True), contexts)
 
 
 @torch.no_grad()
@@ -110,8 +115,10 @@ class OnlineSession:
         self.updates_needed = tools.Every(batch_steps / config.env.train_ratio * self.action_repeat)
         self.initial_updates_pending = True
 
-    def start(self, resumed=False):
-        self.initial_updates_pending = not resumed
+    def start(self, resumed=False, env_steps=0, world_model_updates=0):
+        self.initial_updates_pending = not world_model_updates
+        if resumed:
+            self.updates_needed(env_steps)
         self.done = torch.ones(self.envs.env_num, dtype=torch.bool, device=self.model.device)
         self.returns = torch.zeros(self.envs.env_num, dtype=torch.float32, device=self.model.device)
         self.lengths = torch.zeros(self.envs.env_num, dtype=torch.int32, device=self.model.device)

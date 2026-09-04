@@ -205,15 +205,28 @@ class SequenceBuffer(EpisodeReplay):
         self._obs_keys = tuple(state["obs_keys"]) if state.get("obs_keys") else None
         super().load_state_dict(state["replay"])
 
-    def sample(self, batch_size=None, sequence_length=None):
+    def sample(self, batch_size=None, sequence_length=None, with_context=False):
         batch_size = int(batch_size or self.batch_size)
         sequence_length = int(sequence_length or self.sequence_length)
         groups = self.sample_groups(batch_size, sequence_length, self.windows_per_episode)
         batch = _to_device(self.stack_windows(groups, sequence_length), self.device)
         obs = {key: batch[key] for key in self._obs_keys}
-        return (
+        result = (
             obs,
             batch["action"].float(),
             batch["reward"].float(),
             batch["terminal"].float(),
         )
+        if not with_context:
+            return result
+        contexts = [
+            (
+                _to_device(
+                    episode[: max(starts)].select(*self._obs_keys, "action").unsqueeze(0),
+                    self.device,
+                ),
+                starts,
+            )
+            for episode, starts in groups
+        ]
+        return contexts, result

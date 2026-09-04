@@ -119,7 +119,7 @@ class OnlineSession:
         self.updates_per_collect = int(config.planning_train.updates_per_collect)
         self.initial_updates = int(config.planning_train.initial_updates)
 
-    def start(self, resumed=False):
+    def start(self, resumed=False, env_steps=0, world_model_updates=0):
         self.replay.start(self.envs.env_num)
         self.obs = self.envs.reset().to(self.model.device, non_blocking=True)
         size = max(self.model.history_size - 1, 1)
@@ -128,7 +128,7 @@ class OnlineSession:
         self.first = torch.ones(self.envs.env_num, dtype=torch.bool, device=self.model.device)
         self.returns = torch.zeros(self.envs.env_num, device=self.model.device)
         self.lengths = torch.zeros(self.envs.env_num, dtype=torch.int32, device=self.model.device)
-        self.initial_updates_pending = not resumed
+        self.initial_updates_pending = not world_model_updates
 
     def collect(self):
         history, past_action = build_context(

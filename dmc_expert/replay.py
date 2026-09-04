@@ -168,47 +168,70 @@ class DMCExpertDataset:
 
 
 class DMCExpertEpisodeReplay(DMCExpertDataset):
-    """Sample complete episodes in Dreamer's previous-action convention."""
+    """Sample Dreamer windows and rebuild their state from episode prefixes."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.sequence_length = int(config.replay.sequence_length)
+        self.episodes = self.episodes[self.lengths[self.episodes] >= self.sequence_length - 1]
+        if not len(self.episodes):
+            raise ValueError(f"{self.path} has no complete episode with {self.sequence_length} observations.")
+        self.num_episodes = len(self.episodes)
 
     def sample_episode_batch(self):
         indices = self._next_episode_indices()
-        lengths = self.lengths[indices]
-        if not np.all(lengths == lengths[0]):
-            raise RuntimeError(
-                "Full-episode sampling requires equal-length episodes. "
-                "Pad the dataset or use fixed-length DMC expert episodes."
-            )
-        rows = [self._make_episode(ep_idx, int(lengths[0])) for ep_idx in indices]
+        starts = [
+            int(self.rng.integers(int(self.lengths[ep_idx]) - self.sequence_length + 2))
+            for ep_idx in indices
+        ]
+        rows = [
+            self._make_window(ep_idx, start, self.sequence_length)
+            for ep_idx, start in zip(indices, starts, strict=True)
+        ]
         data = {key: torch.as_tensor(np.stack([row[key] for row in rows], axis=0)) for key in rows[0]}
-        return TensorDict(data, batch_size=(self.batch_size, next(iter(data.values())).shape[1]))
+        batch = TensorDict(data, batch_size=(self.batch_size, self.sequence_length))
+        contexts = []
+        for ep_idx, start in zip(indices, starts, strict=True):
+            row = self._make_window(ep_idx, 0, start)
+            context = TensorDict(
+                {key: torch.as_tensor(value) for key, value in row.items()},
+                batch_size=(start,),
+            ).unsqueeze(0)
+            contexts.append((context, (start,)))
+        return contexts, batch
 
-    def _make_episode(self, ep_idx, length):
+    def _make_window(self, ep_idx, start, length):
         ep_idx = int(ep_idx)
-        sequence_length = length + 1
-        observations = self._read_observations(ep_idx, 0, sequence_length)
+        start, length = int(start), int(length)
+        observations = self._read_observations(ep_idx, start, length)
         # Dreamer pairs each observation with the action and reward that led to it.
-        actions = np.zeros((sequence_length, self.action_dim), dtype=np.float32)
-        rewards = np.zeros((sequence_length, 1), dtype=np.float32)
-        terminations = np.zeros((sequence_length, 1), dtype=bool)
-        is_last = np.zeros((sequence_length, 1), dtype=bool)
-        actions[1:] = np.asarray(self.actions[ep_idx, :length], dtype=np.float32)
-        rewards[1:] = np.asarray(self.rewards[ep_idx, :length], dtype=np.float32)
-        terminations[1:] = np.asarray(self.terminations[ep_idx, :length], dtype=bool)
-        is_last[1:] = np.logical_or(
-            terminations[1:],
-            np.asarray(self.truncations[ep_idx, :length], dtype=bool),
-        )
+        actions = np.zeros((length, self.action_dim), dtype=np.float32)
+        rewards = np.zeros((length, 1), dtype=np.float32)
+        terminations = np.zeros((length, 1), dtype=bool)
+        is_last = np.zeros((length, 1), dtype=bool)
+        destination = 0 if start else 1
+        source = max(start - 1, 0)
+        count = length - destination
+        if count:
+            transition = slice(source, source + count)
+            actions[destination:] = np.asarray(self.actions[ep_idx, transition], dtype=np.float32)
+            rewards[destination:] = np.asarray(self.rewards[ep_idx, transition], dtype=np.float32)
+            terminations[destination:] = np.asarray(self.terminations[ep_idx, transition], dtype=bool)
+            is_last[destination:] = np.logical_or(
+                terminations[destination:],
+                np.asarray(self.truncations[ep_idx, transition], dtype=bool),
+            )
 
         obs = observations
         obs.update({
             "action": actions,
             "reward": rewards,
-            "is_first": np.zeros((sequence_length, 1), dtype=bool),
+            "is_first": np.zeros((length, 1), dtype=bool),
             "is_last": is_last,
             "is_terminal": terminations,
         })
-        obs["is_first"][0] = True
-        obs["is_last"][-1] = True
+        if length and start == 0:
+            obs["is_first"][0] = True
         return obs
 
 
@@ -222,6 +245,7 @@ class DMCExpertSequenceReplay(DMCExpertDataset):
         if not len(self.episodes):
             raise ValueError(f"{self.path} has no complete episode of length {self.sequence_length}.")
         self.num_episodes = len(self.episodes)
+        self.reconstruct_context = str(config.storm_model.sequence_core) != "transformer"
 
         reward = np.asarray(self.rewards[..., 0], dtype=np.float32)
         terminal = np.asarray(self.terminations[..., 0], dtype=np.float32)
@@ -235,16 +259,30 @@ class DMCExpertSequenceReplay(DMCExpertDataset):
 
     def sample_episode_batch(self):
         indices = self._next_episode_indices()
-        rows = [self._sample_episode(ep_idx) for ep_idx in indices]
+        samples = [self._sample_episode(ep_idx) for ep_idx in indices]
+        starts, rows = zip(*samples, strict=True)
         data = {key: torch.as_tensor(np.stack([row[key] for row in rows], axis=0)) for key in rows[0]}
         obs = {key: data[key] for key in self.obs_keys}
-        return (
+        batch = (
             obs,
             data["action"].float(),
             data["reward"].float(),
             data["terminal"].float(),
             data["return"].float(),
         )
+        if not self.reconstruct_context:
+            return batch
+
+        contexts = []
+        for ep_idx, start in zip(indices, starts, strict=True):
+            context = self._read_observations(ep_idx, 0, start)
+            context["action"] = np.asarray(self.actions[int(ep_idx), :start], dtype=np.float32)
+            context = TensorDict(
+                {key: torch.as_tensor(value) for key, value in context.items()},
+                batch_size=(start,),
+            ).unsqueeze(0)
+            contexts.append((context, (start,)))
+        return contexts, batch
 
     def _sample_episode(self, ep_idx):
         ep_idx = int(ep_idx)
@@ -258,7 +296,7 @@ class DMCExpertSequenceReplay(DMCExpertDataset):
             "terminal": np.asarray(self.terminations[ep_idx, start:end], dtype=bool),
             "return": self.returns[ep_idx, start:end, None],
         })
-        return obs
+        return start, obs
 
 
 class DMCExpertTransitionReplay(DMCExpertDataset):

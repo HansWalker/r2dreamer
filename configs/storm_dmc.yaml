@@ -2,6 +2,7 @@ defaults:
   - dmc_experiment
   - _self_
 
+# Frozen STORM recipe shared by every sequence-core variant.
 logdir: logdir/storm_dmc_vision/${scenario.name}/${storm_model.sequence_core}/seed_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 model_family: storm
 

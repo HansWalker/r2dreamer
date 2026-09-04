@@ -112,18 +112,72 @@ class WorldModel(nn.Module):
         sample, _ = self._encode_obs_with_logits(obs)
         return sample
 
-    def observe(self, obs, action) -> dict[str, torch.Tensor]:
+    @property
+    def streaming(self):
+        return bool(getattr(self.sequence_core, "streaming", False))
+
+    def observe(self, obs, action, cache=None) -> dict[str, torch.Tensor]:
         stoch, post_logits = self._encode_obs_with_logits(obs)
-        deter = self.sequence_core(stoch, action)
+        if cache is None:
+            deter = self.sequence_core(stoch, action)
+        else:
+            outputs = []
+            for position in range(stoch.shape[1]):
+                output, cache = self.sequence_core.step(
+                    stoch[:, position : position + 1],
+                    action[:, position : position + 1],
+                    cache,
+                )
+                outputs.append(output)
+            deter = torch.cat(outputs, dim=1)
         prior_logits = self.prior(deter)
         feat = torch.cat([stoch, deter], dim=-1)
         return {"stoch": stoch, "deter": deter, "feat": feat, "post_logits": post_logits, "prior_logits": prior_logits}
 
+    @torch.no_grad()
+    def replay_cache(self, contexts):
+        """Rebuild streaming state at each sampled window boundary."""
+        if not self.streaming or not contexts:
+            return None
+
+        cache_rows = None
+        cache_dtype = self.amp_dtype if self.use_amp and self.device.type == "cuda" else next(self.parameters()).dtype
+        encoder_training = self.encoder.training
+        self.encoder.eval()
+        try:
+            for context, starts in contexts:
+                wanted = set(starts)
+                cache = self.sequence_core.initial_cache(1, dtype=cache_dtype, device=self.device)
+                anchors = {0: tuple(value.detach().clone() for value in cache)} if 0 in wanted else {}
+                if max(starts, default=0):
+                    context = context.to(self.device, non_blocking=True)
+                    with self._amp():
+                        stoch = self.encode_obs({self.encoder.key: context[self.encoder.key]})
+                        action = context["action"]
+                        for position in range(max(starts)):
+                            _, cache = self.sequence_core.step(
+                                stoch[:, position : position + 1],
+                                action[:, position : position + 1],
+                                cache,
+                            )
+                            if position + 1 in wanted:
+                                anchors[position + 1] = tuple(value.detach().clone() for value in cache)
+
+                for start in starts:
+                    anchor = anchors[start]
+                    if cache_rows is None:
+                        cache_rows = [[] for _ in anchor]
+                    for rows, value in zip(cache_rows, anchor, strict=True):
+                        rows.append(value)
+        finally:
+            self.encoder.train(encoder_training)
+        return tuple(torch.cat(rows, dim=0) for rows in cache_rows)
+
     def loss(
-        self, obs, action, reward, terminal
+        self, obs, action, reward, terminal, cache=None
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         with self._amp():
-            state = self.observe(obs, action)
+            state = self.observe(obs, action, cache)
             recon = self.decoder(state["stoch"])
             recon_loss = self.decoder.reconstruction_loss(recon, obs)
             reward_logits = self.reward(state["deter"])
@@ -145,13 +199,14 @@ class WorldModel(nn.Module):
         }
         return total, metrics, state
 
-    def update(self, obs, action, reward, termination):
+    def update(self, obs, action, reward, termination, contexts=None):
         self.train()
         obs = {key: value.to(self.device, non_blocking=True) for key, value in obs.items()}
         action = action.to(self.device, non_blocking=True)
         reward = reward.to(self.device, non_blocking=True)
         termination = termination.to(self.device, non_blocking=True)
-        loss, metrics, state = self.loss(obs, action, reward, termination)
+        cache = self.replay_cache(contexts)
+        loss, metrics, state = self.loss(obs, action, reward, termination, cache)
         optimize(self, self.optimizer, self.scaler, loss, self.grad_clip)
         return metrics, state, (obs, action, reward, termination)
 
@@ -179,12 +234,13 @@ class WorldModel(nn.Module):
             return torch.cat([prior, deter], dim=-1), cache
 
     @torch.no_grad()
-    def imagine(self, actor_critic, context_obs, context_action, horizon: int) -> dict[str, torch.Tensor]:
+    def imagine(self, actor_critic, context_obs, context_action, horizon: int, cache=None) -> dict[str, torch.Tensor]:
         self.eval()
         actor_critic.eval()
         with self._amp():
             stoch = self.encode_obs(context_obs)
-            cache = self.sequence_core.initial_cache(stoch.shape[0], dtype=stoch.dtype, device=stoch.device)
+            if cache is None:
+                cache = self.sequence_core.initial_cache(stoch.shape[0], dtype=stoch.dtype, device=stoch.device)
             deter, cache = self.sequence_core.step(stoch[:, :1], context_action[:, :1], cache)
             for idx in range(1, stoch.shape[1]):
                 deter, cache = self.sequence_core.step(

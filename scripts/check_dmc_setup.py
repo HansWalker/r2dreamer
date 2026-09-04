@@ -216,21 +216,32 @@ def check_mamba3():
             raise RuntimeError(f"{name} Mamba3 sequence training failed")
 
         layer.zero_grad(set_to_none=True)
-        token = sequence[:, 0].detach().contiguous()
+        recurrent_input = sequence.detach().contiguous()
         with torch.autocast("cuda", dtype=amp_dtype):
             recurrent_cache = layer.initial_context(batch_size, device=device, dtype=amp_dtype)
-            recurrent, *recurrent_cache = layer.recurrent_step(token, *recurrent_cache)
+            recurrent_steps = []
+            for position in range(recurrent_input.shape[1]):
+                recurrent, *recurrent_cache = layer.recurrent_step(
+                    recurrent_input[:, position],
+                    *recurrent_cache,
+                )
+                recurrent_steps.append(recurrent)
+            recurrent = torch.stack(recurrent_steps, dim=1)
             recurrent.float().square().mean().backward()
         if not torch.isfinite(recurrent).all() or layer.mamba.in_proj.weight.grad is None:
             raise RuntimeError(f"{name} Mamba3 recurrent training failed")
-        if not torch.allclose(output[:, 0], recurrent, rtol=2e-2, atol=2e-2):
-            error = float((output[:, 0] - recurrent).abs().max())
-            raise RuntimeError(f"{name} Mamba3 sequence and recurrent steps differ (max error {error:.3g})")
+        if not torch.allclose(output, recurrent, rtol=2e-2, atol=2e-2):
+            error = float((output - recurrent).abs().max())
+            raise RuntimeError(f"{name} Mamba3 sequence and recurrent paths differ (max error {error:.3g})")
 
         layer.eval()
         with torch.no_grad(), torch.autocast("cuda", dtype=amp_dtype):
             fast_cache = layer.initial_context(batch_size, device=device, dtype=amp_dtype)
-            step, *fast_cache = layer.fast_step(token, *fast_cache)
+            fast_steps = []
+            for position in range(recurrent_input.shape[1]):
+                step, *fast_cache = layer.fast_step(recurrent_input[:, position], *fast_cache)
+                fast_steps.append(step)
+            step = torch.stack(fast_steps, dim=1)
         if not torch.isfinite(step).all():
             raise RuntimeError(f"{name} Mamba3 cached step produced a non-finite output")
         if not all(torch.isfinite(value).all() for value in fast_cache):
@@ -239,7 +250,7 @@ def check_mamba3():
             raise RuntimeError(f"{name} Mamba3 cached step returned a non-contiguous state")
         if not torch.allclose(recurrent, step, rtol=2e-2, atol=2e-2):
             error = float((recurrent - step).abs().max())
-            raise RuntimeError(f"{name} Mamba3 recurrent and fused steps differ (max error {error:.3g})")
+            raise RuntimeError(f"{name} Mamba3 recurrent and cached paths differ (max error {error:.3g})")
         for recurrent_state, fast_state in zip(recurrent_cache, fast_cache, strict=True):
             if not torch.allclose(recurrent_state, fast_state, rtol=2e-2, atol=2e-2):
                 error = float((recurrent_state - fast_state).abs().max())

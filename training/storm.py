@@ -61,8 +61,11 @@ def load_checkpoint(model, payload, training=True):
 def expert_update(model, batch):
     world_model = model.world_model
     agent = model.actor_critic
+    contexts = None
+    if len(batch) == 2:
+        contexts, batch = batch
     obs, action, reward, terminal, returns = batch
-    wm_metrics, state, _ = world_model.update(obs, action, reward, terminal)
+    wm_metrics, state, _ = world_model.update(obs, action, reward, terminal, contexts)
     feature = world_model.next_policy_features(state)
     ac_metrics = agent.update_expert(
         feature,
@@ -224,7 +227,7 @@ class OnlineSession:
         self.world_model_updates = int(settings.world_model_updates)
         self.actor_critic_updates = int(settings.actor_critic_updates)
 
-    def start(self, resumed=False):
+    def start(self, resumed=False, env_steps=0, world_model_updates=0):
         self.replay.start(self.envs.env_num)
         self.obs = self.envs.reset().to(self.model.world_model.device, non_blocking=True)
         self.policy = StormPolicyContext(self.model, self.envs.env_num, self.context_length)
@@ -258,7 +261,9 @@ class OnlineSession:
         world_model = self.model.world_model
         metrics = {}
         for _ in range(self.world_model_updates):
-            wm_metrics, _, _ = world_model.update(*self.replay.sample())
+            sample = self.replay.sample(with_context=world_model.streaming)
+            contexts, batch = sample if world_model.streaming else (None, sample)
+            wm_metrics, _, _ = world_model.update(*batch, contexts=contexts)
             metrics.update(wm_metrics)
         for _ in range(self.actor_critic_updates):
             metrics.update(self._update_actor_critic())
@@ -268,15 +273,19 @@ class OnlineSession:
         settings = self.settings
         world_model = self.model.world_model
         agent = self.model.actor_critic
-        obs, action, _, _ = self.replay.sample(
+        sample = self.replay.sample(
             batch_size=int(settings.imagine_batch_size),
             sequence_length=int(settings.imagine_context_length),
+            with_context=world_model.streaming,
         )
+        contexts, batch = sample if world_model.streaming else (None, sample)
+        obs, action, _, _ = batch
         imagined = world_model.imagine(
             agent,
             {key: value.to(world_model.device, non_blocking=True) for key, value in obs.items()},
             action.to(world_model.device, non_blocking=True),
             horizon=int(settings.imagine_horizon),
+            cache=world_model.replay_cache(contexts),
         )
         return agent.update(
             imagined["feat"],
