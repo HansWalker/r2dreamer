@@ -29,34 +29,31 @@ and latent-rollout path.
 
 Expert datasets use the `dmc_expert_hdf5_dense_v1` layout: each dataset directory contains
 `metadata.json`, `data.hdf5`, and `progress.json`. The primary experiments use 64x64 RGB observations
-on Point Mass Easy, Reacher Easy, and Ball-in-Cup Catch. Set the local TD-MPC2 checkout
+on Cartpole Balance Sparse, Reacher Easy, and Ball-in-Cup Catch. Set the local TD-MPC2 checkout
 and image-dataset root before collecting or training:
 
 ```bash
 export TDMPC2_DIR=/absolute/path/to/tdmpc2
 export DMC_EXPERT_VISION_DATA_DIR=/absolute/path/to/data/dmc_expert_vision
-export TDMPC2_POINT_MASS_CHECKPOINT=/absolute/path/to/pointmass-easy.pt
 
 python3 -m scripts.collect_dmc_expert_data --config-name dmc_expert_collection
 
-python3 train.py --config-name offline_dmc_expert_gru_vision scenario=point_mass
-python3 train.py --config-name offline_dmc_expert_sliding_window_vision scenario=point_mass
-python3 train.py --config-name offline_dmc_expert_mamba3_vision scenario=point_mass
-python3 train.py --config-name offline_dmc_expert_s5_vision scenario=point_mass
-python3 train.py --config-name offline_dmc_expert_hyena_vision scenario=point_mass
-python3 train.py --config-name storm_dmc_transformer_vision scenario=point_mass
-python3 train.py --config-name storm_dmc_sliding_window_vision scenario=point_mass
-python3 train.py --config-name storm_dmc_mamba_vision scenario=point_mass
-python3 train.py --config-name storm_dmc_s5_vision scenario=point_mass
-python3 train.py --config-name storm_dmc_hyena_vision scenario=point_mass
-python3 train.py --config-name leworldmodel_dmc_vision scenario=point_mass
-python3 train.py --config-name temporal_straightening_dmc_vision scenario=point_mass
-python3 train.py --config-name tdmpc2_dmc_vision scenario=point_mass
+python3 train.py --config-name offline_dmc_expert_gru_vision scenario=cartpole_balance_sparse
+python3 train.py --config-name offline_dmc_expert_sliding_window_vision scenario=cartpole_balance_sparse
+python3 train.py --config-name offline_dmc_expert_mamba3_vision scenario=cartpole_balance_sparse
+python3 train.py --config-name offline_dmc_expert_s5_vision scenario=cartpole_balance_sparse
+python3 train.py --config-name offline_dmc_expert_hyena_vision scenario=cartpole_balance_sparse
+python3 train.py --config-name storm_dmc_transformer_vision scenario=cartpole_balance_sparse
+python3 train.py --config-name storm_dmc_sliding_window_vision scenario=cartpole_balance_sparse
+python3 train.py --config-name storm_dmc_mamba_vision scenario=cartpole_balance_sparse
+python3 train.py --config-name storm_dmc_s5_vision scenario=cartpole_balance_sparse
+python3 train.py --config-name storm_dmc_hyena_vision scenario=cartpole_balance_sparse
+python3 train.py --config-name leworldmodel_dmc_vision scenario=cartpole_balance_sparse
+python3 train.py --config-name temporal_straightening_dmc_vision scenario=cartpole_balance_sparse
+python3 train.py --config-name tdmpc2_dmc_vision scenario=cartpole_balance_sparse
 ```
 
-TD-MPC2 publishes compatible checkpoints for Reacher and Ball-in-Cup. Its published checkpoint set
-does not include Point Mass, so that task requires a locally trained 5M TD-MPC2 state checkpoint
-exposed through `TDMPC2_POINT_MASS_CHECKPOINT`.
+TD-MPC2 publishes compatible checkpoints for all three tasks; collection downloads them on demand.
 
 Run the complete collection, training, and evaluation matrix from one config:
 
@@ -105,7 +102,7 @@ Hydra multirun does not mix checkpoints:
 
 ```bash
 python3 train.py --config-name offline_dmc_expert_gru_vision --multirun \
-  scenario=point_mass seed=0,1,2,3,4
+  scenario=cartpole_balance_sparse seed=0,1,2,3,4
 ```
 
 Every training run names its config explicitly. Resume a checkpoint through the same entrypoint;
@@ -113,7 +110,7 @@ Every training run names its config explicitly. Resume a checkpoint through the 
 
 ```bash
 python3 train.py --config-name offline_dmc_expert_mamba3_vision \
-  scenario=point_mass \
+  scenario=cartpole_balance_sparse \
   resume_from=/absolute/path/to/latest.pt \
   training.online.steps=80000
 
@@ -146,11 +143,11 @@ MLPs:
 Each scenario is collected once into one 10,500-episode dataset. Episodes 0 through 9,999 are available
 to training, while episodes 10,000 through 10,499 are reserved for evaluation. The RGB array is about
 60 GiB before HDF5 compression. Collection also stores simulator state for the held-out physical-state
-probe. Temporal Straightening alone receives its configured four-value proprioceptive subset;
+probe. Temporal Straightening alone receives each task's configured proprioceptive subset;
 target-relative state remains excluded.
 
-Collection stores a two-coordinate task relation beside each image: mass-to-target for Point Mass,
-finger-to-target for Reacher, and ball-to-moving-cup-target for Ball-in-Cup. LeWorldModel and
+Collection stores a two-coordinate task relation beside each image: cart position and pole-angle error
+for Cartpole, finger-to-target for Reacher, and ball-to-moving-cup-target for Ball-in-Cup. LeWorldModel and
 Temporal Straightening train a detached readout for this label; it does not alter their encoder or
 predictor objective. The held-out range in the same HDF5 file supplies physical-state prediction data.
 
@@ -163,9 +160,9 @@ image supplied at evaluation time:
 ```bash
 python3 -m scripts.evaluate_dmc \
   --config-name leworldmodel_dmc_vision \
-  --scenario point_mass \
+  --scenario cartpole_balance_sparse \
   --logdir /absolute/path/to/the/run \
-  --dataset "$DMC_EXPERT_VISION_DATA_DIR/point_mass_easy"
+  --dataset "$DMC_EXPERT_VISION_DATA_DIR/cartpole_balance_sparse"
 ```
 
 The image cohort is the comparison. Each family retains its native input branches, visual frontend,
@@ -177,7 +174,8 @@ handles pretraining, online scheduling, evaluation, logging, checkpoints, and re
 Each module under `training/` contains only its family-specific construction and update hooks.
 
 The `scenario` selection keeps each DMC task, dataset directory, action shape, success geometry, and
-planning horizon together. Active benchmark values are `point_mass`, `reacher`, and `ball_in_cup`.
+planning horizon together. Active benchmark values are `cartpole_balance_sparse`, `reacher`, and
+`ball_in_cup`.
 
 Only the Mamba3 configs require the Mamba runtime, but the setup script installs one shared
 environment so every comparison model runs against the same PyTorch and DMC dependencies.
@@ -273,7 +271,7 @@ Choose an image config explicitly. The `scenario` group keeps the task, dataset,
 together.
 
 ```bash
-python3 train.py --config-name offline_dmc_expert_gru_vision scenario=point_mass
+python3 train.py --config-name offline_dmc_expert_gru_vision scenario=cartpole_balance_sparse
 ```
 
 ## Headless rendering

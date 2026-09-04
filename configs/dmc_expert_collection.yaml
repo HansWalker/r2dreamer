@@ -25,11 +25,9 @@ progress_every: 25
 resume: true
 
 tasks:
-  - point_mass/easy
+  - cartpole/balance_sparse
   - reacher/easy
   - ball_in_cup/catch
 
-# TD-MPC2 does not publish a Point Mass checkpoint; use a locally trained
-# 5M single-task checkpoint for that expert dataset.
-checkpoints:
-  point_mass/easy: ${oc.env:TDMPC2_POINT_MASS_CHECKPOINT,null}
+# Optional task-to-path overrides. Published checkpoints are downloaded otherwise.
+checkpoints: {}

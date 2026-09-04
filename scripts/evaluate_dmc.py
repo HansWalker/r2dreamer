@@ -15,7 +15,7 @@ def _path(value):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-name", required=True, help="Hydra training config used by the checkpoint.")
-    parser.add_argument("--scenario", required=True, help="Scenario config name, such as point_mass.")
+    parser.add_argument("--scenario", required=True, help="Scenario config name, such as cartpole_balance_sparse.")
     parser.add_argument("--logdir", type=Path, required=True, help="Training run directory.")
     parser.add_argument("--dataset", type=Path, required=True, help="Held-out HDF5 dataset for prediction metrics.")
     parser.add_argument("--device", help="Optional device override, such as cuda:0.")

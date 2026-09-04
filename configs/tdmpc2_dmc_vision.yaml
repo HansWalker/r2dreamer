@@ -26,7 +26,7 @@ planning_train:
 
 tdmpc2_model:
   num_channels: 32
-  mlp_dim: 538
+  mlp_dim: 539
   latent_dim: 512
   num_q: 5
   dropout: 0.01

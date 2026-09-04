@@ -66,7 +66,10 @@ def _render(raw_env, domain: str, image_size: int) -> np.ndarray:
 
 
 def _goal_relation_spec(physics, task: TaskSpec):
-    if task.domain == "point_mass":
+    if task.dmc_name == "cartpole/balance_sparse":
+        tolerance = [0.25, float(np.arccos(0.995))]
+        name, geometry = "cart_and_pole_to_balance", "box"
+    elif task.domain == "point_mass":
         tolerance = [float(physics.named.model.geom_size["target", 0])]
         name, geometry = "mass_to_target", "radial"
     elif task.domain == "reacher":
@@ -83,6 +86,11 @@ def _goal_relation_spec(physics, task: TaskSpec):
 
 
 def _goal_relation(physics, task: TaskSpec):
+    if task.dmc_name == "cartpole/balance_sparse":
+        angle = float(physics.named.data.qpos["hinge_1"])
+        angle = np.arctan2(np.sin(angle), np.cos(angle))
+        return np.asarray([physics.cart_position(), angle], dtype=np.float32)
+
     method = {
         "point_mass": "mass_to_target",
         "reacher": "finger_to_target",

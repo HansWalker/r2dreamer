@@ -16,4 +16,4 @@ expert:
   num_samples: 4
 
 tasks:
-  - ball_in_cup/catch
+  - cartpole/balance_sparse

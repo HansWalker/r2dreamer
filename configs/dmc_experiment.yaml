@@ -1,5 +1,5 @@
 defaults:
-  - scenario: point_mass
+  - scenario: cartpole_balance_sparse
   - env: dmc_vision
   - dmc_model
   - override hydra/job_logging: disabled

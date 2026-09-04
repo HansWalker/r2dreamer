@@ -2,8 +2,8 @@ defaults:
   - dmc_benchmark
   - _self_
 
-# One scenario exercises collection, every model family, checkpointing, and evaluation.
-scenarios: [ball_in_cup]
+# Exercise the newly introduced one-action Cartpole path through every family.
+scenarios: [cartpole_balance_sparse]
 seeds: [0]
 output_dir: runs/dmc_smoke
 device: cuda:0

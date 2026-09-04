@@ -1,5 +1,5 @@
 defaults:
-  - scenario@scenario_configs.point_mass: point_mass
+  - scenario@scenario_configs.cartpole_balance_sparse: cartpole_balance_sparse
   - scenario@scenario_configs.reacher: reacher
   - scenario@scenario_configs.ball_in_cup: ball_in_cup
   - _self_
@@ -11,7 +11,7 @@ stages:
 
 # Every model below runs on every scenario and seed.
 scenarios:
-  - point_mass
+  - cartpole_balance_sparse
   - reacher
   - ball_in_cup
 
