@@ -224,7 +224,8 @@ class Mamba3Layer(nn.Module):
         ssm_state = ssm_state.to(device=token.device, dtype=torch.float32).contiguous()
         k_state = k_state.to(device=token.device, dtype=cache_dtype).contiguous()
         v_state = v_state.to(device=token.device, dtype=cache_dtype).contiguous()
-        return self.mamba.step(token, angle_state, ssm_state, k_state, v_state)
+        output, *_ = self.mamba.step(token, angle_state, ssm_state, k_state, v_state)
+        return output, angle_state, ssm_state, k_state, v_state
 
     def step(self, token, angle_state, ssm_state, k_state, v_state):
         if torch.is_grad_enabled():

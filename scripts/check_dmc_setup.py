@@ -231,8 +231,12 @@ def check_mamba3():
         with torch.no_grad(), torch.autocast("cuda", dtype=amp_dtype):
             fast_cache = layer.initial_context(batch_size, device=device, dtype=amp_dtype)
             step, *fast_cache = layer.fast_step(token, *fast_cache)
-        if not torch.isfinite(step).all() or not all(value.is_contiguous() for value in fast_cache):
-            raise RuntimeError(f"{name} Mamba3 cached step failed")
+        if not torch.isfinite(step).all():
+            raise RuntimeError(f"{name} Mamba3 cached step produced a non-finite output")
+        if not all(torch.isfinite(value).all() for value in fast_cache):
+            raise RuntimeError(f"{name} Mamba3 cached step produced a non-finite state")
+        if not all(value.is_contiguous() for value in fast_cache):
+            raise RuntimeError(f"{name} Mamba3 cached step returned a non-contiguous state")
         if not torch.allclose(recurrent, step, rtol=2e-2, atol=2e-2):
             error = float((recurrent - step).abs().max())
             raise RuntimeError(f"{name} Mamba3 recurrent and fused steps differ (max error {error:.3g})")
