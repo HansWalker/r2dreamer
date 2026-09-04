@@ -89,9 +89,9 @@ class TanhNormal:
 
 
 def percentile(x: torch.Tensor, percentage: float) -> torch.Tensor:
-    flat = x.reshape(-1)
+    flat = x.detach().reshape(-1)
     kth = max(1, int(float(percentage) * flat.numel()))
-    return torch.kthvalue(flat, kth).values
+    return flat.sort().values[kth - 1]
 
 
 def lambda_return(reward, value, termination, gamma: float, lambd: float) -> torch.Tensor:
