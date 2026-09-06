@@ -26,6 +26,7 @@ CORE_TYPES = {
     "s5": S5SequenceCore,
     "hyena": HyenaSequenceCore,
 }
+CORE_INIT_OFFSET = 1_000_003
 
 
 def categorical_sample(logits: torch.Tensor) -> torch.Tensor:
@@ -58,11 +59,15 @@ class WorldModel(nn.Module):
         recurrent = config.recurrent
         if core_name not in CORE_TYPES:
             raise ValueError(f"Unsupported STORM sequence core: {core_name}")
-        self.sequence_core = CORE_TYPES[core_name](
-            stem=sequence_stem,
-            feat_dim=hidden_dim,
-            config=recurrent,
-        )
+        # Keep all modules outside the tested sequence core identically
+        # initialized across STORM variants with the same experiment seed.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed((torch.initial_seed() + CORE_INIT_OFFSET) % (2**63 - 1))
+            self.sequence_core = CORE_TYPES[core_name](
+                stem=sequence_stem,
+                feat_dim=hidden_dim,
+                config=recurrent,
+            )
 
         self.posterior = StormPosterior(
             encoder_feat_dim=self.encoder.out_dim,
@@ -142,8 +147,12 @@ class WorldModel(nn.Module):
 
         cache_rows = None
         cache_dtype = self.amp_dtype if self.use_amp and self.device.type == "cuda" else next(self.parameters()).dtype
-        encoder_training = self.encoder.training
-        self.encoder.eval()
+        # Reconstruct prefixes with the same fixed normalization used for online inference.
+        # Batch statistics would make an early cache anchor depend on later sampled frames.
+        batch_norms = [module for module in self.encoder.modules() if isinstance(module, nn.BatchNorm2d)]
+        batch_norm_training = [norm.training for norm in batch_norms]
+        for norm in batch_norms:
+            norm.eval()
         try:
             for context, starts in contexts:
                 wanted = set(starts)
@@ -170,7 +179,8 @@ class WorldModel(nn.Module):
                     for rows, value in zip(cache_rows, anchor, strict=True):
                         rows.append(value)
         finally:
-            self.encoder.train(encoder_training)
+            for norm, training in zip(batch_norms, batch_norm_training, strict=True):
+                norm.train(training)
         return tuple(torch.cat(rows, dim=0) for rows in cache_rows)
 
     def loss(

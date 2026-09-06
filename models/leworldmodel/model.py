@@ -192,12 +192,13 @@ class LeWorldModel(LatentPlanner):
             projections=int(settings.sigreg.projections),
         )
         self.sigreg_weight = float(settings.sigreg.weight)
+        self.model_lr = float(settings.optim.lr)
         goal_parameters = list(self.goal_readout.parameters())
         goal_ids = {id(parameter) for parameter in goal_parameters}
         self.optimizers = {
             "model": optim.AdamW(
                 [parameter for parameter in self.parameters() if id(parameter) not in goal_ids],
-                lr=float(settings.optim.lr),
+                lr=self.model_lr,
                 weight_decay=float(settings.optim.weight_decay),
             ),
             "goal": optim.AdamW(
@@ -219,7 +220,7 @@ class LeWorldModel(LatentPlanner):
         super().load_optimizer_state_dict(state)
         self._scheduler_state = state.get("scheduler")
 
-    def configure_pretraining(self, total_updates):
+    def _configure_schedule(self, total_updates, resume):
         total_updates = int(total_updates)
         warmup = max(1, int(0.01 * total_updates))
 
@@ -229,10 +230,23 @@ class LeWorldModel(LatentPlanner):
             progress = min(1.0, (step - warmup) / max(1, total_updates - warmup))
             return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizers["model"], scale)
-        if self._scheduler_state is not None:
+        optimizer = self.optimizers["model"]
+        loaded_lrs = [group["lr"] for group in optimizer.param_groups]
+        for group in optimizer.param_groups:
+            group["lr"] = self.model_lr
+            group["initial_lr"] = self.model_lr
+        self.scheduler = optim.lr_scheduler.LambdaLR(optimizer, scale)
+        if resume and self._scheduler_state is not None:
             self.scheduler.load_state_dict(self._scheduler_state)
-            self._scheduler_state = None
+            for group, lr in zip(optimizer.param_groups, loaded_lrs, strict=True):
+                group["lr"] = lr
+        self._scheduler_state = None
+
+    def configure_pretraining(self, total_updates):
+        self._configure_schedule(total_updates, resume=self._scheduler_state is not None)
+
+    def configure_online(self, total_updates, resumed=False):
+        self._configure_schedule(total_updates, resume=resumed)
 
     def update(self, batch):
         metrics = super().update(batch)

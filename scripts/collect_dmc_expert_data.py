@@ -3,6 +3,7 @@
 import argparse
 
 from dmc_expert.collection import collect, load_config
+from training.protocol import freeze_implementation
 
 
 def main():
@@ -16,6 +17,7 @@ def main():
     parser.add_argument("--override", action="append", default=[], help="Hydra override; repeat as needed.")
     args = parser.parse_args()
     config = load_config(args.config_name, args.override)
+    freeze_implementation()
     if args.task:
         config.tasks = args.task
     collect(config)

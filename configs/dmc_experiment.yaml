@@ -11,35 +11,44 @@ device: "cuda:0"
 model_family: dreamer
 model_io: ${env.model_io}
 resume_from: null
-experiment_protocol: dmc_frozen_defaults_v2
+experiment_protocol: dmc_frozen_defaults_v15
+
+expert_data:
+  policy: tdmpc2
+  policy_mode: mpc
+  train_episodes: 10000
+  heldout_episodes: 500
 
 hydra:
   run:
     dir: ${logdir}
 
 evaluation:
-  # An episode succeeds once its action-repeat-normalized DMC reward reaches this value.
+  # Report both first-hit and sustained success using the same threshold for every family.
   success_threshold: 0.8
+  sustained_success_steps: 5
   final:
-    checkpoint: best.pt
+    checkpoint: final.pt
     episodes: 50
     seed: 3000000
     context_length: 64
     horizons: [1, 5, 10, 25]
-    probe_train_windows: 32
-    probe_test_windows: 32
+    probe_train_windows: 128
+    probe_test_windows: 128
     probe_batch_size: 8
     probe_ridge: 0.001
     probe_seed: 2000000
 
 replay:
-  # Shared exposure for Dreamer and the representation models. STORM and
-  # TD-MPC2 retain their reference-family batch sizes in their base configs.
-  batch_size: 32
+  # Length-64 families use batch 16; length-4 families override this to 256.
+  # Both configurations expose each optimizer update to 1,024 observations.
+  batch_size: 16
   sequence_length: 64
-  max_size: 5e5
+  # Retain the most recent half of the 40,000 online agent transitions.
+  max_size: 20000
   storage_device: cpu
-  windows_per_episode: 4
+  # Draw from 16 source episodes once replay contains that many usable episodes.
+  episodes_per_batch: 16
   device: ${device}
   seed: ${seed}
 
@@ -47,17 +56,16 @@ training:
   expert:
     enabled: false
     data_path: ${env.dataset_root}/${scenario.dataset}
-    epochs: 16
+    batch_size: ${replay.batch_size}
+    updates: 5000
     shuffle: true
     log_every: 50
-    eval_every: 500
+    eval_every: 0
     save_every: 500
   online:
     steps: 80000
+    updates: 10000
+    warmup_transitions: 1024
     log_every: 5000
     eval_every: 20000
     save_every: 20000
-
-dreamer_train:
-  initial_updates: 0
-  train_after: 0

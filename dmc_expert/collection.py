@@ -1,5 +1,7 @@
 """DMC expert collection orchestration."""
 
+import hashlib
+import importlib.metadata
 import time
 from pathlib import Path
 from typing import Any
@@ -7,6 +9,8 @@ from typing import Any
 import numpy as np
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
+
+from envs.dmc import goal_relation, goal_relation_spec
 
 from .storage import (
     DATA_FORMAT,
@@ -23,9 +27,34 @@ from .tdmpc2 import (
     load_agent,
     resolve_checkpoint,
     select_tasks,
+    source_sha256,
 )
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
+
+
+def _collector_sha256():
+    root = CONFIG_DIR.parent
+    paths = (
+        Path(__file__),
+        root / "dmc_expert" / "storage.py",
+        root / "dmc_expert" / "tdmpc2.py",
+        root / "envs" / "dmc.py",
+        root / "scripts" / "collect_dmc_expert_data.py",
+    )
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _collector_runtime():
+    return {
+        package: importlib.metadata.version(package)
+        for package in ("torch", "tensordict", "numpy", "omegaconf", "dm-control", "mujoco")
+    }
 
 
 def load_config(name="dmc_expert_collection", overrides=()):
@@ -65,60 +94,23 @@ def _render(raw_env, domain: str, image_size: int) -> np.ndarray:
     return raw_env.physics.render(image_size, image_size, camera_id=camera_id)
 
 
-def _goal_relation_spec(physics, task: TaskSpec):
-    if task.dmc_name == "cartpole/balance_sparse":
-        tolerance = [0.25, float(np.arccos(0.995))]
-        name, geometry = "cart_and_pole_to_balance", "box"
-    elif task.domain == "point_mass":
-        tolerance = [float(physics.named.model.geom_size["target", 0])]
-        name, geometry = "mass_to_target", "radial"
-    elif task.domain == "reacher":
-        tolerance = [float(physics.named.model.geom_size["finger", 0] + physics.named.model.geom_size["target", 0])]
-        name, geometry = "finger_to_target", "radial"
-    elif task.domain == "ball_in_cup":
-        target = np.asarray(physics.named.model.site_size["target"], dtype=np.float32)[[0, 2]]
-        ball = float(physics.named.model.geom_size["ball", 0])
-        tolerance = (target - ball).tolist()
-        name, geometry = "ball_to_target", "box"
-    else:
-        return None
-    return {"name": name, "geometry": geometry, "shape": [2], "tolerance": tolerance}
-
-
-def _goal_relation(physics, task: TaskSpec):
-    if task.dmc_name == "cartpole/balance_sparse":
-        angle = float(physics.named.data.qpos["hinge_1"])
-        angle = np.arctan2(np.sin(angle), np.cos(angle))
-        return np.asarray([physics.cart_position(), angle], dtype=np.float32)
-
-    method = {
-        "point_mass": "mass_to_target",
-        "reacher": "finger_to_target",
-        "ball_in_cup": "ball_to_target",
-    }.get(task.domain)
-    if method is None:
-        return None
-    relation = np.asarray(getattr(physics, method)(), dtype=np.float32).reshape(-1)
-    if task.domain == "point_mass":
-        relation = relation[:2]
-    if relation.size != 2:
-        raise RuntimeError(f"{task.dmc_name} returned a {relation.size}D goal relation; expected 2D.")
-    return relation
-
-
 def _dataset_metadata(
     task: TaskSpec,
     checkpoint_path: Path,
     obs: dict[str, np.ndarray],
     action_spec,
     raw_action_spec,
-    goal_relation,
+    goal_spec,
     config,
 ) -> dict[str, Any]:
     custom_checkpoint = task.dmc_name in config.checkpoints
     train_episodes = int(config.episodes.train)
     heldout_episodes = int(config.episodes.heldout)
     total_episodes = train_episodes + heldout_episodes
+    checkpoint_digest = hashlib.sha256()
+    with checkpoint_path.open("rb") as checkpoint_file:
+        for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+            checkpoint_digest.update(chunk)
     return {
         "format": DATA_FORMAT,
         "env_type": "dmc",
@@ -132,6 +124,10 @@ def _dataset_metadata(
         "checkpoint_path": (
             str(checkpoint_path.resolve()) if custom_checkpoint else checkpoint_name(task, config.checkpoint_seed)
         ),
+        "checkpoint_sha256": checkpoint_digest.hexdigest(),
+        "tdmpc2_source_sha256": source_sha256(config.tdmpc2_root),
+        "collector_sha256": _collector_sha256(),
+        "collector_runtime": _collector_runtime(),
         "checkpoint_local_path": str(checkpoint_path),
         "checkpoint_seed": config.checkpoint_seed,
         "seed": config.seed,
@@ -153,7 +149,7 @@ def _dataset_metadata(
         "max_episode_steps": config.max_episode_steps,
         "time_limit": config.time_limit,
         "image_size": config.image_size,
-        "goal_relation": goal_relation,
+        "goal_relation": goal_spec,
         "layout": (
             "episode-major dense arrays; observations/images/goal_relations[e, t], "
             "actions[e, t] -> observations/images/goal_relations[e, t + 1]"
@@ -195,7 +191,7 @@ def collect_episode(raw_env, env, agent, task: TaskSpec, config):
         "terminations": [],
         "truncations": [],
     }
-    relation = _goal_relation(raw_env.physics, task)
+    relation = goal_relation(raw_env.physics, task.domain, task.task)
     if relation is not None:
         rows["goal_relations"] = [relation]
     episode_return = 0.0
@@ -230,7 +226,7 @@ def collect_episode(raw_env, env, agent, task: TaskSpec, config):
         rows["observations"].append(flatten_obs(time_step.observation))
         rows["images"].append(_render(raw_env, task.domain, config.image_size))
         if relation is not None:
-            rows["goal_relations"].append(_goal_relation(raw_env.physics, task))
+            rows["goal_relations"].append(goal_relation(raw_env.physics, task.domain, task.task))
         if dmc_last or truncated:
             break
 
@@ -243,7 +239,7 @@ def collect_task(config, task: TaskSpec, checkpoint_path: Path):
         first_obs = dict(schema_env.reset().observation)
         obs_dim = int(flatten_obs(first_obs).shape[0])
         action_dim = int(np.prod(action_spec.shape))
-        goal_relation = _goal_relation_spec(schema_raw_env.physics, task)
+        goal_spec = goal_relation_spec(schema_raw_env.physics, task.domain, task.task)
     finally:
         schema_raw_env.close()
 
@@ -263,7 +259,7 @@ def collect_task(config, task: TaskSpec, checkpoint_path: Path):
         first_obs,
         action_spec,
         raw_action_spec,
-        goal_relation,
+        goal_spec,
         config,
     )
     target_episodes = int(metadata["num_episodes"])
@@ -279,10 +275,7 @@ def collect_task(config, task: TaskSpec, checkpoint_path: Path):
     returns = []
     started = time.perf_counter()
     progress_every = max(int(config.progress_every), 1)
-    print(
-        f"Collection | task={task.dmc_name} | episodes={completed}/{target_episodes} | "
-        f"output={store_path}"
-    )
+    print(f"Collection | task={task.dmc_name} | episodes={completed}/{target_episodes} | output={store_path}")
     write_progress(store_path, final_episodes, final_rows, target_episodes)
     try:
         for episode_idx in range(completed, target_episodes):
@@ -295,7 +288,6 @@ def collect_task(config, task: TaskSpec, checkpoint_path: Path):
                 raw_env.close()
 
             append_episode(h5, episode_idx, episode, episode_return)
-            h5.flush()
             final_episodes = episode_idx + 1
             final_rows += int(episode["actions"].shape[0])
             write_progress(store_path, final_episodes, final_rows, target_episodes)

@@ -54,23 +54,8 @@ class Logger:
         self.close()
 
 
-class Every:
-    def __init__(self, every):
-        self._every = every
-        self._last = None
-
-    def __call__(self, step):
-        if not self._every:
-            return 0
-        if self._last is None:
-            self._last = step
-            return 1
-        count = int((step - self._last) / self._every)
-        self._last += self._every * count
-        return count
-
-
 def configure_randomness(seed, deterministic=False):
+    torch.set_float32_matmul_precision("high")
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)

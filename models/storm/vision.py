@@ -69,4 +69,4 @@ class StormImageDecoder(nn.Module):
         target = observation[self.key].float()
         if observation[self.key].dtype == torch.uint8:
             target = target / 255.0
-        return (prediction[self.key] - target).square().sum(dim=(-3, -2, -1)).mean()
+        return (prediction[self.key] - target).square().mean()

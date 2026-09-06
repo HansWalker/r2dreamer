@@ -8,7 +8,9 @@ from torch.nn import functional as F
 
 try:
     from mamba_ssm.modules import mamba3 as _mamba3_module
-    from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import mamba3_step_fn as _mamba3_step_fn
+    from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import (
+        mamba3_step_fn as _mamba3_step_fn,
+    )
 except Exception as exc:  # pragma: no cover - depends on the optional CUDA stack
     Mamba3 = None
     MAMBA3_IMPORT_ERROR = exc

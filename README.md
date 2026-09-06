@@ -63,7 +63,7 @@ Run the complete collection, training, and evaluation matrix from one config:
 ```
 
 Before committing to the full datasets and training budget, run the same lifecycle with one tiny
-Ball-in-Cup dataset and one update per model:
+Cartpole Balance Sparse dataset and one expert update per model:
 
 ```bash
 ./scripts/run_smoke.sh --dry-run
@@ -71,8 +71,8 @@ Ball-in-Cup dataset and one update per model:
 ```
 
 Immediately before the production run, use the fuller preflight. It checks the installed GPU stack,
-runs two expert updates for every model, exercises the short online lifecycle for Dreamer, STORM, and
-TD-MPC2, evaluates all thirteen variants, and validates the resulting checkpoints and metrics:
+runs two expert updates and the short online lifecycle for every model, evaluates all thirteen variants,
+and validates the resulting checkpoints and metrics:
 
 ```bash
 ./scripts/run_preflight.sh
@@ -91,8 +91,9 @@ seed 0. It collects the three independent scenario datasets concurrently on the 
 and evaluates every model one at a time, scenario by scenario. Set `collection.parallelism=1` to collect
 serially. Training writes each run under
 `runs/dmc_vision/<scenario>/<family>/<variant>/seed_<seed>`, and evaluation writes
-`evaluation.json` beside each checkpoint. Set the booleans under `stages` to run only part of the
-lifecycle, add seeds after the initial matrix succeeds, and select the compute device with
+`evaluation.json` for `final.pt` and `evaluation_best.json` for `best.pt` in that run directory. Set
+the booleans under `stages` to run only part of the lifecycle, add seeds after the initial matrix
+succeeds, and select the compute device with
 `device`. With `training.resume: true`, rerunning the same command skips completed evaluations,
 evaluates finished training runs, and resumes interrupted expert or online training. Set
 `training.overwrite: true` to delete existing runs and start them again.
@@ -120,14 +121,15 @@ tensorboard --logdir ./logdir
 Checkpoint names identify their phase: `pretrain_latest.pt` resumes interrupted expert training,
 `pretrained.pt` is the completed expert-pretraining state, `pretrained_best.pt` is its best
 validation-return state, `latest.pt` resumes online training, `best.pt` is the best online
-validation-return state, and `final.pt` is the completed online state. Checkpoints and evaluation
-JSON are written atomically so an interrupted write does not replace the previous valid file. Final
-evaluation selects one exact checkpoint name from the model config and never falls back across phases.
+validation state, and `final.pt` is the completed online state. Checkpoints and evaluation JSON are
+written atomically so an interrupted write does not replace the previous valid file. Production
+evaluation reports `final.pt` as the primary result and `best.pt` as a supplementary result. The best
+checkpoint is chosen lexicographically by mean validation return, sustained success, and then later
+training step. The physical-state probe is run only for the primary final checkpoint.
 
-Intermediate checkpoint selection uses five policy episodes. Online families skip rollout evaluation
+Intermediate checkpoint selection uses five policy episodes. All families skip rollout evaluation
 during expert pretraining, then evaluate at the start of online training and every 20,000 steps through
-80,000 steps. The offline-only LeWorldModel and Temporal Straightening runs instead evaluate four
-evenly spaced pretraining checkpoints. Reported final metrics still use 50 fresh episodes.
+80,000 steps. Reported final metrics still use 50 fresh episodes.
 
 The image models keep each family's visual design rather than routing pixels through shared state
 MLPs:
@@ -136,9 +138,9 @@ MLPs:
 - STORM uses its Conv-BatchNorm-ReLU encoder and transposed-convolution decoder with Transformer,
   sliding-window attention, Mamba3, S5, or Hyena sequence dynamics.
 - LeWorldModel uses a compact train-from-scratch ViT and its decoder-free latent objective.
-- Temporal Straightening combines spatial ResNet tokens with its native proprioceptive embedding and
-  reconstructs the visual tokens with a convolutional decoder.
-- TD-MPC2 uses its four-layer pixel encoder and random-shift augmentation.
+- Temporal Straightening combines spatial ResNet tokens with its native proprioceptive embedding,
+  aggregate-cosine curvature, and a convolutional decoder.
+- TD-MPC2 uses its native three-frame pixel stack, four-layer encoder, and random-shift augmentation.
 
 Each scenario is collected once into one 10,500-episode dataset. Episodes 0 through 9,999 are available
 to training, while episodes 10,000 through 10,499 are reserved for evaluation. The RGB array is about
@@ -149,11 +151,15 @@ target-relative state remains excluded.
 Collection stores a two-coordinate task relation beside each image: cart position and pole-angle error
 for Cartpole, finger-to-target for Reacher, and ball-to-moving-cup-target for Ball-in-Cup. LeWorldModel and
 Temporal Straightening train a detached readout for this label; it does not alter their encoder or
-predictor objective. The held-out range in the same HDF5 file supplies physical-state prediction data.
+predictor objective. Their online replay computes the identical relation from simulator state but removes
+it before encoding. The held-out range in the same HDF5 file supplies physical-state prediction data.
+Dataset metadata fingerprints the expert checkpoint, collector, external TD-MPC2 source, and collection
+runtime so an interrupted collection cannot resume into a mixture of incompatible trajectories.
 
 Evaluate an image-model checkpoint on that held-out dataset. Every family reports fresh policy
-return and task success as well as physical-state prediction. LeWorldModel and Temporal
-Straightening remain reward-free during representation training; reward only selects checkpoints.
+return, one-step success, sustained success, and physical-state prediction. LeWorldModel and Temporal
+Straightening remain reward-free during representation training; validation return only selects
+checkpoints.
 Their planners minimize the fixed DMC success geometry predicted from latent state, with no goal
 image supplied at evaluation time:
 
@@ -165,9 +171,24 @@ python3 -m scripts.evaluate_dmc \
   --dataset "$DMC_EXPERT_VISION_DATA_DIR/cartpole_balance_sparse"
 ```
 
-The image cohort is the comparison. Each family retains its native input branches, visual frontend,
-objective, planner, and update recipe, while tasks, action spaces, datasets, and total capacity are
-matched.
+The image cohort is the comparison. Every family receives 5,000 expert updates and 10,000 online
+updates, with exactly 1,024 sampled observations from 16 source episodes in each world-model or
+representation update. Dreamer and STORM use one 64-frame sequence per source episode; TD-MPC2,
+LeWorldModel, and Temporal Straightening use sixteen native four-frame clips per source episode. Online
+replay has a shared rolling capacity of 20,000 transitions and training starts after 1,024 collected
+transitions. LeWorldModel and Temporal Straightening collect
+with their own planners and continue their unchanged representation objectives; they receive no actor,
+critic, reward, or behavior-cloning loss. Each family retains its native input branches, visual frontend,
+objective, and planner while tasks, action spaces, sampled-data budget, update count, and replay capacity
+are matched.
+Dreamer and STORM also use 512 starting states for each imagined controller update; their native ways
+of obtaining those starts remain different.
+
+The observation budget is the controlled data/compute measure. Every update encodes 1,024 images.
+Dreamer has 1,024 RSSM state targets per update, STORM has 1,008 adjacent-state targets, and the
+short-horizon planning models have 768 adjacent-state targets. Training logs and evaluation JSON
+record both counts so this consequence of retaining each family's native temporal horizon remains
+explicit.
 
 All experiment configs enter through `train.py`. The shared lifecycle in `training/trainer.py`
 handles pretraining, online scheduling, evaluation, logging, checkpoints, and resume state.
@@ -213,8 +234,9 @@ settings live in `configs/storm_dmc.yaml`. Their implementations remain separate
 
 The additional configs bring the comparison to five model families: Dreamer, STORM,
 LeWorldModel, Temporal Straightening, and TD-MPC2. Dreamer has five sequence-core variants and STORM
-has five, so there are thirteen configurations in total. Eleven have native reward-driven online control;
-LeWorldModel and Temporal Straightening remain offline representation and goal-planning methods.
+has five, so there are thirteen configurations in total. Eleven use their native reward-driven online
+updates. LeWorldModel and Temporal Straightening instead continue their representation objectives on
+self-collected trajectories.
 
 - [TD-MPC2][tdmpc2] keeps its pixel encoder, random-shift augmentation, SimNorm latent model,
   distributional reward and five-critic losses, Gaussian policy prior, target critics, and MPPI planner.
@@ -225,27 +247,25 @@ LeWorldModel and Temporal Straightening remain offline representation and goal-p
   objective, reconstruction, and gradient-based action planning.
 
 LeWorldModel and Temporal Straightening are kept as goal-conditioned representation models. They do
-not receive added reward or value heads, and reward-only online training is disabled for them. Their
-learned latent dynamics can be compared with the same held-out physical-state prediction metric.
-Their small task-relation readout is trained on detached latents and used only to expose each DMC
-task's native success region to the planner.
+not receive added reward or value heads. During the online phase, each model's planner supplies the
+actions and its unchanged self-supervised loss trains on the resulting replay samples. Their small
+task-relation readout is trained on detached latents and used only to expose each DMC task's native
+success region to the planner.
 
 The shared trainer does not impose one optimizer or update rule on every family. Dreamer keeps its
-joint world-model/actor-critic update; STORM keeps separate world-model and imagined actor-critic
-updates at one of each per collected transition; TD-MPC2 keeps its joint latent-model/Q update,
+joint world-model/actor-critic update; STORM keeps one separate world-model and imagined actor-critic
+update per shared update; TD-MPC2 keeps its joint latent-model/Q update,
 separate policy update, and soft target-Q update; LeWorldModel keeps AdamW and its prediction plus
 SIGReg objective; and Temporal Straightening keeps separate Adam/AdamW optimizers for its encoder,
-predictor, action encoder, and decoder. The common 16-epoch expert phase, 64x64 images, and matched
+predictor, action encoder, and decoder. The common fixed-update expert phase, 64x64 images, and matched
 parameter budget are deliberate comparison adaptations rather than claims about the original paper
-defaults. One expert epoch means one randomly positioned sequence from every episode. Dreamer and
-STORM use 64-frame sequences; the planning families retain their native four-frame training clips.
-Replay batch, sequence, and online update settings remain family-specific where the reference recipes
-differ.
+defaults. Sequence lengths remain family-specific where the reference recipes differ, so batch sizes are
+chosen to equalize sampled observations while source-episode diversity is held constant.
 
-The production configs use the predeclared `dmc_frozen_defaults_v2` hyperparameter protocol. Recurrent
-variants inherit one unchanged family recipe: Dreamer uses LaProp at `4e-5`, batch size 32, 1,000-update
-warmup, and AGC 0.3; STORM uses Adam at `1e-4` for the world model and `3e-5` for the actor-critic,
-batch size 16, and its reference gradient limits. TD-MPC2 uses its `3e-4` reference learning rate,
+The production configs use the predeclared `dmc_frozen_defaults_v15` hyperparameter protocol. Recurrent
+variants inherit one unchanged family recipe: Dreamer uses LaProp at `4e-5`, batch size 16, and AGC
+0.3; STORM uses Adam at `1e-4` for the world model and `3e-5` for the actor-critic, batch size 16, and
+its reference gradient limits. TD-MPC2 uses its `3e-4` reference learning rate,
 while LeWorldModel and Temporal Straightening retain their native optimizer separation. Core widths are
 set only by the shared parameter budget. These defaults must be frozen before production runs and must
 not be adjusted for individual tasks or variants after observing results.

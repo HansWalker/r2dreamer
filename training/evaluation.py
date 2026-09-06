@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass
 from functools import singledispatch
@@ -13,7 +12,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from dmc_expert.storage import DATA_FORMAT, observation_indices, split_episode_indices
+from dmc_expert.storage import (
+    observation_indices,
+    read_image_window,
+    split_episode_indices,
+)
 from models.dreamer import Dreamer
 from models.planning import LatentPlanner
 from models.shared.utils import parse_model_io
@@ -42,8 +45,8 @@ def latent_rollout(model, observation, action, context_length):
 
 @latent_rollout.register
 @torch.no_grad()
-def _(model: TDMPC2, observation, action, context_length):
-    latent = model.encoder(observation)
+def _tdmpc2_rollout(model: TDMPC2, observation, action, context_length):
+    latent = model.encoder(model.stack_sequence(observation))
     state = latent[:, context_length - 1]
     predictions = []
     for current_action in action[:, context_length - 1 :].unbind(1):
@@ -54,7 +57,7 @@ def _(model: TDMPC2, observation, action, context_length):
 
 @latent_rollout.register
 @torch.no_grad()
-def _(model: LatentPlanner, observation, action, context_length):
+def _planning_rollout(model: LatentPlanner, observation, action, context_length):
     latent = model.encode(observation)
     history_size = model.history_size
     start = context_length - 1
@@ -75,7 +78,7 @@ def _(model: LatentPlanner, observation, action, context_length):
 
 @latent_rollout.register
 @torch.no_grad()
-def _(model: Dreamer, observation, action, context_length):
+def _dreamer_rollout(model: Dreamer, observation, action, context_length):
     observation = model.preprocess(dict(observation))
     embed = model.encoder(observation)
     batch, length = embed.shape[:2]
@@ -113,7 +116,7 @@ def _(model: Dreamer, observation, action, context_length):
 
 @latent_rollout.register
 @torch.no_grad()
-def _(model: StormModel, observation, action, context_length):
+def _storm_rollout(model: StormModel, observation, action, context_length):
     world_model = model.world_model
     with world_model._amp():
         stoch = _mode(world_model.posterior(world_model.encoder(observation)))
@@ -185,12 +188,13 @@ def _fixed_storm_rollout(world_model, stoch, action, context_length):
 class ProbeDataset:
     """Read fixed image/action windows and their privileged DMC state labels."""
 
-    def __init__(self, path, model_io, proprio=None):
+    def __init__(self, path, metadata, model_io, proprio=None, frame_stack=1):
         self.path = Path(path).expanduser()
-        self.metadata = json.loads((self.path / "metadata.json").read_text(encoding="utf-8"))
-        if self.metadata.get("format") != DATA_FORMAT:
-            raise ValueError(f"{self.path} uses {self.metadata.get('format')!r}, expected {DATA_FORMAT!r}.")
+        self.metadata = metadata
         self.observation_shapes, action_shape, _ = parse_model_io(model_io)
+        self.frame_stack = int(frame_stack)
+        if self.frame_stack < 1:
+            raise ValueError("frame_stack must be positive.")
         if "image" not in self.observation_shapes or set(self.observation_shapes) - {"image", "proprio"}:
             raise ValueError("The shared physical-state metric expects image and optional proprioception.")
         self.proprio_indices = None
@@ -217,10 +221,6 @@ class ProbeDataset:
 
     def split_windows(self, train_count, test_count, length, seed):
         lengths = np.asarray(self.h5["lengths"], dtype=np.int64)
-        complete = np.asarray(self.h5["complete"], dtype=bool)
-        incomplete = self.episodes[~complete[self.episodes]]
-        if len(incomplete):
-            raise ValueError(f"{self.path} is missing {len(incomplete)} held-out episodes.")
         episodes = self.episodes[lengths[self.episodes] >= length - 1]
         if len(episodes) < 2:
             raise ValueError(f"{self.path} needs at least two complete episodes with {length - 1} transitions.")
@@ -257,7 +257,14 @@ class ProbeDataset:
                 for window in batch
             ])
             images = np.stack([
-                np.asarray(self.h5["images"][window.episode, window.start : window.start + length]) for window in batch
+                read_image_window(
+                    self.h5["images"],
+                    window.episode,
+                    window.start,
+                    length,
+                    self.frame_stack,
+                )
+                for window in batch
             ])
             observation = {"image": torch.as_tensor(images)}
             if self.proprio_indices is not None:
@@ -290,37 +297,27 @@ def _probe_weights(feature, state, ridge, device):
 
 
 @torch.no_grad()
-def evaluate_state_prediction(
-    model,
-    model_io,
-    dataset_path,
-    *,
-    proprio=None,
-    context_length=64,
-    horizons=(1, 5, 10, 25),
-    train_windows=32,
-    test_windows=32,
-    batch_size=8,
-    ridge=1e-3,
-    seed=2_000_000,
-):
+def evaluate_state_prediction(model, config, dataset_path, metadata):
     """Fit one frozen linear state probe and score action-conditioned latent rollouts."""
 
-    horizons = tuple(sorted(set(map(int, horizons))))
-    if not horizons or horizons[0] < 1:
-        raise ValueError("Prediction horizons must be positive integers.")
-    context_length = int(context_length)
-    if context_length < 1:
-        raise ValueError("context_length must be positive.")
+    settings = config.evaluation.final
+    horizons = tuple(sorted(set(map(int, settings.horizons))))
+    context_length = int(settings.context_length)
     total_length = context_length + horizons[-1]
     device = model.world_model.device if isinstance(model, StormModel) else next(model.parameters()).device
     was_training = model.training
     model.eval()
-    dataset = ProbeDataset(dataset_path, model_io, proprio)
+    frame_stack = model.frame_stack if isinstance(model, TDMPC2) else 1
+    dataset = ProbeDataset(dataset_path, metadata, config.model_io, config.env.proprio, frame_stack)
     try:
-        train_specs, test_specs = dataset.split_windows(train_windows, test_windows, total_length, seed)
+        train_specs, test_specs = dataset.split_windows(
+            int(settings.probe_train_windows),
+            int(settings.probe_test_windows),
+            total_length,
+            int(settings.probe_seed),
+        )
         train_feature, train_state = [], []
-        for observation, action, state in dataset.batches(train_specs, total_length, batch_size):
+        for observation, action, state in dataset.batches(train_specs, total_length, int(settings.probe_batch_size)):
             observation = {key: value.to(device, non_blocking=True) for key, value in observation.items()}
             action = action.to(device, non_blocking=True)
             feature, _ = latent_rollout(model, observation, action, context_length)
@@ -328,11 +325,11 @@ def evaluate_state_prediction(
             train_state.append(state[:, context_length - 1 :])
         train_feature = torch.cat(train_feature).flatten(0, 1)
         train_state = torch.cat(train_state).flatten(0, 1)
-        probe = _probe_weights(train_feature, train_state, ridge, device)
+        probe = _probe_weights(train_feature, train_state, settings.probe_ridge, device)
 
         feature_mean, feature_std, state_mean, state_std, varying, weight = probe
         errors = {horizon: [] for horizon in horizons}
-        for observation, action, state in dataset.batches(test_specs, total_length, batch_size):
+        for observation, action, state in dataset.batches(test_specs, total_length, int(settings.probe_batch_size)):
             observation = {key: value.to(device, non_blocking=True) for key, value in observation.items()}
             action = action.to(device, non_blocking=True)
             _, prediction = latent_rollout(model, observation, action, context_length)
@@ -350,14 +347,15 @@ def evaluate_state_prediction(
             "mean_nrmse": float(np.mean(list(nrmse.values()))),
             "metric": "RMSE after per-dimension physical-state standardization",
             "probe": "ridge linear",
-            "ridge": float(ridge),
+            "ridge": float(settings.probe_ridge),
             "episode_split": "disjoint probe-fit and probe-test episodes",
             "dataset_split": "heldout",
             "dataset_episode_range": [int(dataset.episodes[0]), int(dataset.episodes[-1]) + 1],
             "horizons": list(horizons),
             "context_length": context_length,
-            "probe_train_windows": int(train_windows),
-            "probe_test_windows": int(test_windows),
+            "probe_train_windows": int(settings.probe_train_windows),
+            "probe_test_windows": int(settings.probe_test_windows),
+            "input_frame_stack": int(frame_stack),
             "physical_state_dim": int(varying.sum()),
         }
     finally:

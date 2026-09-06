@@ -12,18 +12,6 @@ ExpertReplay = DMCExpertSequenceReplay
 EXPERT_METRICS = {"wm": "wm/loss", "bc": "expert/bc", "value": "expert/value"}
 ONLINE_METRICS = {"wm": "wm/loss", "ac": "ac/loss"}
 
-__all__ = [
-    "EXPERT_METRICS",
-    "ONLINE_METRICS",
-    "ExpertReplay",
-    "OnlineSession",
-    "build_model",
-    "checkpoint",
-    "evaluate",
-    "expert_update",
-    "load_checkpoint",
-]
-
 
 def build_model(config):
     return StormModel(config, config.model_io).to(config.device)
@@ -175,7 +163,10 @@ def evaluate(config, model, envs):
         returns = torch.zeros(envs.env_num, dtype=torch.float32, device=world_model.device)
         lengths = torch.zeros(envs.env_num, dtype=torch.int32, device=world_model.device)
         successes = torch.zeros(envs.env_num, dtype=torch.bool, device=world_model.device)
+        sustained_successes = torch.zeros_like(successes)
+        success_streak = torch.zeros(envs.env_num, dtype=torch.int32, device=world_model.device)
         success_threshold = float(config.evaluation.success_threshold)
+        sustained_steps = int(config.evaluation.sustained_success_steps)
         action_repeat = int(config.env.action_repeat)
         policy = StormPolicyContext(model, envs.env_num, config.storm_train.context_length)
 
@@ -189,7 +180,10 @@ def evaluate(config, model, envs):
             active = ~finished
             returns += reward[:, 0] * active
             lengths += active
-            successes |= (reward[:, 0] / action_repeat >= success_threshold) & active
+            qualifies = (reward[:, 0] / action_repeat >= success_threshold) & active
+            successes |= qualifies
+            success_streak = torch.where(qualifies, success_streak + 1, torch.where(active, 0, success_streak))
+            sustained_successes |= success_streak >= sustained_steps
             policy.advance(obs, action, active=active, reset=model_done)
             finished |= model_done
             obs = (envs.reset_done(next_obs, done) if done.any() else next_obs).to(
@@ -203,6 +197,7 @@ def evaluate(config, model, envs):
             float(lengths.float().mean()),
             {
                 "success": success,
+                "sustained_success": sustained_successes.float().mean(),
                 "return_std": return_std,
                 "return_stderr": return_std / returns.numel() ** 0.5,
             },
@@ -223,11 +218,8 @@ class OnlineSession:
         self.settings = settings
         self.action_repeat = int(config.env.action_repeat)
         self.context_length = int(settings.context_length)
-        self.warmup_steps = int(settings.warmup_steps)
-        self.world_model_updates = int(settings.world_model_updates)
-        self.actor_critic_updates = int(settings.actor_critic_updates)
 
-    def start(self, resumed=False, env_steps=0, world_model_updates=0):
+    def start(self):
         self.replay.start(self.envs.env_num)
         self.obs = self.envs.reset().to(self.model.world_model.device, non_blocking=True)
         self.policy = StormPolicyContext(self.model, self.envs.env_num, self.context_length)
@@ -255,19 +247,16 @@ class OnlineSession:
             self.obs = model_obs
         return self.envs.env_num * self.action_repeat, episodes
 
-    def update(self, step):
-        if self.replay.count() < self.warmup_steps or not self.replay.ready():
-            return {}, 0
+    def update(self, update_count):
         world_model = self.model.world_model
         metrics = {}
-        for _ in range(self.world_model_updates):
+        for _ in range(update_count):
             sample = self.replay.sample(with_context=world_model.streaming)
             contexts, batch = sample if world_model.streaming else (None, sample)
             wm_metrics, _, _ = world_model.update(*batch, contexts=contexts)
             metrics.update(wm_metrics)
-        for _ in range(self.actor_critic_updates):
             metrics.update(self._update_actor_critic())
-        return metrics, self.world_model_updates
+        return metrics
 
     def _update_actor_critic(self):
         settings = self.settings
@@ -280,6 +269,7 @@ class OnlineSession:
         )
         contexts, batch = sample if world_model.streaming else (None, sample)
         obs, action, _, _ = batch
+        world_model.eval()
         imagined = world_model.imagine(
             agent,
             {key: value.to(world_model.device, non_blocking=True) for key, value in obs.items()},

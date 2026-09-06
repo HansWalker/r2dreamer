@@ -7,19 +7,14 @@ defaults:
 training:
   expert:
     enabled: true
-    # Offline-only families select among four evenly spaced checkpoints.
-    eval_every: 1250
-  # The representation methods remain offline; reward is used only to select
-  # among checkpoints through their task-relative planners.
-  online:
-    steps: 0
-
-evaluation:
-  final:
-    checkpoint: pretrained_best.pt
 
 replay:
+  batch_size: 256
   sequence_length: 4
+
+env:
+  # Training labels only; the planner and encoder never receive this value.
+  goal_relation: true
 
 jepa_model:
   history_size: 3
@@ -52,7 +47,7 @@ jepa_model:
     weight: 0.09
     knots: 17
     projections: 1024
-  curvature_weight: 0.01
+  curvature_weight: 0.1
   decoder:
     weight: 1.0
     vision:

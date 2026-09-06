@@ -8,8 +8,6 @@ logdir: logdir/dmc_expert/${scenario.name}/${model.rssm.core}/seed_${seed}/${now
 training:
   expert:
     enabled: true
-    # Online evaluation selects this family's final checkpoint.
-    eval_every: 0
 
 model:
   hidden: 713

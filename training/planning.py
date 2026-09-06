@@ -6,6 +6,7 @@ import torch
 
 from buffer import SequenceBuffer
 from dmc_expert.replay import DMCExpertTransitionReplay
+from envs.dmc import GOAL_RELATION_KEY
 
 ExpertReplay = DMCExpertTransitionReplay
 
@@ -51,6 +52,11 @@ def build_context(obs, obs_history, action_history, history_size, action_dim):
 @torch.no_grad()
 def evaluate(config, model, envs):
     was_training = model.training
+    planner_state = {
+        name: getattr(model, name)
+        for name in ("_previous_mean", "_cem_mean", "_gradient_actions")
+        if hasattr(model, name)
+    }
     model.eval()
     try:
         obs = envs.reset().to(model.device, non_blocking=True)
@@ -58,7 +64,10 @@ def evaluate(config, model, envs):
         returns = torch.zeros(envs.env_num, device=model.device)
         lengths = torch.zeros(envs.env_num, dtype=torch.int32, device=model.device)
         successes = torch.zeros(envs.env_num, dtype=torch.bool, device=model.device)
+        sustained_successes = torch.zeros_like(successes)
+        success_streak = torch.zeros(envs.env_num, dtype=torch.int32, device=model.device)
         success_threshold = float(config.evaluation.success_threshold)
+        sustained_steps = int(config.evaluation.sustained_success_steps)
         action_repeat = int(config.env.action_repeat)
         obs_history = [deque(maxlen=max(model.history_size - 1, 1)) for _ in range(envs.env_num)]
         action_history = [deque(maxlen=max(model.history_size - 1, 1)) for _ in range(envs.env_num)]
@@ -81,7 +90,10 @@ def evaluate(config, model, envs):
             active = ~finished
             returns += reward[:, 0] * active
             lengths += active
-            successes |= (reward[:, 0] / action_repeat >= success_threshold) & active
+            qualifies = (reward[:, 0] / action_repeat >= success_threshold) & active
+            successes |= qualifies
+            success_streak = torch.where(qualifies, success_streak + 1, torch.where(active, 0, success_streak))
+            sustained_successes |= success_streak >= sustained_steps
             for index in range(envs.env_num):
                 if not finished[index]:
                     obs_history[index].append({key: obs[key][index].detach() for key in obs.keys()})
@@ -100,11 +112,14 @@ def evaluate(config, model, envs):
             float(lengths.float().mean()),
             {
                 "success": success,
+                "sustained_success": sustained_successes.float().mean(),
                 "return_std": return_std,
                 "return_stderr": return_std / returns.numel() ** 0.5,
             },
         )
     finally:
+        for name, value in planner_state.items():
+            setattr(model, name, value)
         model.train(was_training)
 
 
@@ -114,21 +129,26 @@ class OnlineSession:
         self.envs = envs
         self.replay = SequenceBuffer(config.replay)
         self.action_repeat = int(config.env.action_repeat)
-        self.warmup_steps = int(config.planning_train.warmup_steps)
-        self.random_steps = int(config.planning_train.random_steps)
-        self.updates_per_collect = int(config.planning_train.updates_per_collect)
-        self.initial_updates = int(config.planning_train.initial_updates)
 
-    def start(self, resumed=False, env_steps=0, world_model_updates=0):
+    @staticmethod
+    def _split_goal_relation(obs):
+        if GOAL_RELATION_KEY not in obs.keys():
+            return obs, None
+        return obs.exclude(GOAL_RELATION_KEY), obs[GOAL_RELATION_KEY]
+
+    def start(self):
         self.replay.start(self.envs.env_num)
-        self.obs = self.envs.reset().to(self.model.device, non_blocking=True)
+        obs, relation = self._split_goal_relation(self.envs.reset())
+        if getattr(self.model, "goal_conditioned", False) and relation is None:
+            raise ValueError("Goal-conditioned online training requires DMC goal-relation labels.")
+        self.obs = obs.to(self.model.device, non_blocking=True)
+        self.goal_relation = relation.to(self.model.device, non_blocking=True) if relation is not None else None
         size = max(self.model.history_size - 1, 1)
         self.obs_history = [deque(maxlen=size) for _ in range(self.envs.env_num)]
         self.action_history = [deque(maxlen=size) for _ in range(self.envs.env_num)]
         self.first = torch.ones(self.envs.env_num, dtype=torch.bool, device=self.model.device)
         self.returns = torch.zeros(self.envs.env_num, device=self.model.device)
         self.lengths = torch.zeros(self.envs.env_num, dtype=torch.int32, device=self.model.device)
-        self.initial_updates_pending = not world_model_updates
 
     def collect(self):
         history, past_action = build_context(
@@ -138,15 +158,19 @@ class OnlineSession:
             self.model.history_size,
             self.model.action_dim,
         )
-        if self.replay.count() < self.random_steps:
-            action = torch.empty(self.envs.env_num, self.model.action_dim, device=self.model.device).uniform_(-1, 1)
-        else:
-            action = self.model.act(history, past_action, first=self.first)
+        action = self.model.act(history, past_action, first=self.first)
         next_obs, reward, done = self.envs.step(action)
-        model_obs = next_obs.to(self.model.device, non_blocking=True)
+        terminal = next_obs["is_terminal"].to(self.model.device, non_blocking=True).reshape(-1)
         reward = reward.to(self.model.device, non_blocking=True)
         model_done = done.to(self.model.device, non_blocking=True)
-        self.replay.append(self.obs, action, reward, model_obs["is_terminal"].reshape(-1), model_done)
+        self.replay.append(
+            self.model.replay_observation(history),
+            action,
+            reward,
+            terminal,
+            model_done,
+            self.goal_relation,
+        )
         for index in range(self.envs.env_num):
             self.obs_history[index].append({key: self.obs[key][index].detach() for key in self.obs.keys()})
             self.action_history[index].append(action[index].detach())
@@ -160,19 +184,17 @@ class OnlineSession:
                 self.returns[index] = self.lengths[index] = 0
                 self.obs_history[index].clear()
                 self.action_history[index].clear()
-        self.obs = (self.envs.reset_done(next_obs, done) if done.any() else next_obs).to(
-            self.model.device, non_blocking=True
-        )
+        if done.any():
+            next_obs = self.envs.reset_done(next_obs, done)
+        next_obs, relation = self._split_goal_relation(next_obs)
+        self.obs = next_obs.to(self.model.device, non_blocking=True)
+        self.goal_relation = relation.to(self.model.device, non_blocking=True) if relation is not None else None
         self.first = model_done
         return self.envs.env_num * self.action_repeat, episodes
 
-    def update(self, step):
-        if self.replay.count() < self.warmup_steps or not self.replay.ready():
-            return {}, 0
-        update_count = self.initial_updates if self.initial_updates_pending else self.updates_per_collect
-        self.initial_updates_pending = False
+    def update(self, update_count):
         metrics = {}
         for _ in range(update_count):
-            obs, action, reward, terminal = self.replay.sample(sequence_length=self.model.sequence_length)
-            metrics = self.model.update((obs, action[:, :-1], reward[:, :-1], terminal[:, :-1]))
-        return metrics, update_count
+            obs, action, reward, terminal, *extra = self.replay.sample(sequence_length=self.model.sequence_length)
+            metrics = self.model.update((obs, action[:, :-1], reward[:, :-1], terminal[:, :-1], *extra))
+        return metrics

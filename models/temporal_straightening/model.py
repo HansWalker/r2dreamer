@@ -1,6 +1,7 @@
 """Temporal Straightening architecture and image-specific components."""
 
 import math
+from itertools import chain
 
 import torch
 import torch.nn.functional as F
@@ -251,14 +252,17 @@ class TemporalStraightening(LatentPlanner):
         )
         weight_decay = float(settings.optim.weight_decay)
         self.optimizers = {
-            "encoder": optim.Adam(self.encoder.parameters(), lr=float(settings.optim.encoder_lr)),
+            "encoder": optim.Adam(
+                chain(self.encoder.backbone.parameters(), self.encoder.norm.parameters()),
+                lr=float(settings.optim.encoder_lr),
+            ),
             "predictor": optim.AdamW(
                 self.predictor.parameters(),
                 lr=float(settings.optim.predictor_lr),
                 weight_decay=weight_decay,
             ),
             "action_encoder": optim.AdamW(
-                self.action_encoder.parameters(),
+                chain(self.action_encoder.parameters(), self.encoder.proprio.parameters()),
                 lr=float(settings.optim.action_encoder_lr),
                 weight_decay=weight_decay,
             ),
@@ -288,7 +292,8 @@ class TemporalStraightening(LatentPlanner):
             target[..., self.encoder.visual_dim :],
         )
         visual = latent[..., : self.encoder.visual_dim]
-        velocity = visual[:, 1:] - visual[:, :-1]
+        trajectory = visual.flatten(-2)
+        velocity = trajectory[:, 1:] - trajectory[:, :-1]
         previous, current = velocity[:, :-1], velocity[:, 1:]
         curvature = 1 - F.cosine_similarity(previous, current, dim=-1, eps=1e-6)
         moving = (previous.norm(dim=-1) > 1e-6) & (current.norm(dim=-1) > 1e-6)

@@ -3,7 +3,6 @@ env_num: 16
 # Checkpoint selection uses a small rollout set; final evaluation uses 50 episodes.
 eval_episode_num: 5
 action_repeat: 2
-train_ratio: 512
 time_limit: 1000
 
 seed: ${seed}
@@ -13,6 +12,7 @@ device: ${device}
 size: [64, 64]
 dataset_root: ${oc.env:DMC_EXPERT_VISION_DATA_DIR,data/dmc_expert_vision}
 proprio: null
+goal_relation: false
 model_io:
   observations:
     image:

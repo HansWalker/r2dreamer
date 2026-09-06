@@ -2,10 +2,6 @@
 
 import importlib
 
-import torch
-
-torch.set_float32_matmul_precision("high")
-
 MODEL_FAMILIES = {
     "dreamer": "training.dreamer",
     "storm": "training.storm",

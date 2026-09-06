@@ -106,7 +106,7 @@ REFERENCE_COUNTS = {
         "heads": 1_184_000,
         "controller": 2_236_680,
     },
-    "tdmpc2": {"encoder": 48_864, "dynamics": 793_088, "heads": 3_493_470, "controller": 533_516},
+    "tdmpc2": {"encoder": 58_272, "dynamics": 793_088, "heads": 3_493_470, "controller": 533_516},
     "leworldmodel": {"encoder": 6_294_144, "dynamics": 11_740_334},
     "temporal_straightening": {"dynamics": 20_122_700, "decoder": 10_140_163},
 }

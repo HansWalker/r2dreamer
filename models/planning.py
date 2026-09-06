@@ -74,6 +74,10 @@ class LatentPlanner(nn.Module):
     def pool(self, latent):
         return self.encoder.pool(latent)
 
+    @staticmethod
+    def replay_observation(history):
+        return {key: value[:, -1] for key, value in history.items()}
+
     def representation_loss(self, obs, latent, action):
         raise NotImplementedError
 

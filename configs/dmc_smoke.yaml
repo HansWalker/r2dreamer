@@ -9,8 +9,9 @@ output_dir: runs/dmc_smoke
 device: cuda:0
 
 smoke:
-  expert_epochs: 1
+  expert_updates: 1
   online_steps: 0
+  online_updates: 0
   online_checkpoint: pretrained.pt
 
 collection:
@@ -26,16 +27,20 @@ training:
     - env.env_num=1
     - env.eval_episode_num=0
     - env.time_limit=8
+    - expert_data.train_episodes=1
+    - expert_data.heldout_episodes=2
     - replay.batch_size=1
     - replay.sequence_length=4
     - replay.max_size=32
-    - replay.windows_per_episode=1
-    - training.expert.epochs=${smoke.expert_epochs}
+    - replay.episodes_per_batch=1
+    - training.expert.updates=${smoke.expert_updates}
     - training.expert.log_every=1
     - training.expert.eval_every=0
     - training.expert.save_every=1
-    - training.online.steps=0
-    - evaluation.final.checkpoint=pretrained.pt
+    - training.online.steps=${smoke.online_steps}
+    - training.online.updates=${smoke.online_updates}
+    - training.online.warmup_transitions=1
+    - evaluation.final.checkpoint=${smoke.online_checkpoint}
     - evaluation.final.episodes=1
     - evaluation.final.context_length=3
     - evaluation.final.horizons=[1]
@@ -45,6 +50,12 @@ training:
 
 evaluation:
   dataset_root: ${oc.env:DMC_SMOKE_DATA_DIR,data/dmc_smoke}
+  checkpoints:
+    - name: primary
+      checkpoint: ${smoke.online_checkpoint}
+      output: evaluation.json
+      log: evaluation.log
+      state_prediction: true
 
 models:
   dreamer:
@@ -94,8 +105,6 @@ models:
 
 smoke_models:
   dreamer:
-    - training.online.steps=${smoke.online_steps}
-    - evaluation.final.checkpoint=${smoke.online_checkpoint}
     - model.deter=64
     - model.hidden=64
     - model.discrete=4
@@ -124,8 +133,6 @@ smoke_models:
     - actor_critic.imagine_batch_size=4
     - model.imag_horizon=2
   storm:
-    - training.online.steps=${smoke.online_steps}
-    - evaluation.final.checkpoint=${smoke.online_checkpoint}
     - storm_model.hidden_dim=64
     - storm_model.posterior.stoch_dim=4
     - storm_model.recurrent.transformer.num_heads=4
@@ -153,12 +160,7 @@ smoke_models:
     - storm_train.imagine_context_length=2
     - storm_train.imagine_horizon=2
     - storm_train.imagine_batch_size=1
-    - storm_train.warmup_steps=4
-    - storm_train.world_model_updates=1
-    - storm_train.actor_critic_updates=1
   tdmpc2:
-    - training.online.steps=${smoke.online_steps}
-    - evaluation.final.checkpoint=${smoke.online_checkpoint}
     - tdmpc2_model.num_channels=8
     - tdmpc2_model.latent_dim=128
     - tdmpc2_model.mlp_dim=64
@@ -169,10 +171,6 @@ smoke_models:
     - tdmpc2_model.planner.elites=2
     - tdmpc2_model.planner.policy_samples=1
     - tdmpc2_model.planner.iterations=1
-    - planning_train.warmup_steps=4
-    - planning_train.random_steps=4
-    - planning_train.initial_updates=1
-    - planning_train.updates_per_collect=1
   leworldmodel:
     - jepa_model.encoder.embedding_dim=64
     - jepa_model.encoder.vision.patch_size=16

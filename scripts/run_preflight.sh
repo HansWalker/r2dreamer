@@ -35,6 +35,9 @@ cd "$REPO_DIR"
 echo "Preflight | dependency and GPU runtime checks"
 "$PYTHON" -m scripts.check_dmc_setup
 
+echo "Preflight | production parameter budgets"
+"$PYTHON" -m scripts.model_size_report
+
 echo "Preflight | collection, training, and evaluation"
 "$PYTHON" -u main.py \
     --config-name dmc_preflight \
@@ -55,7 +58,7 @@ errors = []
 if len(files) != expected:
     errors.append(f"expected {expected} evaluations, found {len(files)}")
 
-online_families = {"dreamer", "storm", "tdmpc2"}
+online_families = {"dreamer", "storm", "tdmpc2", "leworldmodel", "temporal_straightening"}
 for path in files:
     result = json.loads(path.read_text(encoding="utf-8"))
     name = "/".join(path.relative_to(root).parts[:-1])
@@ -63,6 +66,7 @@ for path in files:
     values = {
         "return": float(result["mean_return"]),
         "success": float(result["task_success_rate"]),
+        "sustained": float(result["sustained_success_rate"]),
         "nrmse": float(prediction["mean_nrmse"]),
     }
     family = result["model_family"]
@@ -79,8 +83,14 @@ for path in files:
         errors.append(f"{name}: expected {expected_phase} checkpoint")
     if int(result.get("expert_updates", 0)) < 2:
         errors.append(f"{name}: fewer than two expert updates")
+    if int(result.get("expert_sampled_observations", 0)) != 8:
+        errors.append(f"{name}: expert sampled-observation count is incorrect")
     if family in online_families and int(result.get("environment_steps", 0)) < 8:
         errors.append(f"{name}: online phase did not reach eight steps")
+    if family in online_families and int(result.get("online_updates", 0)) < 1:
+        errors.append(f"{name}: online phase performed no optimizer update")
+    if family in online_families and int(result.get("online_world_model_observations", 0)) != 4:
+        errors.append(f"{name}: online sampled-observation count is incorrect")
     if not Path(result["checkpoint"]).is_file():
         errors.append(f"{name}: checkpoint is missing")
     if not all(math.isfinite(value) for value in values.values()):
@@ -91,6 +101,7 @@ for path in files:
         f"phase={expected_phase:6} "
         f"return={values['return']:8.2f} "
         f"success={100 * values['success']:6.1f}% "
+        f"sustained={100 * values['sustained']:6.1f}% "
         f"nrmse={values['nrmse']:.3f}"
     )
 

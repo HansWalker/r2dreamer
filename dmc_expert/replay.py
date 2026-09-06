@@ -1,6 +1,5 @@
 """Replay views over dense DMC expert datasets."""
 
-import json
 import math
 from pathlib import Path
 
@@ -9,27 +8,32 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from .storage import DATA_FORMAT, observation_indices, split_episode_indices
+from .storage import (
+    observation_indices,
+    read_image_window,
+    split_episode_indices,
+    validate_dataset,
+)
 
 
 class DMCExpertDataset:
     """Shared HDF5 loading and tensor formatting for DMC expert data."""
 
+    frame_stack = 1
+
     def __init__(self, config):
         settings = config.training.expert
         self.path = Path(settings.data_path).expanduser()
-        self.batch_size = int(config.replay.batch_size)
+        self.batch_size = int(settings.batch_size)
+        self.episodes_per_batch = int(config.replay.episodes_per_batch)
         self.shuffle = bool(settings.shuffle)
-        self.rng = np.random.default_rng(int(config.replay.seed))
+        seed = int(config.replay.seed)
+        self.episode_rng = np.random.default_rng(seed)
+        self.window_rng = np.random.default_rng(seed + 1_000_003)
 
-        self.data_path = self.path / "data.hdf5"
-        self.metadata_path = self.path / "metadata.json"
-        with self.metadata_path.open("r", encoding="utf-8") as f:
-            self.metadata = json.load(f)
-        if self.metadata.get("format") != DATA_FORMAT:
-            raise ValueError(f"{self.path} uses format={self.metadata.get('format')!r}; expected {DATA_FORMAT!r}.")
+        self.metadata = validate_dataset(self.path, config, splits=("train",))
 
-        self.h5 = h5py.File(self.data_path, "r")
+        self.h5 = h5py.File(self.path / "data.hdf5", "r")
         self.observations = self.h5["observations"]
         self.images = self.h5["images"]
         self.actions = self.h5["actions"]
@@ -54,15 +58,12 @@ class DMCExpertDataset:
                 )
         self.obs_keys = list(requested)
         self.obs_shapes = requested
-        self._check_array_shapes()
         train_episodes = split_episode_indices(self.metadata, "train", len(self.complete))
         incomplete = train_episodes[~self.complete[train_episodes]]
         if len(incomplete):
             raise ValueError(f"{self.path} is missing {len(incomplete)} training episodes.")
         self.episodes = train_episodes[self.lengths[train_episodes] > 0]
-        if len(self.episodes) == 0:
-            raise ValueError(f"{self.path} has no complete episodes.")
-        self.num_episodes = len(self.episodes)
+        self._validate_episode_count()
         if self.proprio_indices is not None:
             self.proprio_mean, self.proprio_std = self._proprio_stats()
         self._episode_order = np.array([], dtype=np.int64)
@@ -77,38 +78,6 @@ class DMCExpertDataset:
     def __exit__(self, *_):
         self.close()
 
-    def _check_array_shapes(self):
-        episode_shape = self.actions.shape[:2]
-        expected_action = (*episode_shape, self.action_dim)
-        if self.actions.shape != expected_action:
-            raise ValueError(f"Action array has shape {self.actions.shape}, expected {expected_action}.")
-        expected_step = (*episode_shape, 1)
-        for name in ("rewards", "discounts", "terminations", "truncations"):
-            shape = self.h5[name].shape
-            if shape != expected_step:
-                raise ValueError(f"{name} array has shape {shape}, expected {expected_step}.")
-        if self.lengths.shape != episode_shape[:1] or self.complete.shape != episode_shape[:1]:
-            raise ValueError("Episode metadata arrays do not match the HDF5 episode dimension.")
-        expected_images = (*episode_shape[:1], episode_shape[1] + 1, *self.obs_shapes["image"])
-        if self.images.shape != expected_images:
-            raise ValueError(f"Image array has shape {self.images.shape}, expected {expected_images}.")
-        expected_observations = (*episode_shape[:1], episode_shape[1] + 1, int(self.metadata["obs_dim"]))
-        if self.observations.shape != expected_observations:
-            raise ValueError(
-                f"Observation array has shape {self.observations.shape}, expected {expected_observations}."
-            )
-        goal_relation = self.metadata.get("goal_relation")
-        if goal_relation:
-            expected = (*episode_shape[:1], episode_shape[1] + 1, *goal_relation["shape"])
-            if self.goal_relations is None or self.goal_relations.shape != expected:
-                shape = None if self.goal_relations is None else self.goal_relations.shape
-                raise ValueError(f"Goal-relation array has shape {shape}, expected {expected}.")
-
-        for name in ("action_min", "action_max"):
-            size = np.asarray(self.metadata.get(name, [-1.0])).size
-            if size not in (1, self.action_dim):
-                raise ValueError(f"{name} must be scalar or action_dim={self.action_dim}, got {size} values.")
-
     def validate_model_io(self, model_io):
         observations = {str(key): tuple(map(int, shape)) for key, shape in model_io.observations.items()}
         action_dim = math.prod(model_io.action.shape)
@@ -122,33 +91,68 @@ class DMCExpertDataset:
 
     def state_dict(self):
         return {
-            "rng_state": self.rng.bit_generator.state,
+            "episode_rng_state": self.episode_rng.bit_generator.state,
+            "window_rng_state": self.window_rng.bit_generator.state,
             "episode_order": self._episode_order.copy(),
             "episode_pos": self._episode_pos,
         }
 
     def load_state_dict(self, state):
-        self.rng.bit_generator.state = state["rng_state"]
+        self.episode_rng.bit_generator.state = state["episode_rng_state"]
+        self.window_rng.bit_generator.state = state["window_rng_state"]
         self._episode_order = np.asarray(state["episode_order"], dtype=np.int64)
         self._episode_pos = int(state["episode_pos"])
 
-    def _next_episode_indices(self):
+    def _validate_episode_count(self):
+        self.num_episodes = len(self.episodes)
+        if self.num_episodes < self.episodes_per_batch:
+            raise ValueError(
+                f"{self.path} has {self.num_episodes} usable episodes, but this run requires "
+                f"{self.episodes_per_batch} source episodes per update."
+            )
+
+    def _next_episode_indices(self, count):
+        target = int(count)
         indices = []
-        while len(indices) < self.batch_size:
+        while len(indices) < target:
             if self._episode_pos >= len(self._episode_order):
-                self._episode_order = self.rng.permutation(self.episodes) if self.shuffle else self.episodes.copy()
+                self._episode_order = (
+                    self.episode_rng.permutation(self.episodes) if self.shuffle else self.episodes.copy()
+                )
                 self._episode_pos = 0
-            count = min(
-                self.batch_size - len(indices),
+            take = min(
+                target - len(indices),
                 len(self._episode_order) - self._episode_pos,
             )
-            indices.extend(self._episode_order[self._episode_pos : self._episode_pos + count])
-            self._episode_pos += count
+            indices.extend(self._episode_order[self._episode_pos : self._episode_pos + take])
+            self._episode_pos += take
         return np.asarray(indices, dtype=np.int64)
+
+    def _sample_episode_groups(self, valid_starts):
+        indices = self._next_episode_indices(self.episodes_per_batch)
+        windows_per_episode = self.batch_size // len(indices)
+        groups = []
+        for ep_idx in indices:
+            choices = int(valid_starts(int(ep_idx)))
+            starts = self.window_rng.choice(
+                choices,
+                size=windows_per_episode,
+                replace=windows_per_episode > choices,
+            )
+            groups.append((int(ep_idx), tuple(sorted(map(int, starts)))))
+        return groups
 
     def _read_observations(self, ep_idx, start, length):
         ep_idx, start, length = int(ep_idx), int(start), int(length)
-        result = {"image": np.asarray(self.images[ep_idx, start : start + length])}
+        result = {
+            "image": read_image_window(
+                self.images,
+                ep_idx,
+                start,
+                length,
+                self.frame_stack,
+            )
+        }
         if self.proprio_indices is not None:
             state = np.asarray(self.observations[ep_idx, start : start + length], dtype=np.float32)
             result["proprio"] = state[..., self.proprio_indices]
@@ -178,30 +182,22 @@ class DMCExpertEpisodeReplay(DMCExpertDataset):
         super().__init__(config)
         self.sequence_length = int(config.replay.sequence_length)
         self.episodes = self.episodes[self.lengths[self.episodes] >= self.sequence_length - 1]
-        if not len(self.episodes):
-            raise ValueError(f"{self.path} has no complete episode with {self.sequence_length} observations.")
-        self.num_episodes = len(self.episodes)
+        self._validate_episode_count()
 
     def sample_episode_batch(self):
-        indices = self._next_episode_indices()
-        starts = [
-            int(self.rng.integers(int(self.lengths[ep_idx]) - self.sequence_length + 2))
-            for ep_idx in indices
-        ]
-        rows = [
-            self._make_window(ep_idx, start, self.sequence_length)
-            for ep_idx, start in zip(indices, starts, strict=True)
-        ]
+        groups = self._sample_episode_groups(lambda ep_idx: int(self.lengths[ep_idx]) - self.sequence_length + 2)
+        rows = [self._make_window(ep_idx, start, self.sequence_length) for ep_idx, starts in groups for start in starts]
         data = {key: torch.as_tensor(np.stack([row[key] for row in rows], axis=0)) for key in rows[0]}
         batch = TensorDict(data, batch_size=(self.batch_size, self.sequence_length))
         contexts = []
-        for ep_idx, start in zip(indices, starts, strict=True):
-            row = self._make_window(ep_idx, 0, start)
+        for ep_idx, starts in groups:
+            context_length = max(starts)
+            row = self._make_window(ep_idx, 0, context_length)
             context = TensorDict(
                 {key: torch.as_tensor(value) for key, value in row.items()},
-                batch_size=(start,),
+                batch_size=(context_length,),
             ).unsqueeze(0)
-            contexts.append((context, (start,)))
+            contexts.append((context, starts))
         return contexts, batch
 
     def _make_window(self, ep_idx, start, length):
@@ -246,9 +242,7 @@ class DMCExpertSequenceReplay(DMCExpertDataset):
         super().__init__(config)
         self.sequence_length = int(config.replay.sequence_length)
         self.episodes = self.episodes[self.lengths[self.episodes] >= self.sequence_length]
-        if not len(self.episodes):
-            raise ValueError(f"{self.path} has no complete episode of length {self.sequence_length}.")
-        self.num_episodes = len(self.episodes)
+        self._validate_episode_count()
         self.reconstruct_context = str(config.storm_model.sequence_core) != "transformer"
 
         first, stop = int(self.episodes[0]), int(self.episodes[-1]) + 1
@@ -265,9 +259,8 @@ class DMCExpertSequenceReplay(DMCExpertDataset):
             self.returns[self.episodes, step] = running
 
     def sample_episode_batch(self):
-        indices = self._next_episode_indices()
-        samples = [self._sample_episode(ep_idx) for ep_idx in indices]
-        starts, rows = zip(*samples, strict=True)
+        groups = self._sample_episode_groups(lambda ep_idx: int(self.lengths[ep_idx]) - self.sequence_length + 1)
+        rows = [self._sample_episode(ep_idx, start) for ep_idx, starts in groups for start in starts]
         data = {key: torch.as_tensor(np.stack([row[key] for row in rows], axis=0)) for key in rows[0]}
         obs = {key: data[key] for key in self.obs_keys}
         batch = (
@@ -281,20 +274,19 @@ class DMCExpertSequenceReplay(DMCExpertDataset):
             return batch
 
         contexts = []
-        for ep_idx, start in zip(indices, starts, strict=True):
-            context = self._read_observations(ep_idx, 0, start)
-            context["action"] = np.asarray(self.actions[int(ep_idx), :start], dtype=np.float32)
+        for ep_idx, starts in groups:
+            context_length = max(starts)
+            context = self._read_observations(ep_idx, 0, context_length)
+            context["action"] = np.asarray(self.actions[ep_idx, :context_length], dtype=np.float32)
             context = TensorDict(
                 {key: torch.as_tensor(value) for key, value in context.items()},
-                batch_size=(start,),
+                batch_size=(context_length,),
             ).unsqueeze(0)
-            contexts.append((context, (start,)))
+            contexts.append((context, starts))
         return contexts, batch
 
-    def _sample_episode(self, ep_idx):
-        ep_idx = int(ep_idx)
+    def _sample_episode(self, ep_idx, start):
         length = self.sequence_length
-        start = int(self.rng.integers(int(self.lengths[ep_idx]) - length + 1))
         end = start + length
         obs = self._read_observations(ep_idx, start, length)
         obs.update({
@@ -303,7 +295,7 @@ class DMCExpertSequenceReplay(DMCExpertDataset):
             "terminal": np.asarray(self.terminations[ep_idx, start:end], dtype=bool),
             "return": self.returns[ep_idx, start:end, None],
         })
-        return start, obs
+        return obs
 
 
 class DMCExpertTransitionReplay(DMCExpertDataset):
@@ -314,9 +306,7 @@ class DMCExpertTransitionReplay(DMCExpertDataset):
         self.sequence_length = int(config.replay.sequence_length)
         transitions = self.sequence_length - 1
         self.episodes = self.episodes[self.lengths[self.episodes] >= transitions]
-        if not len(self.episodes):
-            raise ValueError(f"{self.path} has no complete episode with {transitions} transitions.")
-        self.num_episodes = len(self.episodes)
+        self._validate_episode_count()
         if str(config.model_family) in {"leworldmodel", "temporal_straightening"}:
             goal = self.metadata.get("goal_relation")
             requested = config.jepa_model.goal
@@ -335,7 +325,8 @@ class DMCExpertTransitionReplay(DMCExpertDataset):
                 )
 
     def sample_episode_batch(self):
-        rows = [self._sample_episode(ep_idx) for ep_idx in self._next_episode_indices()]
+        groups = self._sample_episode_groups(lambda ep_idx: int(self.lengths[ep_idx]) - self.sequence_length + 2)
+        rows = [self._sample_episode(ep_idx, start) for ep_idx, starts in groups for start in starts]
         observations = {key: torch.as_tensor(np.stack([row[0][key] for row in rows])) for key in self.obs_keys}
         batch = (
             observations,
@@ -347,10 +338,8 @@ class DMCExpertTransitionReplay(DMCExpertDataset):
             return batch
         return (*batch, torch.as_tensor(np.stack([row[4] for row in rows])).float())
 
-    def _sample_episode(self, ep_idx):
+    def _sample_episode(self, ep_idx, start):
         transitions = self.sequence_length - 1
-        episode_length = int(self.lengths[ep_idx])
-        start = int(self.rng.integers(episode_length - transitions + 1))
         observations = self._read_observations(ep_idx, start, self.sequence_length)
         end = start + transitions
         row = (
@@ -363,3 +352,13 @@ class DMCExpertTransitionReplay(DMCExpertDataset):
             return row
         relation = np.asarray(self.goal_relations[ep_idx, start : start + self.sequence_length], dtype=np.float32)
         return (*row, relation)
+
+
+class DMCExpertFrameStackReplay(DMCExpertTransitionReplay):
+    """Present raw expert images as causal frame stacks without changing the HDF5 data."""
+
+    def __init__(self, config):
+        self.frame_stack = int(config.tdmpc2_model.frame_stack)
+        if self.frame_stack < 1:
+            raise ValueError("frame_stack must be positive.")
+        super().__init__(config)

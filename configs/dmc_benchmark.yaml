@@ -53,3 +53,14 @@ training:
 
 evaluation:
   dataset_root: ${oc.env:DMC_EXPERT_VISION_DATA_DIR,data/dmc_expert_vision}
+  checkpoints:
+    - name: final
+      checkpoint: final.pt
+      output: evaluation.json
+      log: evaluation.log
+      state_prediction: true
+    - name: best
+      checkpoint: best.pt
+      output: evaluation_best.json
+      log: evaluation_best.log
+      state_prediction: false

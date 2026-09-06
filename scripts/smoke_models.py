@@ -35,7 +35,7 @@ def model_configs():
     return configs
 
 
-def synthetic_batch(config, batch_size=2, length=4):
+def synthetic_batch(config, model, batch_size=2, length=4):
     action_dim = math.prod(map(int, config.model_io.action.shape))
     observation = {}
     for key, shape in config.model_io.observations.items():
@@ -70,7 +70,8 @@ def synthetic_batch(config, batch_size=2, length=4):
         returns = reward.flip(1).cumsum(1).flip(1)
         batch = (observation, action, reward, terminal, returns)
     else:
-        batch = (observation, action[:, :-1], reward[:, :-1], terminal[:, :-1])
+        training_observation = model.stack_sequence(observation) if family == "tdmpc2" else observation
+        batch = (training_observation, action[:, :-1], reward[:, :-1], terminal[:, :-1])
         if family in {"leworldmodel", "temporal_straightening"}:
             tolerance = torch.as_tensor(list(config.jepa_model.goal.tolerance)).reshape(1, 1, -1)
             relation = torch.randn(batch_size, length, 2) * tolerance
@@ -124,10 +125,12 @@ def main():
     for name, config in model_configs().items():
         family = load_model_family(config.model_family)
         model = family.build_model(config)
-        batch, observation, action = synthetic_batch(config)
+        batch, observation, action = synthetic_batch(config, model)
         metrics = family.expert_update(model, batch)
         if not all(torch.isfinite(torch.as_tensor(value)).all() for value in metrics.values()):
             raise RuntimeError(f"{name} produced a non-finite update.")
+        if not all(torch.isfinite(parameter).all() for parameter in model.parameters()):
+            raise RuntimeError(f"{name} produced non-finite parameters.")
         family.load_checkpoint(model, family.checkpoint(model), training=False)
 
         model.eval()

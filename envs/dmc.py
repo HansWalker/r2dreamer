@@ -5,6 +5,51 @@ import numpy as np
 
 from .parallel import ParallelEnv
 
+GOAL_RELATION_KEY = "goal_relation"
+
+
+def goal_relation_spec(physics, domain, task):
+    name = f"{domain}/{task}"
+    if name == "cartpole/balance_sparse":
+        tolerance = [0.25, float(np.arccos(0.995))]
+        relation_name, geometry = "cart_and_pole_to_balance", "box"
+    elif domain == "point_mass":
+        tolerance = [float(physics.named.model.geom_size["target", 0])]
+        relation_name, geometry = "mass_to_target", "radial"
+    elif domain == "reacher":
+        tolerance = [float(physics.named.model.geom_size["finger", 0] + physics.named.model.geom_size["target", 0])]
+        relation_name, geometry = "finger_to_target", "radial"
+    elif domain == "ball_in_cup":
+        target = np.asarray(physics.named.model.site_size["target"], dtype=np.float32)[[0, 2]]
+        ball = float(physics.named.model.geom_size["ball", 0])
+        tolerance = (target - ball).tolist()
+        relation_name, geometry = "ball_to_target", "box"
+    else:
+        return None
+    return {"name": relation_name, "geometry": geometry, "shape": [2], "tolerance": tolerance}
+
+
+def goal_relation(physics, domain, task):
+    name = f"{domain}/{task}"
+    if name == "cartpole/balance_sparse":
+        angle = float(physics.named.data.qpos["hinge_1"])
+        angle = np.arctan2(np.sin(angle), np.cos(angle))
+        return np.asarray([physics.cart_position(), angle], dtype=np.float32)
+
+    method = {
+        "point_mass": "mass_to_target",
+        "reacher": "finger_to_target",
+        "ball_in_cup": "ball_to_target",
+    }.get(domain)
+    if method is None:
+        return None
+    relation = np.asarray(getattr(physics, method)(), dtype=np.float32).reshape(-1)
+    if domain == "point_mass":
+        relation = relation[:2]
+    if relation.size != 2:
+        raise RuntimeError(f"{name} returned a {relation.size}D goal relation; expected 2D.")
+    return relation
+
 
 class DeepMindControl(gym.Env):
     metadata: ClassVar[dict] = {}
@@ -18,6 +63,7 @@ class DeepMindControl(gym.Env):
         seed=0,
         max_steps=None,
         proprio=None,
+        include_goal_relation=False,
     ):
         from dm_control import suite
 
@@ -25,11 +71,14 @@ class DeepMindControl(gym.Env):
             raise ValueError("action_repeat must be positive.")
         domain, task = {f"{domain}_{task}": (domain, task) for domain, task in suite.ALL_TASKS}[name]
         self._env = suite.load(domain, task, task_kwargs={"random": seed})
+        self._domain = domain
+        self._task = task
         self._action_repeat = int(action_repeat)
         self._size = size
         self._max_steps = max_steps
         self._episode_step = None
         self._proprio = {str(key): np.asarray(indices, dtype=np.int64) for key, indices in (proprio or {}).items()}
+        self._include_goal_relation = bool(include_goal_relation)
         if camera is None:
             camera = {"quadruped": 2, "fish": 3}.get(domain, 0)
         self._camera = camera
@@ -51,6 +100,8 @@ class DeepMindControl(gym.Env):
         if self._proprio:
             size = sum(len(indices) for indices in self._proprio.values())
             spaces["proprio"] = gym.spaces.Box(-np.inf, np.inf, (size,), dtype=np.float32)
+        if self._include_goal_relation:
+            spaces[GOAL_RELATION_KEY] = gym.spaces.Box(-np.inf, np.inf, (2,), dtype=np.float32)
         return gym.spaces.Dict(spaces)
 
     def step(self, action):
@@ -96,6 +147,8 @@ class DeepMindControl(gym.Env):
                 np.asarray(time_step.observation[key], dtype=np.float32).reshape(-1)[indices]
                 for key, indices in self._proprio.items()
             ])
+        if self._include_goal_relation:
+            observation[GOAL_RELATION_KEY] = goal_relation(self._env.physics, self._domain, self._task)
         return observation
 
     def render(self, *args, **kwargs):
@@ -104,7 +157,7 @@ class DeepMindControl(gym.Env):
         return self._env.physics.render(*self._size, camera_id=self._camera)
 
 
-def make_env(config, seed):
+def make_env(config, seed, include_goal_relation=False):
     proprio = config.get("proprio")
     return DeepMindControl(
         str(config.task).removeprefix("dmc_"),
@@ -113,18 +166,20 @@ def make_env(config, seed):
         seed=seed,
         max_steps=config.time_limit // config.action_repeat,
         proprio=proprio,
+        include_goal_relation=include_goal_relation,
     )
 
 
-def _make_parallel_envs(config, env_num, seed):
+def _make_parallel_envs(config, env_num, seed, include_goal_relation=False):
     def constructor(index):
-        return lambda: make_env(config, int(seed) + index)
+        return lambda: make_env(config, int(seed) + index, include_goal_relation)
 
     return ParallelEnv(constructor, env_num, pin_memory=str(config.device).startswith("cuda"))
 
 
-def make_envs(config):
-    return _make_parallel_envs(config, config.env_num, config.seed)
+def make_envs(config, seed=None):
+    seed = int(config.seed) if seed is None else int(seed)
+    return _make_parallel_envs(config, config.env_num, seed, bool(config.get("goal_relation", False)))
 
 
 def make_eval_envs(config):

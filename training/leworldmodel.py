@@ -2,17 +2,14 @@
 
 from models.leworldmodel import LeWorldModel
 
-from .planning import ExpertReplay, checkpoint, evaluate, expert_update, load_checkpoint
+from . import planning
 
-__all__ = [
-    "EXPERT_METRICS",
-    "ExpertReplay",
-    "build_model",
-    "checkpoint",
-    "evaluate",
-    "expert_update",
-    "load_checkpoint",
-]
+ExpertReplay = planning.ExpertReplay
+OnlineSession = planning.OnlineSession
+checkpoint = planning.checkpoint
+evaluate = planning.evaluate
+expert_update = planning.expert_update
+load_checkpoint = planning.load_checkpoint
 
 EXPERT_METRICS = {
     "loss": "loss",
@@ -20,6 +17,7 @@ EXPERT_METRICS = {
     "sigreg": "sigreg_loss",
     "goal": "goal_relation_loss",
 }
+ONLINE_METRICS = EXPERT_METRICS
 
 
 def build_model(config):

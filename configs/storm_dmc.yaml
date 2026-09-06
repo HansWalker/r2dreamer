@@ -9,12 +9,6 @@ model_family: storm
 training:
   expert:
     enabled: true
-    # Online evaluation selects this family's final checkpoint.
-    eval_every: 0
-
-replay:
-  batch_size: 16
-  max_size: 100000
 
 storm_model:
   sequence_core: transformer
@@ -76,7 +70,7 @@ storm_model:
 
 actor_critic:
   hidden_dim: 292
-  imagine_batch_size: 1024
+  imagine_batch_size: 512
   act: ReLU
   gamma: 0.985
   lambd: 0.95
@@ -100,6 +94,3 @@ storm_train:
   imagine_context_length: 8
   imagine_horizon: 16
   imagine_batch_size: ${actor_critic.imagine_batch_size}
-  warmup_steps: 1024
-  world_model_updates: ${env.env_num}
-  actor_critic_updates: ${env.env_num}

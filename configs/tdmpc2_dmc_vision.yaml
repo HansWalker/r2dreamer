@@ -10,21 +10,13 @@ logdir: logdir/tdmpc2_dmc_vision/${scenario.name}/seed_${seed}/${now:%Y-%m-%d}/$
 training:
   expert:
     enabled: true
-    # Online evaluation selects this family's final checkpoint.
-    eval_every: 0
 
 replay:
   batch_size: 256
   sequence_length: 4
-  max_size: 1000000
-
-planning_train:
-  warmup_steps: 2500
-  random_steps: 2500
-  initial_updates: 2500
-  updates_per_collect: ${env.env_num}
 
 tdmpc2_model:
+  frame_stack: 3
   num_channels: 32
   mlp_dim: 539
   latent_dim: 512

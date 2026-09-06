@@ -1,27 +1,16 @@
 """TD-MPC2 hooks for the shared DMC trainer."""
 
+from dmc_expert.replay import DMCExpertFrameStackReplay
 from models.tdmpc2 import TDMPC2
 
-from .planning import (
-    ExpertReplay,
-    OnlineSession,
-    checkpoint,
-    evaluate,
-    expert_update,
-    load_checkpoint,
-)
+from . import planning
 
-__all__ = [
-    "EXPERT_METRICS",
-    "ONLINE_METRICS",
-    "ExpertReplay",
-    "OnlineSession",
-    "build_model",
-    "checkpoint",
-    "evaluate",
-    "expert_update",
-    "load_checkpoint",
-]
+ExpertReplay = DMCExpertFrameStackReplay
+OnlineSession = planning.OnlineSession
+checkpoint = planning.checkpoint
+evaluate = planning.evaluate
+expert_update = planning.expert_update
+load_checkpoint = planning.load_checkpoint
 
 EXPERT_METRICS = {
     "loss": "loss",

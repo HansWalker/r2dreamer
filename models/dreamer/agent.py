@@ -130,7 +130,11 @@ class Dreamer(DreamerModel):
         p_data = self.preprocess(data)
         initial = self._replay_initial(contexts)
         self._update_slow_target()
-        with autocast(device_type=self.device.type, dtype=torch.float16):
+        with autocast(
+            device_type=self.device.type,
+            dtype=torch.float16,
+            enabled=self.device.type == "cuda",
+        ):
             metrics = self._cal_grad(p_data, initial)
         self._optimizer_step(metrics)
         return metrics
@@ -141,7 +145,11 @@ class Dreamer(DreamerModel):
         p_data = self.preprocess(data)
         initial = self._replay_initial(contexts) if contexts is not None else self._initial_tuple(data.shape[0])
         self._update_slow_target()
-        with autocast(device_type=self.device.type, dtype=torch.float16):
+        with autocast(
+            device_type=self.device.type,
+            dtype=torch.float16,
+            enabled=self.device.type == "cuda",
+        ):
             metrics = self._cal_expert_pretrain_grad(p_data, initial)
         return self._optimizer_step(metrics)
 

@@ -1,10 +1,28 @@
 """TD-MPC2 checkpoint and task integration for DMC expert collection."""
 
+import hashlib
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 CHECKPOINT_REPO = "nicklashansen/tdmpc2"
+
+
+def source_sha256(root: Path) -> str:
+    """Hash the external TD-MPC2 source that interprets expert checkpoints."""
+    package_root = Path(root).expanduser().resolve() / "tdmpc2"
+    config_path = package_root / "config.yaml"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Missing TD-MPC2 config: {config_path}")
+    paths = sorted(
+        path for path in package_root.rglob("*") if path.is_file() and path.suffix in {".py", ".yaml", ".yml"}
+    )
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.relative_to(package_root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)

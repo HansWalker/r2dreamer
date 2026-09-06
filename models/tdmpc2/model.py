@@ -83,17 +83,19 @@ class RandomShift(nn.Module):
 
 
 class PixelEncoder(nn.Module):
-    """TD-MPC2's original 64x64 pixel encoder."""
+    """TD-MPC2's original 64x64 pixel encoder over stacked RGB frames."""
 
-    def __init__(self, model_io, config, final):
+    def __init__(self, model_io, config, final, frame_stack):
         super().__init__()
         self.key, (height, width, channels) = image_spec(model_io)
         if (height, width) != (64, 64):
             raise ValueError(f"TD-MPC2 expects 64x64 images, got {height}x{width}.")
+        self.raw_channels = channels
+        self.input_channels = channels * int(frame_stack)
         feature_channels = int(config.num_channels)
         self.net = nn.Sequential(
             RandomShift(),
-            nn.Conv2d(channels, feature_channels, 7, stride=2),
+            nn.Conv2d(self.input_channels, feature_channels, 7, stride=2),
             nn.ReLU(),
             nn.Conv2d(feature_channels, feature_channels, 5, stride=2),
             nn.ReLU(),
@@ -110,6 +112,10 @@ class PixelEncoder(nn.Module):
             )
 
     def forward(self, obs):
+        if obs[self.key].shape[-1] != self.input_channels:
+            raise ValueError(
+                f"TD-MPC2 encoder expects {self.input_channels} stacked channels, got {obs[self.key].shape[-1]}."
+            )
         pixels, prefix = channel_first(obs[self.key])
         if obs[self.key].dtype == torch.uint8:
             pixels = pixels / 255.0
@@ -125,7 +131,10 @@ class TDMPC2(nn.Module):
         if action_kind != "continuous":
             raise ValueError("TD-MPC2 requires continuous actions.")
         self.action_dim = math.prod(action_shape)
-        self.history_size = 1
+        self.frame_stack = int(settings.frame_stack)
+        if self.frame_stack < 1:
+            raise ValueError("TD-MPC2 frame_stack must be positive.")
+        self.history_size = self.frame_stack
         self.sequence_length = int(settings.horizon) + 1
         self.horizon = int(settings.horizon)
         self.latent_dim = int(settings.latent_dim)
@@ -146,7 +155,12 @@ class TDMPC2(nn.Module):
 
         hidden = [int(settings.mlp_dim)] * 2
         latent_action = self.latent_dim + self.action_dim
-        self.encoder = PixelEncoder(model_io, settings, SimNorm(int(settings.simnorm_dim)))
+        self.encoder = PixelEncoder(
+            model_io,
+            settings,
+            SimNorm(int(settings.simnorm_dim)),
+            self.frame_stack,
+        )
         self.dynamics = td_mlp(
             latent_action,
             hidden,
@@ -201,6 +215,31 @@ class TDMPC2(nn.Module):
     def load_optimizer_state_dict(self, state):
         self.model_optimizer.load_state_dict(state["model"])
         self.policy_optimizer.load_state_dict(state["policy"])
+
+    def stack_sequence(self, observation):
+        """Convert raw RGB sequences to TD-MPC2's causal frame-stack representation."""
+        image = observation[self.encoder.key]
+        if image.ndim != 5:
+            raise ValueError(f"TD-MPC2 frame stacking expects [B,T,H,W,C], got {tuple(image.shape)}.")
+        if image.shape[-1] == self.encoder.input_channels:
+            return observation
+        if image.shape[-1] != self.encoder.raw_channels:
+            raise ValueError(
+                f"TD-MPC2 expects [B,T,H,W,{self.encoder.raw_channels}] raw images or "
+                f"{self.encoder.input_channels}-channel frame stacks, got {tuple(image.shape)}."
+            )
+        length = image.shape[1]
+        padding = image[:, :1].expand(-1, self.frame_stack - 1, *image.shape[2:])
+        frames = torch.cat((padding, image), dim=1)
+        stacked = torch.cat(
+            [frames[:, offset : offset + length] for offset in range(self.frame_stack)],
+            dim=-1,
+        )
+        return {**observation, self.encoder.key: stacked}
+
+    def replay_observation(self, history):
+        stacked = self.stack_sequence(history)
+        return {key: value[:, -1] for key, value in stacked.items()}
 
     def _two_hot(self, target):
         target = symlog(target).clamp(self.vmin, self.vmax)
@@ -349,7 +388,7 @@ class TDMPC2(nn.Module):
         self.eval()
         try:
             history = {key: value.to(self.device) for key, value in history.items()}
-            latent = self.encoder({key: value[:, -1] for key, value in history.items()})
+            latent = self.encoder(self.replay_observation(history))
             batch = latent.shape[0]
             horizon = int(self.planner.horizon)
             samples = int(self.planner.samples)

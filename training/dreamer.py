@@ -2,7 +2,6 @@
 
 import torch
 
-import tools
 from buffer import Buffer
 from dmc_expert.replay import DMCExpertEpisodeReplay
 from models.dreamer import Dreamer
@@ -10,18 +9,6 @@ from models.dreamer import Dreamer
 ExpertReplay = DMCExpertEpisodeReplay
 EXPERT_METRICS = {"loss": "opt/loss", "bc": "loss/bc"}
 ONLINE_METRICS = {"loss": "opt/loss"}
-
-__all__ = [
-    "EXPERT_METRICS",
-    "ONLINE_METRICS",
-    "ExpertReplay",
-    "OnlineSession",
-    "build_model",
-    "checkpoint",
-    "evaluate",
-    "expert_update",
-    "load_checkpoint",
-]
 
 
 def build_model(config):
@@ -62,7 +49,10 @@ def evaluate(config, model, envs):
         steps = torch.zeros(envs.env_num, dtype=torch.int32, device=model.device)
         returns = torch.zeros(envs.env_num, dtype=torch.float32, device=model.device)
         successes = torch.zeros(envs.env_num, dtype=torch.bool, device=model.device)
+        sustained_successes = torch.zeros_like(successes)
+        success_streak = torch.zeros(envs.env_num, dtype=torch.int32, device=model.device)
         success_threshold = float(config.evaluation.success_threshold)
+        sustained_steps = int(config.evaluation.sustained_success_steps)
         action_repeat = int(config.env.action_repeat)
         logged = {}
         state = model.get_initial_state(envs.env_num)
@@ -80,7 +70,10 @@ def evaluate(config, model, envs):
                 raise RuntimeError("Evaluation policy produced a non-finite action.")
             active = ~finished
             returns += transition["reward"][:, 0] * active
-            successes |= (transition["reward"][:, 0] / action_repeat >= success_threshold) & stepped
+            qualifies = (transition["reward"][:, 0] / action_repeat >= success_threshold) & stepped
+            successes |= qualifies
+            success_streak = torch.where(qualifies, success_streak + 1, torch.where(stepped, 0, success_streak))
+            sustained_successes |= success_streak >= sustained_steps
             for key, value in transition.items():
                 if key.startswith("log_"):
                     logged.setdefault(key[4:], torch.zeros_like(returns))
@@ -89,6 +82,7 @@ def evaluate(config, model, envs):
 
         return_std = returns.std(unbiased=returns.numel() > 1)
         logged["success"] = successes.float()
+        logged["sustained_success"] = sustained_successes.float()
         logged["return_std"] = return_std
         logged["return_stderr"] = return_std / returns.numel() ** 0.5
         return (
@@ -107,18 +101,9 @@ class OnlineSession:
         self.model = model
         self.envs = envs
         self.replay = Buffer(config.replay)
-        settings = config.dreamer_train
-        self.train_after = int(settings.train_after)
-        self.initial_updates = int(settings.initial_updates)
         self.action_repeat = int(config.env.action_repeat)
-        batch_steps = self.replay.batch_size * self.replay.sequence_length
-        self.updates_needed = tools.Every(batch_steps / config.env.train_ratio * self.action_repeat)
-        self.initial_updates_pending = True
 
-    def start(self, resumed=False, env_steps=0, world_model_updates=0):
-        self.initial_updates_pending = not world_model_updates
-        if resumed:
-            self.updates_needed(env_steps)
+    def start(self):
         self.done = torch.ones(self.envs.env_num, dtype=torch.bool, device=self.model.device)
         self.returns = torch.zeros(self.envs.env_num, dtype=torch.float32, device=self.model.device)
         self.lengths = torch.zeros(self.envs.env_num, dtype=torch.int32, device=self.model.device)
@@ -145,15 +130,8 @@ class OnlineSession:
         self.returns += transition["reward"][:, 0]
         return step_delta, episodes
 
-    def update(self, step):
-        if step < self.train_after or not self.replay.ready():
-            return {}, 0
-        if self.initial_updates_pending:
-            update_count = self.initial_updates
-            self.initial_updates_pending = False
-        else:
-            update_count = self.updates_needed(step)
+    def update(self, update_count):
         metrics = {}
         for _ in range(update_count):
             metrics = self.model.update(self.replay)
-        return metrics, update_count
+        return metrics

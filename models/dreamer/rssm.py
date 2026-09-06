@@ -24,6 +24,7 @@ CORE_TYPES = {
     "hyena": (DreamerHyenaCore, "hyena"),
     "sliding_window": (DreamerSlidingWindowCore, "sliding_window"),
 }
+CORE_INIT_OFFSET = 1_000_003
 
 
 class RSSM(nn.Module):
@@ -41,12 +42,18 @@ class RSSM(nn.Module):
         if self._core not in CORE_TYPES:
             raise ValueError(f"Unsupported RSSM core: {self._core}")
         core_type, settings = CORE_TYPES[self._core]
-        self._deter_net = core_type(
-            self._deter,
-            self.flat_stoch,
-            act_dim,
-            getattr(config, settings),
-        )
+        # Core variants must not perturb the initialization of the shared
+        # posterior, prior, heads, or policy modules built after this RSSM.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed((torch.initial_seed() + CORE_INIT_OFFSET) % (2**63 - 1))
+            self._deter_net = core_type(
+                self._deter,
+                self.flat_stoch,
+                act_dim,
+                getattr(config, settings),
+            )
+            if self._core == "block_gru":
+                self._deter_net.apply(weight_init_)
 
         self._obs_net = DreamerPosterior(
             config,
@@ -57,8 +64,6 @@ class RSSM(nn.Module):
             config,
             deter_dim=self._deter,
         )
-        if self._core == "block_gru":
-            self._deter_net.apply(weight_init_)
         self._obs_net.apply(weight_init_)
         self._prior_net.apply(weight_init_)
 
