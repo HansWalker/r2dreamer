@@ -50,6 +50,8 @@ import math
 import sys
 from pathlib import Path
 
+from training.protocol import EVALUATION_PROTOCOL
+
 root = Path(sys.argv[1]).resolve()
 files = sorted(root.glob("*/*/*/seed_*/evaluation.json"))
 expected = 13
@@ -58,7 +60,6 @@ errors = []
 if len(files) != expected:
     errors.append(f"expected {expected} evaluations, found {len(files)}")
 
-online_families = {"dreamer", "storm", "tdmpc2", "leworldmodel", "temporal_straightening"}
 for path in files:
     result = json.loads(path.read_text(encoding="utf-8"))
     name = "/".join(path.relative_to(root).parts[:-1])
@@ -67,43 +68,55 @@ for path in files:
         "return": float(result["mean_return"]),
         "success": float(result["task_success_rate"]),
         "sustained": float(result["sustained_success_rate"]),
-        "nrmse": float(prediction["mean_nrmse"]),
     }
-    family = result["model_family"]
-    expected_phase = "online" if family in online_families else "expert"
-
     protocol = result.get("experiment_protocol")
     if not protocol or protocol == "legacy_unversioned":
         errors.append(f"{name}: checkpoint protocol is missing")
-    elif protocol != result.get("evaluation_protocol"):
-        errors.append(f"{name}: training and evaluation protocols differ")
+    elif result.get("evaluation_protocol") != EVALUATION_PROTOCOL:
+        errors.append(f"{name}: wrong or missing evaluation protocol")
     if result.get("dataset_role") != "held_out":
         errors.append(f"{name}: evaluation dataset is not held out")
-    if result.get("checkpoint_phase") != expected_phase:
-        errors.append(f"{name}: expected {expected_phase} checkpoint")
+    if result.get("checkpoint_phase") != "online":
+        errors.append(f"{name}: expected online checkpoint")
     if int(result.get("expert_updates", 0)) < 2:
         errors.append(f"{name}: fewer than two expert updates")
     if int(result.get("expert_sampled_observations", 0)) != 8:
         errors.append(f"{name}: expert sampled-observation count is incorrect")
-    if family in online_families and int(result.get("environment_steps", 0)) < 8:
+    if int(result.get("environment_steps", 0)) < 8:
         errors.append(f"{name}: online phase did not reach eight steps")
-    if family in online_families and int(result.get("online_updates", 0)) < 1:
+    if int(result.get("online_updates", 0)) < 1:
         errors.append(f"{name}: online phase performed no optimizer update")
-    if family in online_families and int(result.get("online_world_model_observations", 0)) != 4:
+    if int(result.get("online_world_model_observations", 0)) != 4:
         errors.append(f"{name}: online sampled-observation count is incorrect")
     if not Path(result["checkpoint"]).is_file():
         errors.append(f"{name}: checkpoint is missing")
     if not all(math.isfinite(value) for value in values.values()):
         errors.append(f"{name}: non-finite evaluation metric")
+    coordinates = prediction["state_coordinates"]
+    rmse = prediction["rmse"]
+    expected_head_updates = int(result["expert_updates"]) + int(result["online_updates"])
+    if prediction.get("readout_updates") != expected_head_updates or prediction.get("readout_examples") != expected_head_updates:
+        errors.append(f"{name}: physical-state head did not train once per model update")
+    if prediction.get("evaluation_fitting") is not False:
+        errors.append(f"{name}: evaluation did not use the fixed checkpoint head")
+    if not coordinates or set(rmse) != {"1"}:
+        errors.append(f"{name}: missing physical-state prediction metrics")
+    for horizon, state_errors in rmse.items():
+        if set(state_errors) != set(coordinates):
+            errors.append(f"{name}: incomplete RMSE coordinates at horizon {horizon}")
+        if not all(math.isfinite(float(value)) and float(value) >= 0 for value in state_errors.values()):
+            errors.append(f"{name}: invalid RMSE at horizon {horizon}")
 
     print(
         f"{name:55} "
-        f"phase={expected_phase:6} "
+        "phase=online "
         f"return={values['return']:8.2f} "
         f"success={100 * values['success']:6.1f}% "
-        f"sustained={100 * values['sustained']:6.1f}% "
-        f"nrmse={values['nrmse']:.3f}"
+        f"sustained={100 * values['sustained']:6.1f}%"
     )
+    for horizon, state_errors in rmse.items():
+        details = ", ".join(f"{key}={value:.4g}" for key, value in state_errors.items())
+        print(f"  RMSE (original units) | horizon={horizon} | {details}")
 
 for path in root.rglob("*.log"):
     text = path.read_text(errors="replace")

@@ -224,7 +224,7 @@ class RSSM(nn.Module):
         # (B, S, K)
         logit = self._obs_net(deter, embed)
 
-        # Sample discrete stochastic state via straight-through Gumbel-Softmax.
+        # Sample discrete stochastic state with a straight-through probability gradient.
         # (B, S, K)
         stoch = self.get_dist(logit).rsample()
         return stoch, deter, logit, *cache
@@ -286,11 +286,6 @@ class RSSM(nn.Module):
         return torchd.independent.Independent(dists.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1)
 
     def kl_loss(self, post_logit, prior_logit, free):
-        kld = dists.kl
-        rep_loss = kld(post_logit, prior_logit.detach()).sum(-1)
-        dyn_loss = kld(post_logit.detach(), prior_logit).sum(-1)
-        # Clipped gradients are not backpropagated using torch.clip.
-        rep_loss = torch.clip(rep_loss, min=free)
-        dyn_loss = torch.clip(dyn_loss, min=free)
-
-        return dyn_loss, rep_loss
+        dyn_loss = torchd.kl_divergence(self.get_dist(post_logit.detach()), self.get_dist(prior_logit))
+        rep_loss = torchd.kl_divergence(self.get_dist(post_logit), self.get_dist(prior_logit.detach()))
+        return dyn_loss.clamp_min(free), rep_loss.clamp_min(free)

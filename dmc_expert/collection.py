@@ -2,10 +2,12 @@
 
 import hashlib
 import importlib.metadata
+import json
 import time
 from pathlib import Path
 from typing import Any
 
+import h5py
 import numpy as np
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
@@ -17,6 +19,8 @@ from .storage import (
     append_episode,
     completed_episodes,
     open_dataset,
+    validate_dataset_protocol,
+    validate_dataset_storage,
     write_progress,
 )
 from .tdmpc2 import (
@@ -233,7 +237,45 @@ def collect_episode(raw_env, env, agent, task: TaskSpec, config):
     return {key: np.stack(values, axis=0) for key, values in rows.items()}, episode_return
 
 
-def collect_task(config, task: TaskSpec, checkpoint_path: Path):
+def collect_task(config, task: TaskSpec, checkpoint_path: Path | None = None):
+    store_path = Path(config.output_dir).expanduser() / task.store_name
+    metadata_path, data_path = store_path / "metadata.json", store_path / "data.hdf5"
+    if config.resume and metadata_path.is_file():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        with h5py.File(data_path, "r") as h5:
+            completed = completed_episodes(h5)
+            rows = int(np.asarray(h5["lengths"][:completed], dtype=np.int64).sum())
+        if completed == int(metadata["num_episodes"]):
+            # Finished data need no current expert or source/runtime provenance check.
+            validate_dataset_protocol(
+                metadata,
+                task=task.dmc_name,
+                train_episodes=config.episodes.train,
+                heldout_episodes=config.episodes.heldout,
+                action_repeat=config.action_repeat,
+                max_episode_steps=config.max_episode_steps,
+                image_size=config.image_size,
+                policy_mode="mpc" if config.expert.mpc else "actor",
+            )
+            validate_dataset_storage(store_path, metadata)
+            write_progress(store_path, completed, rows, completed)
+            print(f"Collection | task={task.dmc_name} | reused={completed} completed episodes | output={store_path}")
+            return {
+                "domain_name": task.domain,
+                "task_name": task.task,
+                "task_slug": task.slug,
+                "data_path": str(store_path),
+                "hdf5_path": str(data_path),
+                "metadata_path": str(metadata_path),
+                "checkpoint_path": metadata.get("checkpoint_local_path", metadata.get("checkpoint_path")),
+                "episodes": completed,
+                "rows": rows,
+                "obs_dim": metadata["obs_dim"],
+                "action_dim": metadata["action_dim"],
+                "mean_new_return": None,
+            }
+
+    checkpoint_path = checkpoint_path or resolve_checkpoint(task, config.checkpoint_seed, config.checkpoints)
     schema_raw_env, schema_env, raw_action_spec, action_spec = make_env(task, config.seed, config.time_limit)
     try:
         first_obs = dict(schema_env.reset().observation)
@@ -252,7 +294,6 @@ def collect_task(config, task: TaskSpec, checkpoint_path: Path):
         action_dim=action_dim,
     )
 
-    store_path = Path(config.output_dir).expanduser() / task.store_name
     metadata = _dataset_metadata(
         task,
         checkpoint_path,
@@ -331,7 +372,4 @@ def collect_task(config, task: TaskSpec, checkpoint_path: Path):
 def collect(config):
     Path(config.output_dir).expanduser().mkdir(parents=True, exist_ok=True)
     tasks = select_tasks(discover_tasks(), config.tasks)
-    return [
-        collect_task(config, task, resolve_checkpoint(task, config.checkpoint_seed, config.checkpoints))
-        for task in tasks
-    ]
+    return [collect_task(config, task) for task in tasks]

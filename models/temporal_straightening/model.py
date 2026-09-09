@@ -1,7 +1,6 @@
 """Temporal Straightening architecture and image-specific components."""
 
 import math
-from itertools import chain
 
 import torch
 import torch.nn.functional as F
@@ -20,24 +19,6 @@ class ActionEncoder(nn.Module):
 
     def forward(self, action):
         return self.net(action.float())
-
-
-class ProprioEncoder(nn.Module):
-    """Reference-style per-frame proprioceptive embedding."""
-
-    def __init__(self, input_dim, embedding_dim):
-        super().__init__()
-        self.linear = nn.Linear(input_dim, embedding_dim)
-        self.norm = nn.LayerNorm(embedding_dim)
-        self.register_buffer("mean", torch.zeros(input_dim))
-        self.register_buffer("std", torch.ones(input_dim))
-
-    def set_stats(self, mean, std):
-        self.mean.copy_(torch.as_tensor(mean, device=self.mean.device))
-        self.std.copy_(torch.as_tensor(std, device=self.std.device))
-
-    def forward(self, value):
-        return self.norm(self.linear((value.float() - self.mean) / self.std))
 
 
 class TransformerBlock(nn.Module):
@@ -127,16 +108,10 @@ class ResidualBlock(nn.Module):
 class SensoryEncoder(nn.Module):
     def __init__(self, model_io, config):
         super().__init__()
-        observations, _, _ = parse_model_io(model_io)
         self.key, (height, width, channels) = image_spec(model_io)
-        if "proprio" not in observations:
-            raise ValueError("Temporal Straightening requires a proprioceptive observation.")
-        self.keys = (self.key, "proprio")
-        self.shapes = {key: observations[key] for key in self.keys}
+        self.keys = (self.key,)
         self.visual_dim = int(config.embedding_dim)
-        proprio_dim = math.prod(observations["proprio"])
-        proprio_embedding_dim = int(config.proprio_embedding_dim)
-        self.out_dim = self.visual_dim + proprio_embedding_dim
+        self.out_dim = self.visual_dim
         base = int(config.vision.base_channels)
         blocks = []
         in_channels = channels
@@ -148,7 +123,6 @@ class SensoryEncoder(nn.Module):
         blocks.append(ResidualBlock(in_channels, self.visual_dim))
         self.backbone = nn.Sequential(*blocks)
         self.norm = nn.LayerNorm(self.visual_dim)
-        self.proprio = ProprioEncoder(proprio_dim, proprio_embedding_dim)
         self.grid = (height // 16, width // 16)
         self.num_tokens = math.prod(self.grid)
 
@@ -158,22 +132,13 @@ class SensoryEncoder(nn.Module):
             pixels = pixels / 255.0
         features = self.backbone(2 * pixels - 1)
         tokens = self.norm(features.flatten(2).transpose(1, 2))
-        visual = tokens.reshape(*prefix, tokens.shape[-2], self.visual_dim)
-        proprio = self.proprio(obs["proprio"]).unsqueeze(-2).expand(*prefix, self.num_tokens, -1)
-        return torch.cat((visual, proprio), dim=-1)
-
-    @staticmethod
-    def pool(latent):
-        return latent.mean(dim=-2)
+        return tokens.reshape(*prefix, tokens.shape[-2], self.visual_dim)
 
     def target(self, observation):
         value = observation[self.key].float()
         if observation[self.key].dtype == torch.uint8:
             value = value / 255.0
         return 2 * value - 1
-
-    def set_proprio_stats(self, mean, std):
-        self.proprio.set_stats(mean, std)
 
 
 class DecoderResidualBlock(nn.Module):
@@ -227,11 +192,6 @@ class TemporalStraightening(LatentPlanner):
         encoder = SensoryEncoder(model_io, settings.encoder)
         latent_dim = encoder.out_dim
         action_embedding_dim = int(settings.predictor.action_embedding_dim)
-        decoder = VisionDecoder(
-            encoder.visual_dim,
-            observations[encoder.key],
-            int(settings.decoder.vision.base_channels),
-        )
         super().__init__(
             config,
             model_io,
@@ -244,16 +204,19 @@ class TemporalStraightening(LatentPlanner):
             ),
             encoder,
             ActionEncoder(math.prod(action_shape), action_embedding_dim),
-            goal_readout=nn.Sequential(
-                nn.Flatten(start_dim=-2),
-                nn.Linear(encoder.num_tokens * latent_dim, 2),
-            ),
-            decoder=decoder,
         )
+        if settings.decoder.enabled:
+            # Visualization must not change the active model's initialization or RNG stream.
+            with torch.random.fork_rng(devices=[]):
+                self.decoder = VisionDecoder(
+                    encoder.visual_dim,
+                    observations[encoder.key],
+                    int(settings.decoder.vision.base_channels),
+                )
         weight_decay = float(settings.optim.weight_decay)
         self.optimizers = {
             "encoder": optim.Adam(
-                chain(self.encoder.backbone.parameters(), self.encoder.norm.parameters()),
+                [*self.encoder.backbone.parameters(), *self.encoder.norm.parameters()],
                 lr=float(settings.optim.encoder_lr),
             ),
             "predictor": optim.AdamW(
@@ -262,55 +225,42 @@ class TemporalStraightening(LatentPlanner):
                 weight_decay=weight_decay,
             ),
             "action_encoder": optim.AdamW(
-                chain(self.action_encoder.parameters(), self.encoder.proprio.parameters()),
+                self.action_encoder.parameters(),
                 lr=float(settings.optim.action_encoder_lr),
                 weight_decay=weight_decay,
             ),
-            "decoder": optim.Adam(self.decoder.parameters(), lr=float(settings.optim.decoder_lr)),
-            "goal": optim.AdamW(
-                self.goal_readout.parameters(),
-                lr=float(settings.goal.lr),
-                weight_decay=float(settings.goal.weight_decay),
-            ),
         }
+        if self.decoder is not None:
+            self.optimizers["decoder"] = optim.Adam(self.decoder.parameters(), lr=float(settings.optim.decoder_lr))
         self.curvature_weight = float(settings.curvature_weight)
+        self.prediction_weight = float(settings.prediction_weight)
         self.decoder_weight = float(settings.decoder.weight)
-
-    def set_proprio_stats(self, mean, std):
-        self.encoder.set_proprio_stats(mean, std)
 
     def representation_loss(self, obs, latent, action):
         prediction = self.predict(latent[:, :-1], action)
         target = latent[:, 1:].detach()
         prediction_loss = F.mse_loss(prediction, target)
-        visual_prediction_loss = F.mse_loss(
-            prediction[..., : self.encoder.visual_dim],
-            target[..., : self.encoder.visual_dim],
-        )
-        proprio_prediction_loss = F.mse_loss(
-            prediction[..., self.encoder.visual_dim :],
-            target[..., self.encoder.visual_dim :],
-        )
-        visual = latent[..., : self.encoder.visual_dim]
-        trajectory = visual.flatten(-2)
+        trajectory = latent.flatten(-2)
         velocity = trajectory[:, 1:] - trajectory[:, :-1]
         previous, current = velocity[:, :-1], velocity[:, 1:]
         curvature = 1 - F.cosine_similarity(previous, current, dim=-1, eps=1e-6)
         moving = (previous.norm(dim=-1) > 1e-6) & (current.norm(dim=-1) > 1e-6)
         curvature_loss = curvature[moving].mean() if moving.any() else curvature.new_zeros(())
-        image = self.encoder.target(obs)
-        reconstruction_loss = F.mse_loss(self.decoder(visual.detach()), image)
-        predicted_reconstruction_loss = F.mse_loss(
-            self.decoder(prediction[..., : self.encoder.visual_dim].detach()),
-            image[:, 1:],
-        )
-        decoder_loss = reconstruction_loss + predicted_reconstruction_loss
-        return prediction_loss + self.curvature_weight * curvature_loss + self.decoder_weight * decoder_loss, {
+        loss = self.prediction_weight * prediction_loss + self.curvature_weight * curvature_loss
+        metrics = {
             "prediction_loss": prediction_loss,
-            "visual_prediction_loss": visual_prediction_loss,
-            "proprio_prediction_loss": proprio_prediction_loss,
+            "visual_prediction_loss": prediction_loss,
             "curvature_loss": curvature_loss,
-            "decoder_reconstruction_loss": reconstruction_loss,
-            "decoder_prediction_loss": predicted_reconstruction_loss,
-            "decoder_loss": decoder_loss,
         }
+        if self.decoder is not None:
+            image = self.encoder.target(obs)
+            reconstruction_loss = F.mse_loss(self.decoder(latent.detach()), image)
+            predicted_reconstruction_loss = F.mse_loss(self.decoder(prediction.detach()), image[:, 1:])
+            decoder_loss = reconstruction_loss + predicted_reconstruction_loss
+            loss = loss + self.decoder_weight * decoder_loss
+            metrics.update(
+                decoder_reconstruction_loss=reconstruction_loss,
+                decoder_prediction_loss=predicted_reconstruction_loss,
+                decoder_loss=decoder_loss,
+            )
+        return loss, metrics

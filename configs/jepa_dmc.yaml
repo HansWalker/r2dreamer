@@ -9,23 +9,16 @@ training:
     enabled: true
 
 replay:
-  batch_size: 256
+  batch_size: 336
   sequence_length: 4
-
-env:
-  # Training labels only; the planner and encoder never receive this value.
-  goal_relation: true
 
 jepa_model:
   history_size: 3
   goal:
     geometry: ${scenario.goal.geometry}
     tolerance: ${scenario.goal.tolerance}
-    relation_weight: 1.0
     stable_steps: 2
     action_weight: 1e-4
-    lr: 5e-4
-    weight_decay: 1e-3
   encoder:
     embedding_dim: 192
     vision:
@@ -63,6 +56,7 @@ jepa_model:
     max_std: 2.0
     lr: 1.0
     action_noise: 0.003
+    gradient_batch_size: 32  # Maximum candidate trajectories per autograd pass; does not reduce restarts.
   optim:
     lr: 5e-5
     weight_decay: 1e-3

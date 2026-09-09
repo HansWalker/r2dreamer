@@ -11,7 +11,19 @@ device: "cuda:0"
 model_family: dreamer
 model_io: ${env.model_io}
 resume_from: null
-experiment_protocol: dmc_frozen_defaults_v15
+experiment_protocol: dmc_frozen_defaults_v20
+# Per agent step: an effective reward horizon of 100 decisions (200 physics steps at action_repeat=2).
+reward_discount: 0.99
+
+state_head:
+  target_version: dmc_physical_state_v2
+  task: ${scenario.task}
+  fields: ${scenario.state_fields}
+  projection_dim: 16
+  hidden_dim: 64
+  samples_per_update: 256
+  lr: 3e-4
+  grad_clip: 10.0
 
 expert_data:
   policy: tdmpc2
@@ -24,24 +36,28 @@ hydra:
     dir: ${logdir}
 
 evaluation:
-  # Report both first-hit and sustained success using the same threshold for every family.
+  # Primary success: satisfy the goal on 90% of the final 20% of each episode.
   success_threshold: 0.8
+  maintenance_fraction: 0.2
+  maintenance_occupancy: 0.9
+  # Retained as a separate diagnostic and the existing reward-checkpoint tie breaker.
   sustained_success_steps: 5
   final:
     checkpoint: final.pt
     episodes: 50
     seed: 3000000
-    context_length: 64
-    horizons: [1, 5, 10, 25]
-    probe_train_windows: 128
-    probe_test_windows: 128
-    probe_batch_size: 8
-    probe_ridge: 0.001
-    probe_seed: 2000000
+    context_length: 64  # Same observed prefix for all models; no earlier episode history.
+    horizons: [1, 5, 10, 25, 50, 100]
+    state_windows: 128
+    motion_fraction: 0.5  # Remaining windows are uniform; both cohorts also receive separate scores.
+    motion_candidates: 8  # Choose the most active forecast segment among these starts in its held-out episode.
+    state_batch_size: 8
+    state_samples: 8  # Native latent samples, averaged after decoding physical state.
+    state_seed: 2000000
 
 replay:
-  # Length-64 families use batch 16; length-4 families override this to 256.
-  # Both configurations expose each optimizer update to 1,024 observations.
+  # Match 1,008 adjacent-state targets: 16 * 63 here, 336 * 3 for length-4 families.
+  # Dreamer additionally trains the initial state of each sampled sequence.
   batch_size: 16
   sequence_length: 64
   # Retain the most recent half of the 40,000 online agent transitions.

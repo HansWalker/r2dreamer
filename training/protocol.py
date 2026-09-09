@@ -11,6 +11,10 @@ from omegaconf import OmegaConf
 
 ROOT = Path(__file__).resolve().parents[1]
 IMPLEMENTATION_ENV = "DMC_IMPLEMENTATION_SHA256"
+# Bump these for incompatible payload/recipe changes or changed metric semantics, not source formatting.
+CHECKPOINT_SCHEMA = 2
+TRAINING_RECIPE_VERSION = 2
+EVALUATION_PROTOCOL = "dmc_evaluation_v8"
 
 
 def implementation_sha256():
@@ -115,6 +119,7 @@ def _training_config(config):
     for key in ("device", "storage_device"):
         data.get("replay", {}).pop(key, None)
     data.get("training", {}).get("expert", {}).pop("data_path", None)
+    data.get("jepa_model", {}).get("planner", {}).pop("gradient_batch_size", None)
 
     evaluation = data.get("evaluation", {})
     data["evaluation"] = {
@@ -137,6 +142,36 @@ def run_identity(config):
         "runtime_sha256": runtime_sha256(),
         "training_config_sha256": hashlib.sha256(encoded).hexdigest(),
     }
+
+
+def checkpoint_compatibility(config):
+    """Separate weight-loading settings from the recipe required to resume optimization."""
+    training = _training_config(config)
+    # Device placement is not a model or optimizer recipe, including resolved nested references.
+    pending = [training]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            node.pop("device", None)
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
+    for phase in training.get("training", {}).values():
+        for key in ("log_every", "save_every"):
+            phase.pop(key, None)
+    components = {
+        "dreamer": ("model",),
+        "storm": ("storm_model", "actor_critic"),
+        "tdmpc2": ("tdmpc2_model",),
+        "leworldmodel": ("jepa_model",),
+        "temporal_straightening": ("jepa_model",),
+    }[str(config.model_family)]
+    model = {key: training[key] for key in ("model_io", "state_head", *components)}
+    result = {"schema": CHECKPOINT_SCHEMA, "recipe_version": TRAINING_RECIPE_VERSION}
+    for name, settings in (("model", model), ("training", training)):
+        encoded = json.dumps(settings, sort_keys=True, separators=(",", ":")).encode()
+        result[f"{name}_sha256"] = hashlib.sha256(encoded).hexdigest()
+    return result
 
 
 def family_recipe_sha256(config):
@@ -166,6 +201,8 @@ def validate_training_recipe(config):
     train_episodes = int(config.expert_data.train_episodes)
     heldout_episodes = int(config.expert_data.heldout_episodes)
     image_size = tuple(map(int, config.env.size))
+    reward_discount = float(config.reward_discount)
+    require(0 < reward_discount < 1, "reward_discount must be between zero and one, exclusive")
     require(batch_size > 0, "replay.batch_size must be positive")
     require(sequence_length >= 2, "replay.sequence_length must contain at least two observations")
     require(int(config.replay.max_size) >= sequence_length, "replay.max_size must fit one training sequence")
@@ -181,10 +218,10 @@ def validate_training_recipe(config):
         train_episodes >= episodes_per_batch,
         "expert_data.train_episodes must fit one update's source episodes",
     )
-    require(heldout_episodes >= 2, "expert_data.heldout_episodes must support disjoint probe splits")
+    require(heldout_episodes > 0, "expert_data.heldout_episodes must contain at least one evaluation episode")
     require(len(image_size) == 2 and image_size[0] == image_size[1], "expert datasets require square images")
     require(str(config.expert_data.policy) == "tdmpc2", "expert_data.policy must be tdmpc2")
-    require(str(config.expert_data.policy_mode) == "mpc", "expert_data.policy_mode must be mpc")
+    require(str(config.expert_data.policy_mode) in {"actor", "mpc"}, "expert_data.policy_mode must be actor or mpc")
 
     expert = config.training.expert
     if bool(expert.enabled):
@@ -218,6 +255,7 @@ def validate_training_recipe(config):
         )
 
     if family == "dreamer":
+        require(float(config.model.gamma) == reward_discount, "Dreamer gamma must match reward_discount")
         imagine_batch = int(config.actor_critic.imagine_batch_size)
         require(int(config.model.imag_horizon) >= 1, "Dreamer imagination horizon must be positive")
         require(imagine_batch % batch_size == 0, "Dreamer imagination batch must divide evenly over replay batches")
@@ -226,6 +264,7 @@ def validate_training_recipe(config):
             "Dreamer needs at least two replay imagination starts per sampled sequence",
         )
     elif family == "storm":
+        require(float(config.actor_critic.gamma) == reward_discount, "STORM gamma must match reward_discount")
         settings = config.storm_train
         require(int(settings.imagine_context_length) >= 2, "STORM imagination context must be at least two")
         require(int(settings.imagine_horizon) >= 1, "STORM imagination horizon must be positive")
@@ -244,6 +283,7 @@ def validate_training_recipe(config):
                 "STORM Transformer max_length is shorter than a configured context",
             )
     elif family == "tdmpc2":
+        require(float(config.tdmpc2_model.gamma) == reward_discount, "TD-MPC2 gamma must match reward_discount")
         require(
             sequence_length == int(config.tdmpc2_model.horizon) + 1,
             "TD-MPC2 replay length must equal model horizon + 1",
@@ -267,6 +307,8 @@ def validate_training_recipe(config):
             "planner horizon and iterations must be positive",
         )
         require(int(planner.samples) > 0, "planner samples must be positive")
+        if str(planner.type) == "gradient":
+            require(int(planner.gradient_batch_size) > 0, "planner gradient_batch_size must be positive")
         if str(planner.type) == "cem":
             require(
                 2 <= int(planner.elites) <= int(planner.samples),
@@ -276,19 +318,37 @@ def validate_training_recipe(config):
         errors.append(f"unknown model family {family!r}")
 
     final = config.evaluation.final
+    head = config.state_head
+    history = int(config.jepa_model.history_size) if family in {"leworldmodel", "temporal_straightening"} else 1
+    available = int(config.replay.batch_size) * (int(config.replay.sequence_length) - max(1, history - 1))
+    require(0 < int(head.samples_per_update) <= available, "state-head sample budget exceeds available causal states")
+    require(int(head.projection_dim) > 0 and int(head.hidden_dim) > 0, "state-head dimensions must be positive")
+    require(float(head.lr) > 0 and float(head.grad_clip) > 0, "state-head optimizer settings must be positive")
+    require(head.fields == config.scenario.state_fields, "state-head target coordinates must match the scenario")
+    require(head.task == config.scenario.task, "state-head task must match the scenario")
+    require(set(config.model_io.observations) == {"image"}, "comparison models must receive images only")
     horizons = tuple(map(int, final.horizons))
     require(int(final.episodes) > 0, "final evaluation requires at least one episode")
-    require(int(final.context_length) > 0, "state-prediction context length must be positive")
+    require(int(final.context_length) >= history, "state-prediction context is shorter than the head's native history")
+    if family == "tdmpc2":
+        require(
+            int(final.context_length) >= int(config.tdmpc2_model.frame_stack),
+            "state-prediction context must contain TD-MPC2's complete frame stack",
+        )
     require(
         bool(horizons) and all(horizon > 0 for horizon in horizons),
         "state-prediction horizons must be nonempty and positive",
     )
     require(
-        int(final.probe_train_windows) > 0 and int(final.probe_test_windows) > 0 and int(final.probe_batch_size) > 0,
-        "state-prediction probe sizes must be positive",
+        int(final.state_windows) > 0 and int(final.state_batch_size) > 0 and int(final.state_samples) > 0,
+        "state-prediction evaluation sizes must be positive",
     )
+    require(0 <= float(final.motion_fraction) <= 1, "evaluation motion_fraction must be in [0, 1]")
+    require(int(final.motion_candidates) > 0, "evaluation motion_candidates must be positive")
     require(0 <= float(config.evaluation.success_threshold) <= 1, "success threshold must be in [0, 1]")
     require(int(config.evaluation.sustained_success_steps) > 0, "sustained success steps must be positive")
+    require(0 < float(config.evaluation.maintenance_fraction) <= 1, "maintenance fraction must be in (0, 1]")
+    require(0 < float(config.evaluation.maintenance_occupancy) <= 1, "maintenance occupancy must be in (0, 1]")
     if errors:
         raise ValueError("Invalid training recipe:\n- " + "\n- ".join(errors))
 
@@ -300,10 +360,12 @@ def comparison_signature(config):
     return {
         "protocol": str(config.experiment_protocol),
         "deterministic_run": bool(config.deterministic_run),
+        "reward_discount": float(config.reward_discount),
         "expert_enabled": bool(config.training.expert.enabled),
         "expert_updates": int(config.training.expert.updates),
         "expert_shuffle": bool(config.training.expert.shuffle),
-        "world_model_observations_per_update": batch_size * sequence_length,
+        # Match within-window transitions; Dreamer's additional initial-state target stays in its loss.
+        "adjacent_state_targets_per_update": batch_size * (sequence_length - 1),
         "source_episodes_per_update": int(config.replay.episodes_per_batch),
         "expert_policy": str(config.expert_data.policy),
         "expert_policy_mode": str(config.expert_data.policy_mode),
@@ -322,19 +384,23 @@ def comparison_signature(config):
         "online_eval_every": int(config.training.online.eval_every),
         "success_threshold": float(config.evaluation.success_threshold),
         "sustained_success_steps": int(config.evaluation.sustained_success_steps),
+        "maintenance_fraction": float(config.evaluation.maintenance_fraction),
+        "maintenance_occupancy": float(config.evaluation.maintenance_occupancy),
         "final_eval_episodes": int(config.evaluation.final.episodes),
         "final_eval_seed": int(config.evaluation.final.seed),
         "prediction_context": int(config.evaluation.final.context_length),
         "prediction_horizons": tuple(map(int, config.evaluation.final.horizons)),
-        "probe_train_windows": int(config.evaluation.final.probe_train_windows),
-        "probe_test_windows": int(config.evaluation.final.probe_test_windows),
-        "probe_batch_size": int(config.evaluation.final.probe_batch_size),
-        "probe_ridge": float(config.evaluation.final.probe_ridge),
-        "probe_seed": int(config.evaluation.final.probe_seed),
+        "state_windows": int(config.evaluation.final.state_windows),
+        "state_batch_size": int(config.evaluation.final.state_batch_size),
+        "state_samples": int(config.evaluation.final.state_samples),
+        "state_seed": int(config.evaluation.final.state_seed),
+        "motion_fraction": float(config.evaluation.final.motion_fraction),
+        "motion_candidates": int(config.evaluation.final.motion_candidates),
+        "state_head": {key: value for key, value in config.state_head.items() if key not in {"fields", "task"}},
     }
 
 
-def validate_checkpoint(checkpoint, config):
+def validate_checkpoint(checkpoint, config, *, training=True):
     expected = run_identity(config)
     if checkpoint.get("experiment_protocol") != expected["protocol"]:
         raise ValueError(
@@ -346,15 +412,33 @@ def validate_checkpoint(checkpoint, config):
     actual = checkpoint.get("run_identity")
     if actual is None:
         raise ValueError("Checkpoint has no run identity. Start a fresh run with the current experiment protocol.")
-    mismatches = [key for key, value in expected.items() if actual.get(key) != value]
+    keys = ("protocol", "model_family", "model_variant", "scenario", "task", "seed")
+    mismatches = [key for key in keys if actual.get(key) != expected[key]]
     if mismatches:
         details = ", ".join(f"{key}={actual.get(key)!r} (expected {expected[key]!r})" for key in mismatches)
         raise ValueError(f"Checkpoint belongs to a different experiment: {details}.")
-    return expected
+    compatibility = checkpoint.get("compatibility")
+    if compatibility is None:
+        # Older checkpoints have only a recipe hash. Keep that conservative check, but not a source-file lock.
+        if actual.get("training_config_sha256") != expected["training_config_sha256"]:
+            raise ValueError(
+                "Legacy checkpoint requires its original training settings; no compatibility metadata exists."
+            )
+    else:
+        required = ("schema", "model_sha256")
+        if training:
+            required += ("recipe_version", "training_sha256")
+        expected_compatibility = checkpoint_compatibility(config)
+        mismatches = [key for key in required if compatibility.get(key) != expected_compatibility[key]]
+        if mismatches:
+            purpose = "training" if training else "evaluation"
+            raise ValueError(f"Checkpoint is incompatible with {purpose}: {', '.join(mismatches)}.")
+    # Report the checkpoint's original provenance, never relabel it as trained with today's source.
+    return actual
 
 
-def training_complete(checkpoint, config):
-    validate_checkpoint(checkpoint, config)
+def training_complete(checkpoint, config, *, training=True):
+    validate_checkpoint(checkpoint, config, training=training)
     state = checkpoint.get("trainer_state", {})
     expert_complete = not bool(config.training.expert.enabled) or int(checkpoint.get("expert_updates", -1)) >= int(
         config.training.expert.updates
@@ -381,9 +465,13 @@ def completion_checkpoint(config):
 def evaluation_identity(config, state_prediction):
     settings = OmegaConf.to_container(config.evaluation.final, resolve=True)
     return {
-        "protocol": str(config.experiment_protocol),
+        "protocol": EVALUATION_PROTOCOL,
+        "runtime_sha256": runtime_sha256(),
         "success_threshold": float(config.evaluation.success_threshold),
         "sustained_success_steps": int(config.evaluation.sustained_success_steps),
+        "maintenance_fraction": float(config.evaluation.maintenance_fraction),
+        "maintenance_occupancy": float(config.evaluation.maintenance_occupancy),
         "settings": settings,
+        "storm_context_length": int(config.storm_train.context_length) if config.model_family == "storm" else None,
         "state_prediction": bool(state_prediction),
     }

@@ -5,10 +5,12 @@ import torch
 from buffer import Buffer
 from dmc_expert.replay import DMCExpertEpisodeReplay
 from models.dreamer import Dreamer
+from models.shared.physical_state import STATE_KEY
+from training.evaluation import EpisodeMetrics
 
-ExpertReplay = DMCExpertEpisodeReplay
-EXPERT_METRICS = {"loss": "opt/loss", "bc": "loss/bc"}
-ONLINE_METRICS = {"loss": "opt/loss"}
+build_replay = DMCExpertEpisodeReplay
+EXPERT_METRICS = {"loss": "opt/loss", "bc": "loss/bc", "state": "state/loss"}
+ONLINE_METRICS = {"loss": "opt/loss", "state": "state/loss"}
 
 
 def build_model(config):
@@ -18,7 +20,10 @@ def build_model(config):
 def checkpoint(model):
     return {
         "agent_state_dict": model.state_dict(),
-        "optims_state_dict": {"_optimizer": model._optimizer.state_dict()},
+        "optims_state_dict": {
+            "_optimizer": model._optimizer.state_dict(),
+            "state_head": model.state_head.optimizer.state_dict(),
+        },
         "agent_training_state": model.training_state_dict(),
     }
 
@@ -27,6 +32,7 @@ def load_checkpoint(model, payload, training=True):
     model.load_state_dict(payload["agent_state_dict"])
     if training:
         model._optimizer.load_state_dict(payload["optims_state_dict"]["_optimizer"])
+        model.state_head.optimizer.load_state_dict(payload["optims_state_dict"]["state_head"])
         model.load_training_state_dict(payload.get("agent_training_state"))
 
 
@@ -46,50 +52,23 @@ def evaluate(config, model, envs):
     try:
         done = torch.ones(envs.env_num, dtype=torch.bool, device=model.device)
         finished = torch.zeros_like(done)
-        steps = torch.zeros(envs.env_num, dtype=torch.int32, device=model.device)
-        returns = torch.zeros(envs.env_num, dtype=torch.float32, device=model.device)
-        successes = torch.zeros(envs.env_num, dtype=torch.bool, device=model.device)
-        sustained_successes = torch.zeros_like(successes)
-        success_streak = torch.zeros(envs.env_num, dtype=torch.int32, device=model.device)
-        success_threshold = float(config.evaluation.success_threshold)
-        sustained_steps = int(config.evaluation.sustained_success_steps)
-        action_repeat = int(config.env.action_repeat)
-        logged = {}
+        metrics = EpisodeMetrics(envs.env_num, model.device, config)
         state = model.get_initial_state(envs.env_num)
         action = state["prev_action"].clone()
 
         while not finished.all():
             stepped = ~done & ~finished
-            steps += stepped
             transition, reward, next_done = envs.step(action.detach(), reset_mask=done | finished)
             transition["reward"] = reward
             transition = transition.to(model.device, non_blocking=True)
             done = next_done.to(model.device)
-            action, state = model.act(transition, state, eval=True)
+            action, state = model.act(transition.exclude(STATE_KEY), state, eval=True)
             if not torch.isfinite(action).all():
                 raise RuntimeError("Evaluation policy produced a non-finite action.")
-            active = ~finished
-            returns += transition["reward"][:, 0] * active
-            qualifies = (transition["reward"][:, 0] / action_repeat >= success_threshold) & stepped
-            successes |= qualifies
-            success_streak = torch.where(qualifies, success_streak + 1, torch.where(stepped, 0, success_streak))
-            sustained_successes |= success_streak >= sustained_steps
-            for key, value in transition.items():
-                if key.startswith("log_"):
-                    logged.setdefault(key[4:], torch.zeros_like(returns))
-                    logged[key[4:]] += value[:, 0] * active
+            metrics.update(transition["reward"], stepped)
             finished |= done
 
-        return_std = returns.std(unbiased=returns.numel() > 1)
-        logged["success"] = successes.float()
-        logged["sustained_success"] = sustained_successes.float()
-        logged["return_std"] = return_std
-        logged["return_stderr"] = return_std / returns.numel() ** 0.5
-        return (
-            float(returns.mean()),
-            float(steps.float().mean()),
-            {name: value.mean() for name, value in logged.items()},
-        )
+        return metrics.result()
     finally:
         model.train(was_training)
 
@@ -111,12 +90,6 @@ class OnlineSession:
         self.action = self.agent_state["prev_action"].clone()
 
     def collect(self):
-        episodes = []
-        for index, done in enumerate(self.done):
-            if done and self.lengths[index] > 0:
-                episodes.append((self.returns[index], self.lengths[index]))
-                self.returns[index] = self.lengths[index] = 0
-
         step_delta = int((~self.done).sum()) * self.action_repeat
         self.lengths += ~self.done
         transition, reward, next_done = self.envs.step(self.action.detach(), reset_mask=self.done)
@@ -124,10 +97,15 @@ class OnlineSession:
         replay_transition = transition
         transition = transition.to(self.model.device, non_blocking=True)
         self.done = next_done.to(self.model.device)
-        self.action, self.agent_state = self.model.act(transition.clone(), self.agent_state, eval=False)
+        self.action, self.agent_state = self.model.act(transition.exclude(STATE_KEY), self.agent_state, eval=False)
         replay_transition["action"] = (self.action * ~self.done.unsqueeze(-1)).to(replay_transition.device)
         self.replay.add_transition(replay_transition)
         self.returns += transition["reward"][:, 0]
+        episodes = []
+        for index, done in enumerate(self.done):
+            if done:
+                episodes.append((self.returns[index].item(), self.lengths[index].item()))
+                self.returns[index] = self.lengths[index] = 0
         return step_delta, episodes
 
     def update(self, update_count):

@@ -186,15 +186,7 @@ class ConvDecoder(nn.Module):
         self.apply(weight_init_)
 
     def forward(self, stoch, deter):
-        """Decode latent states into images.
-
-        Notes
-        -----
-        The decoder first constructs a low-resolution spatial feature map from
-        the deterministic state (block-linear projection) and from the stochastic
-        state (MLP projection), concats them, then upsamples back to the target
-        resolution.
-        """
+        """Add deterministic and stochastic spatial projections, then upsample to RGB."""
         # (B, T, S, K), (B, T, D)
         B_T = deter.shape[:-1]
         # (B*T, D), (B*T, S*K)
@@ -230,7 +222,7 @@ class ConvDecoder(nn.Module):
 
 
 class ReturnEMA(nn.Module):
-    """running mean and std"""
+    """Exponential moving average of the 5th and 95th return percentiles."""
 
     def __init__(self, device, alpha=1e-2):
         super().__init__()

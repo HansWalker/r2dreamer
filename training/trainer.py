@@ -9,12 +9,14 @@ from types import ModuleType
 from typing import Any
 
 import torch
+from omegaconf import OmegaConf
 
 import tools
 from dmc_expert.storage import dataset_identity
 from envs import close_envs, make_envs, make_eval_envs
 from training import load_model_family
 from training.protocol import (
+    checkpoint_compatibility,
     dynamics_targets_per_update,
     freeze_implementation,
     model_variant,
@@ -54,6 +56,7 @@ class TrainingRun:
     family: ModuleType
     model: torch.nn.Module
     dataset_identity: dict | None = None
+    resumed_from: dict | None = None
 
 
 def save_checkpoint(run, path, phase, state, replay_state=None, expert_updates=0):
@@ -64,6 +67,9 @@ def save_checkpoint(run, path, phase, state, replay_state=None, expert_updates=0
         "training_seed": int(run.config.seed),
         "checkpoint_id": uuid.uuid4().hex,
         "run_identity": run_identity(run.config),
+        "compatibility": checkpoint_compatibility(run.config),
+        "training_config": OmegaConf.to_container(run.config, resolve=True),
+        "resumed_from": run.resumed_from,
         "dataset_identity": run.dataset_identity,
         "rng_state": tools.get_rng_state(),
         "trainer_state": asdict(state),
@@ -180,6 +186,7 @@ def pretrain(run, replay, checkpoint=None):
                 detail = " | ".join(
                     f"{label}={tools.format_scalar(metrics.get(key), 2)}"
                     for label, key in run.family.EXPERT_METRICS.items()
+                    if key in metrics
                 )
                 scalars = {f"train/{name}": value for name, value in metrics.items()}
                 scalars.update({
@@ -340,6 +347,7 @@ def train_online(run, session, checkpoint=None, expert_updates=0):
             detail = " | ".join(
                 f"{label}={tools.format_scalar(metrics.get(key), 2)}"
                 for label, key in run.family.ONLINE_METRICS.items()
+                if key in metrics
             )
             scalars = {f"train/{name}": value for name, value in metrics.items()}
             scalars.update({
@@ -398,6 +406,10 @@ def train(config, logger, logdir, checkpoint_path=None):
         if checkpoint.get("phase") not in {"expert", "online"}:
             raise ValueError("Checkpoint does not contain a supported training phase.")
         validate_checkpoint(checkpoint, config)
+        run.resumed_from = {
+            "checkpoint_id": checkpoint["checkpoint_id"],
+            "run_identity": checkpoint["run_identity"],
+        }
         run.dataset_identity = checkpoint.get("dataset_identity")
         run.family.load_checkpoint(run.model, checkpoint, training=True)
         tools.set_rng_state(checkpoint.get("rng_state"))
@@ -405,14 +417,12 @@ def train(config, logger, logdir, checkpoint_path=None):
         print(f"Checkpoint | loaded={checkpoint_path} | phase={checkpoint['phase']} | expert_updates={expert_updates}")
 
     if bool(config.training.expert.enabled) and (checkpoint is None or checkpoint["phase"] == "expert"):
-        with run.family.ExpertReplay(config) as replay:
-            replay.validate_model_io(config.model_io)
+        with run.family.build_replay(config) as replay:
             current_dataset = dataset_identity(replay.metadata)
             if run.dataset_identity is not None and run.dataset_identity != current_dataset:
                 raise ValueError("Expert dataset does not match the dataset recorded in the checkpoint.")
             run.dataset_identity = current_dataset
-            if hasattr(run.family, "configure_expert_replay"):
-                run.family.configure_expert_replay(run.model, replay)
+            run.model.state_head.set_stats(replay.state_mean, replay.state_std)
             print(f"Data | expert={replay.path} | episodes={replay.num_episodes}")
             expert_updates = pretrain(run, replay, checkpoint)
     elif not bool(config.training.expert.enabled):

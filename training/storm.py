@@ -7,10 +7,11 @@ import torch
 from buffer import SequenceBuffer
 from dmc_expert.replay import DMCExpertSequenceReplay
 from models.storm import StormModel
+from training.evaluation import EpisodeMetrics
 
-ExpertReplay = DMCExpertSequenceReplay
-EXPERT_METRICS = {"wm": "wm/loss", "bc": "expert/bc", "value": "expert/value"}
-ONLINE_METRICS = {"wm": "wm/loss", "ac": "ac/loss"}
+build_replay = DMCExpertSequenceReplay
+EXPERT_METRICS = {"wm": "wm/loss", "bc": "expert/bc", "value": "expert/value", "state": "state/loss"}
+ONLINE_METRICS = {"wm": "wm/loss", "ac": "ac/loss", "state": "state/loss"}
 
 
 def build_model(config):
@@ -24,6 +25,7 @@ def checkpoint(model):
         "world_model": world_model.state_dict(),
         "actor_critic": agent.state_dict(),
         "wm_optimizer": world_model.optimizer.state_dict(),
+        "state_optimizer": model.state_head.optimizer.state_dict(),
         "ac_optimizer": agent.optimizer.state_dict(),
         "wm_scaler": world_model.scaler.state_dict(),
         "ac_scaler": agent.scaler.state_dict(),
@@ -38,6 +40,7 @@ def load_checkpoint(model, payload, training=True):
     agent.load_state_dict(payload["actor_critic"])
     if training:
         world_model.optimizer.load_state_dict(payload["wm_optimizer"])
+        model.state_head.optimizer.load_state_dict(payload["state_optimizer"])
         agent.optimizer.load_state_dict(payload["ac_optimizer"])
         if "wm_scaler" in payload:
             world_model.scaler.load_state_dict(payload["wm_scaler"])
@@ -52,47 +55,17 @@ def expert_update(model, batch):
     contexts = None
     if len(batch) == 2:
         contexts, batch = batch
-    obs, action, reward, terminal, returns = batch
+    obs, action, reward, terminal = batch
     wm_metrics, state, _ = world_model.update(obs, action, reward, terminal, contexts)
     feature = world_model.next_policy_features(state)
-    ac_metrics = agent.update_expert(
+    ac_metrics = agent.update(
         feature,
         action[:, 1:].to(agent.device),
-        returns[:, 1:].to(agent.device),
+        reward[:, 1:].to(agent.device),
+        terminal[:, 1:].to(agent.device),
+        expert=True,
     )
     return {**wm_metrics, **ac_metrics}
-
-
-@torch.no_grad()
-def act_from_context(model, context_obs, context_action, deterministic=False):
-    world_model = model.world_model
-    agent = model.actor_critic
-    world_model.eval()
-    agent.eval()
-    action = torch.zeros(len(context_action), agent.action_dim, device=world_model.device)
-    groups = {}
-    for index, history in enumerate(context_action):
-        groups.setdefault(len(history), []).append(index)
-
-    for length, indices in groups.items():
-        index = torch.as_tensor(indices, device=world_model.device)
-        if not length:
-            if not deterministic:
-                action[index] = torch.empty(len(indices), agent.action_dim, device=world_model.device).uniform_(-1, 1)
-            continue
-        obs_batch = {
-            key: torch.cat(
-                [torch.cat([item[key] for item in context_obs[i]], dim=1) for i in indices],
-                dim=0,
-            ).to(world_model.device)
-            for key in context_obs[indices[0]][0]
-        }
-        action_batch = torch.cat([torch.cat(list(context_action[i]), dim=1) for i in indices], dim=0).to(
-            world_model.device
-        )
-        feature = world_model.context_feature(obs_batch, action_batch)
-        action[index], _ = agent.sample(feature, deterministic=deterministic)
-    return action
 
 
 class StormPolicyContext:
@@ -117,19 +90,41 @@ class StormPolicyContext:
         agent = self.model.actor_critic
         world_model.eval()
         agent.eval()
-        if not self.streaming:
-            return act_from_context(self.model, self.obs, self.action, deterministic=deterministic)
-
         action = torch.zeros(self.batch_size, agent.action_dim, device=world_model.device)
+        if not self.streaming:
+            groups = {}
+            for index, history in enumerate(self.action):
+                groups.setdefault(len(history), []).append(index)
+
+            for length, indices in groups.items():
+                index = torch.as_tensor(indices, device=world_model.device)
+                if not length:
+                    if not deterministic:
+                        action[index] = torch.empty_like(action[index]).uniform_(-1, 1)
+                    continue
+                obs_batch = {
+                    key: torch.cat([torch.cat([item[key] for item in self.obs[i]], dim=1) for i in indices], dim=0).to(
+                        world_model.device
+                    )
+                    for key in self.obs[indices[0]][0]
+                }
+                action_batch = torch.cat([torch.cat(list(self.action[i]), dim=1) for i in indices], dim=0).to(
+                    world_model.device
+                )
+                feature = world_model.context_feature(obs_batch, action_batch)
+                action[index], _ = agent.sample(feature, deterministic=deterministic)
+            return action
+
         if self.ready.any():
             index = self.ready.nonzero(as_tuple=False).flatten()
             action[index], _ = agent.sample(self.feature[index], deterministic=deterministic)
         if not deterministic and (~self.ready).any():
-            action[~self.ready].uniform_(-1, 1)
+            action[~self.ready] = torch.empty_like(action[~self.ready]).uniform_(-1, 1)
         return action
 
     @torch.no_grad()
     def advance(self, obs, action, active=None, reset=None):
+        obs = {"image": obs["image"]}
         device = self.model.world_model.device
         active = torch.ones(self.batch_size, dtype=torch.bool, device=device) if active is None else active.to(device)
         reset = torch.zeros_like(active) if reset is None else reset.to(device)
@@ -160,14 +155,7 @@ def evaluate(config, model, envs):
     try:
         obs = envs.reset().to(world_model.device, non_blocking=True)
         finished = torch.zeros(envs.env_num, dtype=torch.bool, device=world_model.device)
-        returns = torch.zeros(envs.env_num, dtype=torch.float32, device=world_model.device)
-        lengths = torch.zeros(envs.env_num, dtype=torch.int32, device=world_model.device)
-        successes = torch.zeros(envs.env_num, dtype=torch.bool, device=world_model.device)
-        sustained_successes = torch.zeros_like(successes)
-        success_streak = torch.zeros(envs.env_num, dtype=torch.int32, device=world_model.device)
-        success_threshold = float(config.evaluation.success_threshold)
-        sustained_steps = int(config.evaluation.sustained_success_steps)
-        action_repeat = int(config.env.action_repeat)
+        metrics = EpisodeMetrics(envs.env_num, world_model.device, config)
         policy = StormPolicyContext(model, envs.env_num, config.storm_train.context_length)
 
         while not finished.all():
@@ -178,30 +166,14 @@ def evaluate(config, model, envs):
             reward = reward.to(world_model.device, non_blocking=True)
             model_done = done.to(world_model.device, non_blocking=True)
             active = ~finished
-            returns += reward[:, 0] * active
-            lengths += active
-            qualifies = (reward[:, 0] / action_repeat >= success_threshold) & active
-            successes |= qualifies
-            success_streak = torch.where(qualifies, success_streak + 1, torch.where(active, 0, success_streak))
-            sustained_successes |= success_streak >= sustained_steps
+            metrics.update(reward, active)
             policy.advance(obs, action, active=active, reset=model_done)
             finished |= model_done
             obs = (envs.reset_done(next_obs, done) if done.any() else next_obs).to(
                 world_model.device, non_blocking=True
             )
 
-        return_std = returns.std(unbiased=returns.numel() > 1)
-        success = successes.float().mean()
-        return (
-            float(returns.mean()),
-            float(lengths.float().mean()),
-            {
-                "success": success,
-                "sustained_success": sustained_successes.float().mean(),
-                "return_std": return_std,
-                "return_stderr": return_std / returns.numel() ** 0.5,
-            },
-        )
+        return metrics.result()
     finally:
         world_model.train(wm_training)
         agent.train(agent_training)
@@ -240,7 +212,7 @@ class OnlineSession:
         if model_done.any():
             for index, flag in enumerate(model_done):
                 if flag:
-                    episodes.append((self.returns[index], self.lengths[index]))
+                    episodes.append((self.returns[index].item(), self.lengths[index].item()))
                     self.returns[index] = self.lengths[index] = 0
             self.obs = self.envs.reset_done(next_obs, done).to(self.model.world_model.device, non_blocking=True)
         else:
@@ -249,37 +221,34 @@ class OnlineSession:
 
     def update(self, update_count):
         world_model = self.model.world_model
+        agent = self.model.actor_critic
+        settings = self.settings
         metrics = {}
         for _ in range(update_count):
             sample = self.replay.sample(with_context=world_model.streaming)
             contexts, batch = sample if world_model.streaming else (None, sample)
             wm_metrics, _, _ = world_model.update(*batch, contexts=contexts)
             metrics.update(wm_metrics)
-            metrics.update(self._update_actor_critic())
-        return metrics
 
-    def _update_actor_critic(self):
-        settings = self.settings
-        world_model = self.model.world_model
-        agent = self.model.actor_critic
-        sample = self.replay.sample(
-            batch_size=int(settings.imagine_batch_size),
-            sequence_length=int(settings.imagine_context_length),
-            with_context=world_model.streaming,
-        )
-        contexts, batch = sample if world_model.streaming else (None, sample)
-        obs, action, _, _ = batch
-        world_model.eval()
-        imagined = world_model.imagine(
-            agent,
-            {key: value.to(world_model.device, non_blocking=True) for key, value in obs.items()},
-            action.to(world_model.device, non_blocking=True),
-            horizon=int(settings.imagine_horizon),
-            cache=world_model.replay_cache(contexts),
-        )
-        return agent.update(
-            imagined["feat"],
-            imagined["action"],
-            reward=imagined["reward"],
-            termination=imagined["terminal"],
-        )
+            sample = self.replay.sample(
+                batch_size=int(settings.imagine_batch_size),
+                sequence_length=int(settings.imagine_context_length),
+                with_context=world_model.streaming,
+            )
+            contexts, batch = sample if world_model.streaming else (None, sample)
+            obs, action, _, _ = batch
+            world_model.eval()
+            imagined = world_model.imagine(
+                agent,
+                {key: value.to(world_model.device, non_blocking=True) for key, value in obs.items()},
+                action.to(world_model.device, non_blocking=True),
+                horizon=int(settings.imagine_horizon),
+                cache=world_model.replay_cache(contexts),
+            )
+            metrics.update(agent.update(
+                imagined["feat"],
+                imagined["action"],
+                reward=imagined["reward"],
+                termination=imagined["terminal"],
+            ))
+        return metrics

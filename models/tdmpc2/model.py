@@ -10,16 +10,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from models.shared.distributions import symexp, symlog
+from models.shared.physical_state import STATE_KEY, PhysicalStateHead
 from models.shared.utils import parse_model_io
 from models.shared.vision import channel_first, image_spec
-
-
-def symlog(value):
-    return torch.sign(value) * torch.log1p(value.abs())
-
-
-def symexp(value):
-    return torch.sign(value) * torch.expm1(value.abs())
 
 
 class SimNorm(nn.Module):
@@ -196,6 +190,7 @@ class TDMPC2(nn.Module):
             lr=float(settings.lr),
         )
         self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=float(settings.lr), eps=1e-5)
+        self.state_head = PhysicalStateHead(self.latent_dim, config.state_head)
 
     @property
     def device(self):
@@ -210,11 +205,13 @@ class TDMPC2(nn.Module):
         return {
             "model": self.model_optimizer.state_dict(),
             "policy": self.policy_optimizer.state_dict(),
+            "state_head": self.state_head.optimizer.state_dict(),
         }
 
     def load_optimizer_state_dict(self, state):
         self.model_optimizer.load_state_dict(state["model"])
         self.policy_optimizer.load_state_dict(state["policy"])
+        self.state_head.optimizer.load_state_dict(state["state_head"])
 
     def stack_sequence(self, observation):
         """Convert raw RGB sequences to TD-MPC2's causal frame-stack representation."""
@@ -309,7 +306,7 @@ class TDMPC2(nn.Module):
             policy_loss = -(objective.mean(dim=(0, 2)) * weight).mean()
             self.policy_optimizer.zero_grad(set_to_none=True)
             policy_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip)
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip, error_if_nonfinite=True)
             self.policy_optimizer.step()
             return policy_loss.detach(), info["entropy"].mean().detach()
         finally:
@@ -318,6 +315,7 @@ class TDMPC2(nn.Module):
     def update(self, batch):
         obs, action, reward, terminal, *_ = batch
         obs = {key: value.to(self.device, non_blocking=True) for key, value in obs.items()}
+        labels = obs.pop(STATE_KEY)
         action = action.to(self.device, non_blocking=True)
         reward = reward.to(self.device, non_blocking=True)
         terminal = terminal.to(self.device, non_blocking=True)
@@ -349,6 +347,7 @@ class TDMPC2(nn.Module):
         grad_norm = torch.nn.utils.clip_grad_norm_(
             [*self.encoder.parameters(), *self.dynamics.parameters(), *self.reward.parameters(), *self.qs.parameters()],
             self.grad_clip,
+            error_if_nonfinite=True,
         )
         self.model_optimizer.step()
         policy_loss, entropy = self._update_policy(rollout.detach())
@@ -356,7 +355,9 @@ class TDMPC2(nn.Module):
             for target_parameter, parameter in zip(self.target_qs.parameters(), self.qs.parameters(), strict=True):
                 target_parameter.lerp_(parameter, self.tau)
 
+        state_metrics = self.state_head.fit(torch.cat((rollout[:, :1].detach(), next_latent), dim=1), labels)
         return {
+            **state_metrics,
             "loss": float(loss.detach()),
             "consistency_loss": float(consistency_loss.detach()),
             "reward_loss": float(reward_loss.detach()),

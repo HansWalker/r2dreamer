@@ -24,6 +24,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 from dmc_expert.storage import dataset_identity, validate_dataset
+from models.shared.physical_state import PhysicalStateTargets
 from training.protocol import (
     comparison_signature,
     completion_checkpoint,
@@ -49,6 +50,7 @@ CONSOLE_PREFIXES = (
     "Online |",
     "Evaluation |",
     "Result |",
+    "Prediction |",
     "Output |",
 )
 
@@ -85,6 +87,7 @@ def build_runs(config, scenario_name, scenario):
         for variant, model in variants.items():
             entry = {"config": model, "overrides": []} if isinstance(model, str) else model
             for seed in config["seeds"]:
+                logdir = output_dir / scenario_name / family / variant / f"seed_{seed}"
                 runs.append(
                     ExperimentRun(
                         name=f"{scenario_name}/{family}/{variant}/seed_{seed}",
@@ -93,24 +96,19 @@ def build_runs(config, scenario_name, scenario):
                         variant=str(variant),
                         dataset=scenario["dataset"],
                         config=entry["config"],
-                        overrides=tuple(entry.get("overrides", [])),
+                        overrides=(
+                            f"scenario={scenario_name}",
+                            f"seed={seed}",
+                            f"device={config['device']}",
+                            f"logdir={logdir}",
+                            *config["training"].get("overrides", []),
+                            *entry.get("overrides", []),
+                        ),
                         seed=int(seed),
-                        logdir=output_dir / scenario_name / family / variant / f"seed_{seed}",
+                        logdir=logdir,
                     )
                 )
     return runs
-
-
-def compose_run_config(config, run):
-    overrides = (*config["training"].get("overrides", []), *run.overrides)
-    run_overrides = (
-        f"scenario={run.scenario}",
-        f"seed={run.seed}",
-        f"device={config['device']}",
-        f"logdir={run.logdir}",
-        *overrides,
-    )
-    return load_config(run.config, run_overrides), overrides, run_overrides
 
 
 def validate_matrix(config, scenario_runs, stages):
@@ -131,7 +129,7 @@ def validate_matrix(config, scenario_runs, stages):
         if not runs:
             raise ValueError(f"The experiment matrix contains no model runs for {scenario}.")
         for run in runs:
-            run_config, _, _ = compose_run_config(config, run)
+            run_config = load_config(run.config, run.overrides)
             validate_training_recipe(run_config)
             if str(run_config.model_family) != run.family:
                 raise ValueError(f"Matrix entry {run.name} loads model_family={run_config.model_family!s}.")
@@ -202,7 +200,6 @@ def validate_matrix(config, scenario_runs, stages):
         image_size = tuple(map(int, run_config.env.size))
         checks = (
             (task in collection.tasks, f"collection config does not include {task}"),
-            (first_run.dataset == str(run_config.scenario.dataset), "matrix and model dataset names differ"),
             (str(run_config.scenario.dataset) == task.replace("/", "_"), "scenario dataset name does not match task"),
             (image_size == (int(collection.image_size),) * 2, "collection and model image sizes differ"),
             (int(collection.action_repeat) == int(run_config.env.action_repeat), "collection action repeat differs"),
@@ -210,10 +207,6 @@ def validate_matrix(config, scenario_runs, stages):
                 int(collection.max_episode_steps)
                 == int(run_config.env.time_limit) // int(run_config.env.action_repeat),
                 "collection and online episode lengths differ",
-            ),
-            (
-                resolve_path(run_config.env.dataset_root) == expected_root,
-                "training and evaluation dataset roots differ",
             ),
             (
                 int(collection.episodes.train) == int(run_config.expert_data.train_episodes),
@@ -376,8 +369,11 @@ def current_evaluation(output, spec, config, dataset_path, expected_dataset, che
     try:
         result = json.loads(output.read_text(encoding="utf-8"))
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        identity = validate_checkpoint(checkpoint, config)
-        if checkpoint_path.name == completion_checkpoint(config) and not training_complete(checkpoint, config):
+        identity = validate_checkpoint(checkpoint, config, training=False)
+        training_config = OmegaConf.create(checkpoint["training_config"]) if "training_config" in checkpoint else config
+        if checkpoint_path.name == completion_checkpoint(training_config) and not training_complete(
+            checkpoint, training_config, training=False
+        ):
             return False
         prediction_expected = bool(spec.get("state_prediction", True))
         metrics = (
@@ -387,7 +383,49 @@ def current_evaluation(output, spec, config, dataset_path, expected_dataset, che
         )
         prediction = result.get("physical_state_prediction")
         if prediction_expected:
-            metrics += (None if prediction is None else prediction.get("mean_nrmse"),)
+            if (
+                not prediction
+                or prediction.get("evaluation_fitting") is not False
+                or prediction.get("readout_updates", 0) < 1
+                or prediction.get("rollout") != "open_loop_recorded_actions"
+                or prediction.get("history_policy") != "common_prefix_native_memory"
+                or prediction.get("context_length") != int(config.evaluation.final.context_length)
+                or len(prediction.get("windows", [])) != int(config.evaluation.final.state_windows)
+            ):
+                return False
+            targets = PhysicalStateTargets(config.state_head.task, config.state_head.fields)
+            train_end = int(config.expert_data.train_episodes)
+            heldout_end = train_end + int(config.expert_data.heldout_episodes)
+            if any(
+                not train_end <= window["episode"] < heldout_end
+                or window["start"] < 0
+                or window["forecast_start"] - window["start"] != int(config.evaluation.final.context_length)
+                for window in prediction["windows"]
+            ):
+                return False
+            if (
+                prediction.get("target_version") != config.state_head.target_version
+                or prediction["state_coordinates"] != targets.coordinates
+                or prediction["derived_coordinates"] != targets.derived_coordinates
+                or len(targets.coordinates) != prediction["physical_state_dim"]
+            ):
+                return False
+            for name in (
+                "rmse", "observed_rmse", "persistence_rmse",
+                "derived_rmse", "derived_observed_rmse", "derived_persistence_rmse",
+            ):
+                metric = prediction[name]
+                coordinates = targets.derived_coordinates if name.startswith("derived_") else targets.coordinates
+                if set(metric) != {str(horizon) for horizon in config.evaluation.final.horizons}:
+                    return False
+                for errors in metric.values():
+                    if set(errors) != set(coordinates):
+                        return False
+                    if not all(
+                        value is not None and math.isfinite(float(value)) and float(value) >= 0
+                        for value in errors.values()
+                    ):
+                        return False
         return all((
             result.get("run_identity") == identity,
             result.get("evaluation_identity") == evaluation_identity(config, prediction_expected),
@@ -405,7 +443,8 @@ def current_evaluation(output, spec, config, dataset_path, expected_dataset, che
         return False
 
 
-def run_models(config, runs, stages, dataset_identities, *, dry_run=False):
+def run_models(config, runs, resolved, dataset_identities, *, dry_run=False):
+    stages = config["stages"]
     training = config["training"]
     device = config["device"]
     resume = bool(training.get("resume", False))
@@ -415,7 +454,7 @@ def run_models(config, runs, stages, dataset_identities, *, dry_run=False):
     evaluation_specs = tuple(evaluation.get("checkpoints", ()))
     for index, run in enumerate(runs, 1):
         run_label = f"{index}/{len(runs)} | {run.name}"
-        run_config, overrides, run_overrides = compose_run_config(config, run)
+        run_config = resolved[run.name]
         completed_checkpoint = run.logdir / completion_checkpoint(run_config)
         dataset_path = None if dataset_root is None else dataset_root / run.dataset
         reset = bool(stages["train"] and overwrite and run.logdir.exists())
@@ -463,7 +502,7 @@ def run_models(config, runs, stages, dataset_identities, *, dry_run=False):
                     "train.py",
                     "--config-name",
                     run.config,
-                    *run_overrides,
+                    *run.overrides,
                     *resume_override,
                 ],
                 run.logdir / "stdout.log",
@@ -513,7 +552,7 @@ def run_models(config, runs, stages, dataset_identities, *, dry_run=False):
                     "--output",
                     output,
                 ]
-                for override in (f"seed={run.seed}", *overrides):
+                for override in run.overrides:
                     command.extend(("--override", override))
                 if not bool(spec.get("state_prediction", True)):
                     command.append("--skip-state-prediction")
@@ -556,7 +595,7 @@ def main():
         dataset_identities = {} if args.dry_run else validate_datasets(config, scenario_runs, resolved)
         for index, scenario_name in enumerate(scenarios, 1):
             print(f"\nScenario {index}/{len(scenarios)} | {scenario_name} | runs={runs_per_scenario}", flush=True)
-            run_models(config, scenario_runs[scenario_name], stages, dataset_identities, dry_run=args.dry_run)
+            run_models(config, scenario_runs[scenario_name], resolved, dataset_identities, dry_run=args.dry_run)
     elapsed = timedelta(seconds=round(time.perf_counter() - started))
     print(f"\nCOMPLETE | runs={len(scenarios) * runs_per_scenario} | elapsed={elapsed}")
 

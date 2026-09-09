@@ -10,4 +10,5 @@ training:
     enabled: true
 
 model:
+  state_head: ${state_head}
   hidden: 713

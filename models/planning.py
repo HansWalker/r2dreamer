@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from models.shared.physical_state import STATE_KEY, PhysicalStateHead
 from models.shared.utils import parse_model_io
 
 
@@ -20,10 +21,8 @@ class LatentPlanner(nn.Module):
         encoder,
         action_encoder,
         *,
-        goal_readout,
         projector=None,
         pred_projector=None,
-        decoder=None,
     ):
         super().__init__()
         settings = config.jepa_model
@@ -45,7 +44,6 @@ class LatentPlanner(nn.Module):
         if self.goal_geometry == "box" and tolerance.numel() != 2:
             raise ValueError("Box goal geometry requires one tolerance per relation coordinate.")
         self.register_buffer("goal_tolerance", tolerance)
-        self.goal_relation_weight = float(goal.relation_weight)
         self.goal_stable_steps = int(goal.stable_steps)
         self.goal_action_weight = float(goal.action_weight)
         if not 1 <= self.goal_stable_steps <= int(self.planner.horizon):
@@ -54,10 +52,12 @@ class LatentPlanner(nn.Module):
         self.encoder = encoder
         self.action_encoder = action_encoder
         self.predictor = predictor
-        self.goal_readout = goal_readout
+        self.state_head = PhysicalStateHead(
+            encoder.out_dim, config.state_head, history=self.history_size, tokens=getattr(encoder, "num_tokens", 1)
+        )
         self.projector = projector or nn.Identity()
         self.pred_projector = pred_projector or nn.Identity()
-        self.decoder = decoder
+        self.decoder = None
         self._cem_mean = None
         self._gradient_actions = None
 
@@ -71,9 +71,6 @@ class LatentPlanner(nn.Module):
     def predict(self, state, action):
         return self.pred_projector(self.predictor(state, self.action_encoder(action)))
 
-    def pool(self, latent):
-        return self.encoder.pool(latent)
-
     @staticmethod
     def replay_observation(history):
         return {key: value[:, -1] for key, value in history.items()}
@@ -82,49 +79,45 @@ class LatentPlanner(nn.Module):
         raise NotImplementedError
 
     def optimizer_state_dict(self):
-        return {name: optimizer.state_dict() for name, optimizer in self.optimizers.items()}
+        return {
+            **{name: optimizer.state_dict() for name, optimizer in self.optimizers.items()},
+            "state_head": self.state_head.optimizer.state_dict(),
+        }
 
     def load_optimizer_state_dict(self, state):
         for name, optimizer in self.optimizers.items():
             optimizer.load_state_dict(state[name])
+        self.state_head.optimizer.load_state_dict(state["state_head"])
 
     def update(self, batch):
         obs, action, *_ = batch
         obs = {key: value.to(self.device, non_blocking=True) for key, value in obs.items()}
+        labels = obs.pop(STATE_KEY)
         action = action.to(self.device, non_blocking=True)
         latent = self.encode(obs)
         loss, metrics = self.representation_loss(obs, latent, action)
-        relation = batch[4] if len(batch) > 4 else None
-        if relation is not None:
-            target = relation.to(self.device, non_blocking=True) / self.goal_tolerance
-            prediction = self.goal_readout(latent.detach())
-            if prediction.shape != target.shape:
-                raise ValueError(f"Goal readout has shape {prediction.shape}, expected {target.shape}.")
-            relation_loss = F.mse_loss(prediction, target)
-            loss = loss + self.goal_relation_weight * relation_loss
-            metrics["goal_relation_loss"] = relation_loss
-
         for optimizer in self.optimizers.values():
             optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        goal_parameters = list(self.goal_readout.parameters())
-        goal_ids = {id(parameter) for parameter in goal_parameters}
-        model_parameters = [parameter for parameter in self.parameters() if id(parameter) not in goal_ids]
-        grad_norm = torch.nn.utils.clip_grad_norm_(model_parameters, self.grad_clip)
-        goal_grad_norm = torch.nn.utils.clip_grad_norm_(goal_parameters, self.grad_clip)
+        decoder_parameters = list(self.decoder.parameters()) if self.decoder is not None else []
+        readout_ids = {id(parameter) for parameter in [*self.state_head.parameters(), *decoder_parameters]}
+        model_parameters = [parameter for parameter in self.parameters() if id(parameter) not in readout_ids]
+        grad_norm = torch.nn.utils.clip_grad_norm_(model_parameters, self.grad_clip, error_if_nonfinite=True)
+        # Detached visualization losses must not rescale the representation gradients.
+        if decoder_parameters:
+            torch.nn.utils.clip_grad_norm_(decoder_parameters, self.grad_clip, error_if_nonfinite=True)
         for optimizer in self.optimizers.values():
             optimizer.step()
 
-        output = {
+        return {
             "loss": float(loss.detach()),
             "grad_norm": float(grad_norm),
             **{name: float(value.detach()) for name, value in metrics.items()},
+            **self.state_head.fit(latent, labels),
         }
-        if relation is not None:
-            output["goal_grad_norm"] = float(goal_grad_norm)
-        return output
 
-    def _rollout(self, history, past_action, candidates):
+    def rollout(self, history, past_action, candidates):
+        """Predict action candidates [batch, samples, horizon, action] from encoded history."""
         batch, samples, horizon, _ = candidates.shape
         latent_shape = history.shape[2:]
         state = (
@@ -139,8 +132,8 @@ class LatentPlanner(nn.Module):
         )
         candidates = candidates.reshape(batch * samples, horizon, self.action_dim)
         prediction = []
-        for step in range(horizon):
-            conditioned_action = torch.cat((action_history, candidates[:, step, None]), dim=1)
+        for action in candidates.unbind(1):
+            conditioned_action = torch.cat((action_history, action[:, None]), dim=1)
             next_state = self.predict(state, conditioned_action)[:, -1]
             prediction.append(next_state)
             state = torch.cat((state[:, 1:], next_state[:, None]), dim=1)
@@ -148,8 +141,13 @@ class LatentPlanner(nn.Module):
         return torch.stack(prediction, dim=1).reshape(batch, samples, horizon, *latent_shape)
 
     def _goal_cost(self, history, past_action, candidates):
-        prediction = self._rollout(history, past_action, candidates)
-        relation = self.goal_readout(prediction[:, :, -self.goal_stable_steps :])
+        prediction = self.rollout(history, past_action, candidates)
+        batch, samples, horizon = prediction.shape[:3]
+        prefix = history[:, None, 1:].expand(-1, samples, -1, *history.shape[2:])
+        trajectory = torch.cat((prefix, prediction), dim=2)
+        physical = self.state_head(trajectory.flatten(0, 1)).reshape(batch, samples, horizon, -1)
+        relation = self.state_head.targets.goal_relation(physical[:, :, -self.goal_stable_steps :])
+        relation = relation / self.goal_tolerance
         if self.goal_geometry == "radial":
             outside = F.relu(relation.norm(dim=-1) - 1)
             cost = outside.square()
@@ -211,11 +209,20 @@ class LatentPlanner(nn.Module):
         iterations = int(self.planner.iterations)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iterations)
         action_noise = float(self.planner.action_noise)
+        candidates = batch * restarts
+        batch_size = int(self.planner.gradient_batch_size)
         with torch.enable_grad():
             for _ in range(iterations):
-                cost = self._goal_cost(latent, past_action, logits.tanh())
                 optimizer.zero_grad(set_to_none=True)
-                logits.grad = torch.autograd.grad(cost.mean(), logits)[0]
+                gradient = torch.empty_like(logits).flatten(0, 1)
+                for start in range(0, candidates, batch_size):
+                    stop = min(start + batch_size, candidates)
+                    indices = torch.arange(start, stop, device=self.device) // restarts
+                    chunk = logits.flatten(0, 1)[start:stop].detach().requires_grad_()
+                    cost = self._goal_cost(latent[indices], past_action[indices], chunk.tanh()[:, None])
+                    # Preserve the original global mean, including a smaller final batch.
+                    gradient[start:stop] = torch.autograd.grad(cost.sum() / candidates, chunk)[0]
+                logits.grad = gradient.view_as(logits)
                 optimizer.step()
                 scheduler.step()
                 if action_noise:
@@ -236,7 +243,7 @@ class LatentPlanner(nn.Module):
         was_training = self.training
         self.eval()
         try:
-            history = {key: value.to(self.device) for key, value in history.items()}
+            history = {key: history[key].to(self.device) for key in self.encoder.keys}
             past_action = past_action.to(self.device)
             if str(self.planner.type) == "gradient":
                 return self._gradient_plan(history, past_action, deterministic, first)

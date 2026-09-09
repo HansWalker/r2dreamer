@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report trainable parameter budgets for every DMC comparison model."""
+"""Report learning/control budgets, visualization parameters, and frozen copies separately."""
 
 import argparse
 import contextlib
@@ -108,7 +108,10 @@ REFERENCE_COUNTS = {
     },
     "tdmpc2": {"encoder": 58_272, "dynamics": 793_088, "heads": 3_493_470, "controller": 533_516},
     "leworldmodel": {"encoder": 6_294_144, "dynamics": 11_740_334},
-    "temporal_straightening": {"dynamics": 20_122_700, "decoder": 10_140_163},
+    # TS scratch ResNet (384 features, 32 stem channels) and six-layer ViT (16x64 heads,
+    # MLP 2048, 224px). Excludes unused skip weights, task-specific input embeddings,
+    # and the detached visualization decoder; includes the trainable visual encoder.
+    "temporal_straightening": {"encoder": 4_854_199, "dynamics": 20_122_600},
 }
 
 
@@ -150,9 +153,10 @@ def model_groups(family, model):
         return {
             "encoder": (model.encoder, model.projector),
             "dynamics": (model.action_encoder, model.predictor, model.pred_projector),
-            "decoder": (model.decoder,),
+            "decoder": () if family == "temporal_straightening" else (model.decoder,),
             "heads": (),
-            "controller": (model.goal_readout,),
+            "controller": (model.state_head,),
+            "auxiliary": (model.decoder,) if family == "temporal_straightening" else (),
         }
     raise ValueError(f"No parameter grouping for model family {family!r}")
 
@@ -180,16 +184,27 @@ def build(config_name, scenario, overrides=()):
         model = constructors[family_name]().to(config.device)
     groups = model_groups(family_name, model)
     counts = {name: parameter_count(*groups[name]) for name in GROUPS}
+    auxiliary = parameter_count(*groups.get("auxiliary", ()))
+    state_head = parameter_count(model.state_head)
+    if family_name not in {"leworldmodel", "temporal_straightening"}:
+        auxiliary += state_head
     trainable = parameter_count(model)
-    grouped = sum(counts.values())
+    budget = sum(counts.values())
+    grouped = budget + auxiliary
     if grouped != trainable:
         raise RuntimeError(f"{config_name} grouped {grouped:,} parameters, but the model has {trainable:,}.")
     frozen = parameter_count(model, trainable=False) - trainable
-    return counts | {"trainable": trainable, "frozen": frozen}
+    return counts | {
+        "budget": budget,
+        "state_head": state_head,
+        "auxiliary": auxiliary,
+        "trainable": trainable,
+        "frozen": frozen,
+    }
 
 
 def print_report(rows):
-    headers = ("model", "scenario", *GROUPS, "trainable", "frozen")
+    headers = ("model", "scenario", *GROUPS, "budget", "state_head", "auxiliary", "trainable", "frozen")
     widths = {
         header: max(
             len(header),
@@ -208,11 +223,11 @@ def print_report(rows):
 
     print()
     for scenario in sorted({row["scenario"] for row in rows}):
-        totals = [row["trainable"] for row in rows if row["scenario"] == scenario]
+        totals = [row["budget"] for row in rows if row["scenario"] == scenario]
         print(f"{scenario:12} min={min(totals):,} max={max(totals):,} spread={max(totals) - min(totals):,}")
 
     print()
-    lookup = {(row["model"], row["scenario"]): row["trainable"] for row in rows}
+    lookup = {(row["model"], row["scenario"]): row["budget"] for row in rows}
     pair_gaps = []
     for scenario in sorted({row["scenario"] for row in rows}):
         for left, right in PAIRS:
@@ -243,11 +258,11 @@ def main():
     parser.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=SCENARIOS)
     parser.add_argument("--override", action="append", default=[])
-    parser.add_argument("--max-spread", type=int, default=65_000)
+    parser.add_argument("--max-spread", type=int, default=50_000)
     parser.add_argument("--max-pair-gap", type=int, default=2_000)
     parser.add_argument("--max-proportion-error", type=float, default=0.1)
     parser.add_argument("--target", type=int, default=5_250_000)
-    parser.add_argument("--target-tolerance", type=int, default=60_000)
+    parser.add_argument("--target-tolerance", type=int, default=50_000)
     args = parser.parse_args()
 
     rows = []
@@ -262,10 +277,10 @@ def main():
     if USING_MAMBA_PROXY and any("mamba" in row["model"] for row in rows):
         print("Mamba3 CUDA package unavailable; using its exact parameter shapes for this report.\n")
     pair_gaps = print_report(rows)
-    totals = [row["trainable"] for row in rows]
+    totals = [row["budget"] for row in rows]
     spreads = []
     for scenario in {row["scenario"] for row in rows}:
-        values = [row["trainable"] for row in rows if row["scenario"] == scenario]
+        values = [row["budget"] for row in rows if row["scenario"] == scenario]
         if len(values) > 1:
             spreads.append(max(values) - min(values))
     if spreads and max(spreads) > args.max_spread:

@@ -6,6 +6,7 @@ import math
 
 from torch import nn
 
+from models.shared.physical_state import PhysicalStateHead
 from models.shared.utils import parse_model_io
 
 from .actor_critic import ActorCriticAgent
@@ -25,3 +26,8 @@ class StormModel(nn.Module):
             action_dim,
             config.actor_critic,
         )
+        self.world_model.state_head = PhysicalStateHead(self.world_model.feat_size, config.state_head)
+
+    @property
+    def state_head(self):
+        return self.world_model.state_head

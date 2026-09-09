@@ -222,6 +222,12 @@ def observation_indices(metadata: dict[str, Any], selection) -> np.ndarray:
     return np.asarray(selected, dtype=np.int64)
 
 
+def read_physical_state(h5, episodes, steps, indices, targets) -> np.ndarray:
+    """Transform raw DMC observations without changing the on-disk dataset schema."""
+    state = np.asarray(h5["observations"][episodes, steps], dtype=np.float32)[..., indices]
+    return targets.encode(state)
+
+
 def read_image_window(images, episode: int, start: int, length: int, frame_stack: int = 1) -> np.ndarray:
     """Read one causal image window, repeating the first frame for missing history."""
     if frame_stack == 1:

@@ -12,14 +12,6 @@ def parse_model_io(config):
     return observations, action_shape, str(config.action.kind)
 
 
-def to_f32(x):
-    return x.to(dtype=torch.float32)
-
-
-def to_i32(x):
-    return x.to(dtype=torch.int32)
-
-
 def normalize_action(action):
     return action / action.abs().clamp_min(1.0).detach()
 

@@ -5,19 +5,19 @@ defaults:
 model_family: temporal_straightening
 logdir: logdir/temporal_straightening_dmc_vision/${scenario.name}/seed_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
-env:
-  proprio: ${scenario.proprio}
-  model_io:
-    observations:
-      proprio:
-        - ${scenario.proprio_dim}
-
 jepa_model:
+  # Preserve the visual coefficient of the former mean over 208 visual + 10 proprio channels.
+  prediction_weight: 0.9541284403669725
   encoder:
-    proprio_embedding_dim: 10
+    embedding_dim: 208
+    vision:
+      base_channels: 13
   predictor:
-    mlp_dim: 754
+    heads: 6
+    mlp_dim: 816
   decoder:
+    # Detached visualization only; excluded from the learning/control budget.
+    enabled: false
     vision:
       base_channels: 34
   optim:

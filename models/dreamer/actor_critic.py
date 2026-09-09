@@ -38,7 +38,7 @@ class _DreamerDistributionHead(nn.Module):
         super().__init__()
         self.mlp = _DreamerMLP(config, input_dim)
         dist_name = str(dist_config.name)
-        if dist_name == "bounded_normal":
+        if dist_name == "tanh_normal":
             output_dim = int(shape[0]) * 2
             kwargs = {
                 "min_std": float(dist_config.min_std),

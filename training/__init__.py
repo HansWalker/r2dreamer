@@ -5,9 +5,9 @@ import importlib
 MODEL_FAMILIES = {
     "dreamer": "training.dreamer",
     "storm": "training.storm",
-    "tdmpc2": "training.tdmpc2",
-    "leworldmodel": "training.leworldmodel",
-    "temporal_straightening": "training.temporal_straightening",
+    "tdmpc2": "training.planning",
+    "leworldmodel": "training.planning",
+    "temporal_straightening": "training.planning",
 }
 
 

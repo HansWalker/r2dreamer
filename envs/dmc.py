@@ -3,9 +3,9 @@ from typing import ClassVar
 import gymnasium as gym
 import numpy as np
 
-from .parallel import ParallelEnv
+from models.shared.physical_state import STATE_KEY, PhysicalStateTargets
 
-GOAL_RELATION_KEY = "goal_relation"
+from .parallel import ParallelEnv
 
 
 def goal_relation_spec(physics, domain, task):
@@ -62,8 +62,7 @@ class DeepMindControl(gym.Env):
         camera=None,
         seed=0,
         max_steps=None,
-        proprio=None,
-        include_goal_relation=False,
+        state_fields=None,
     ):
         from dm_control import suite
 
@@ -77,8 +76,8 @@ class DeepMindControl(gym.Env):
         self._size = size
         self._max_steps = max_steps
         self._episode_step = None
-        self._proprio = {str(key): np.asarray(indices, dtype=np.int64) for key, indices in (proprio or {}).items()}
-        self._include_goal_relation = bool(include_goal_relation)
+        self._state_fields = state_fields or {}
+        self._state_targets = PhysicalStateTargets(f"dmc_{name}", state_fields) if state_fields else None
         if camera is None:
             camera = {"quadruped": 2, "fish": 3}.get(domain, 0)
         self._camera = camera
@@ -97,11 +96,9 @@ class DeepMindControl(gym.Env):
     @property
     def observation_space(self):
         spaces = {"image": gym.spaces.Box(0, 255, self._size + (3,), dtype=np.uint8)}
-        if self._proprio:
-            size = sum(len(indices) for indices in self._proprio.values())
-            spaces["proprio"] = gym.spaces.Box(-np.inf, np.inf, (size,), dtype=np.float32)
-        if self._include_goal_relation:
-            spaces[GOAL_RELATION_KEY] = gym.spaces.Box(-np.inf, np.inf, (2,), dtype=np.float32)
+        if self._state_fields:
+            size = len(self._state_targets.coordinates)
+            spaces[STATE_KEY] = gym.spaces.Box(-np.inf, np.inf, (size,), dtype=np.float32)
         return gym.spaces.Dict(spaces)
 
     def step(self, action):
@@ -142,13 +139,12 @@ class DeepMindControl(gym.Env):
             "is_first": np.asarray(time_step.first()),
             "is_last": np.asarray(time_step.last()),
         }
-        if self._proprio:
-            observation["proprio"] = np.concatenate([
-                np.asarray(time_step.observation[key], dtype=np.float32).reshape(-1)[indices]
-                for key, indices in self._proprio.items()
+        if self._state_fields:
+            state = np.concatenate([
+                np.asarray(time_step.observation[key], dtype=np.float32).reshape(-1)[list(indices)]
+                for key, indices in self._state_fields.items()
             ])
-        if self._include_goal_relation:
-            observation[GOAL_RELATION_KEY] = goal_relation(self._env.physics, self._domain, self._task)
+            observation[STATE_KEY] = self._state_targets.encode(state)
         return observation
 
     def render(self, *args, **kwargs):
@@ -157,29 +153,27 @@ class DeepMindControl(gym.Env):
         return self._env.physics.render(*self._size, camera_id=self._camera)
 
 
-def make_env(config, seed, include_goal_relation=False):
-    proprio = config.get("proprio")
+def make_env(config, seed, include_physical_state=False):
     return DeepMindControl(
         str(config.task).removeprefix("dmc_"),
         config.action_repeat,
         config.size,
         seed=seed,
         max_steps=config.time_limit // config.action_repeat,
-        proprio=proprio,
-        include_goal_relation=include_goal_relation,
+        state_fields=config.state_fields if include_physical_state else None,
     )
 
 
-def _make_parallel_envs(config, env_num, seed, include_goal_relation=False):
+def _make_parallel_envs(config, env_num, seed, include_physical_state=False):
     def constructor(index):
-        return lambda: make_env(config, int(seed) + index, include_goal_relation)
+        return lambda: make_env(config, int(seed) + index, include_physical_state)
 
     return ParallelEnv(constructor, env_num, pin_memory=str(config.device).startswith("cuda"))
 
 
 def make_envs(config, seed=None):
     seed = int(config.seed) if seed is None else int(seed)
-    return _make_parallel_envs(config, config.env_num, seed, bool(config.get("goal_relation", False)))
+    return _make_parallel_envs(config, config.env_num, seed, include_physical_state=True)
 
 
 def make_eval_envs(config):

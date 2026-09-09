@@ -13,13 +13,17 @@ def _to_device(data, device):
 class EpisodeReplay:
     """Bounded replay containing raw, episode-aligned transitions."""
 
-    def __init__(self, max_size, storage_device="cpu", seed=0):
-        self.max_size = int(max_size)
-        self.storage_device = torch.device(storage_device)
+    def __init__(self, config):
+        self.max_size = int(config.max_size)
+        self.storage_device = torch.device(config.storage_device)
+        self.device = torch.device(config.device)
+        self.batch_size = int(config.batch_size)
+        self.sequence_length = int(config.sequence_length)
+        self.episodes_per_batch = int(config.episodes_per_batch)
         self.completed = deque()
         self.current = None
         self._completed_size = 0
-        self._generator = torch.Generator().manual_seed(int(seed))
+        self._generator = torch.Generator().manual_seed(int(config.seed))
 
     def start(self, env_num):
         self.current = [[] for _ in range(int(env_num))]
@@ -73,10 +77,10 @@ class EpisodeReplay:
             self._generator.set_state(state["generator_state"].cpu())
         self._trim()
 
-    def ready(self, length, episode_count=1):
-        usable = sum(len(episode) >= length for episode in self.completed)
-        usable += sum(len(episode) >= length for episode in self.current or ())
-        return usable >= int(episode_count)
+    def ready(self):
+        usable = sum(len(episode) >= self.sequence_length for episode in self.completed)
+        usable += sum(len(episode) >= self.sequence_length for episode in self.current or ())
+        return usable >= self.episodes_per_batch
 
     def episodes(self, min_length=1):
         episodes = [episode for episode in self.completed if len(episode) >= min_length]
@@ -114,49 +118,26 @@ class EpisodeReplay:
             groups.append((episode, tuple(sorted(starts.tolist()))))
         return groups
 
-    @staticmethod
-    def stack_windows(groups, sequence_length):
-        return torch.stack(
-            [episode[start : start + sequence_length] for episode, starts in groups for start in starts],
-            dim=0,
-        )
-
 
 class Buffer(EpisodeReplay):
     """Dreamer replay that rebuilds recurrent state from raw episode prefixes."""
 
-    _transition_keys = ("image", "action", "reward", "is_first", "is_last", "is_terminal")
-
-    def __init__(self, config):
-        self.device = torch.device(config.device)
-        self.batch_size = int(config.batch_size)
-        self.sequence_length = int(config.sequence_length)
-        self.episodes_per_batch = int(config.episodes_per_batch)
-        super().__init__(
-            config.max_size,
-            storage_device=config.storage_device,
-            seed=config.seed,
-        )
-
-    def ready(self):
-        return super().ready(self.sequence_length, self.episodes_per_batch)
+    _transition_keys = ("image", "physical_state", "action", "reward", "is_first", "is_last", "is_terminal")
 
     def add_transition(self, data):
         raw = data.select(*self._transition_keys)
         self.append(raw, raw["is_last"])
 
     @staticmethod
-    def _previous_actions(episode, start, length):
-        actions = episode["action"]
-        if length == 0:
-            return actions[:0]
-        if start:
-            return actions[start - 1 : start + length - 1]
-        return torch.cat((torch.zeros_like(actions[:1]), actions[: length - 1]), dim=0)
-
-    def _aligned_slice(self, episode, start, length):
+    def _aligned_slice(episode, start, length):
         sequence = episode[start : start + length].clone()
-        sequence["action"] = self._previous_actions(episode, start, length)
+        actions = episode["action"]
+        if not length:
+            sequence["action"] = actions[:0]
+        elif start:
+            sequence["action"] = actions[start - 1 : start + length - 1]
+        else:
+            sequence["action"] = torch.cat((torch.zeros_like(actions[:1]), actions[: length - 1]), dim=0)
         return sequence
 
     def sample(self):
@@ -179,56 +160,37 @@ class SequenceBuffer(EpisodeReplay):
     """Raw observation-action sequences for STORM and planning models."""
 
     def __init__(self, config):
-        self.batch_size = int(config.batch_size)
-        self.sequence_length = int(config.sequence_length)
-        self.device = torch.device(config.device)
-        self.episodes_per_batch = int(config.episodes_per_batch)
+        super().__init__(config)
         self._obs_keys = None
-        self._has_goal_relation = False
-        super().__init__(
-            config.max_size,
-            storage_device=config.storage_device,
-            seed=config.seed,
-        )
 
-    def ready(self):
-        return super().ready(self.sequence_length, self.episodes_per_batch)
-
-    def append(self, obs, action, reward, terminal, episode_end, goal_relation=None):
+    def append(self, obs, action, reward, terminal, episode_end):
         if self._obs_keys is None:
             self._obs_keys = tuple(obs.keys())
-            self._has_goal_relation = goal_relation is not None
         data = {
-            **{key: value for key, value in obs.items()},
+            **obs,
             "action": action,
             "reward": reward,
             "terminal": terminal.reshape(-1, 1),
         }
-        if goal_relation is not None:
-            data["goal_relation"] = goal_relation
-        transition = TensorDict(
-            data,
-            batch_size=(action.shape[0],),
-        )
+        transition = TensorDict(data, batch_size=(action.shape[0],))
         super().append(transition, episode_end)
 
     def state_dict(self):
         return {
             "obs_keys": self._obs_keys,
-            "has_goal_relation": self._has_goal_relation,
             "replay": super().state_dict(),
         }
 
     def load_state_dict(self, state):
         self._obs_keys = tuple(state["obs_keys"]) if state.get("obs_keys") else None
-        self._has_goal_relation = bool(state.get("has_goal_relation", False))
         super().load_state_dict(state["replay"])
 
     def sample(self, batch_size=None, sequence_length=None, with_context=False):
         batch_size = int(batch_size or self.batch_size)
         sequence_length = int(sequence_length or self.sequence_length)
         groups = self.sample_groups(batch_size, sequence_length, self.episodes_per_batch)
-        batch = _to_device(self.stack_windows(groups, sequence_length), self.device)
+        windows = [episode[start : start + sequence_length] for episode, starts in groups for start in starts]
+        batch = _to_device(torch.stack(windows, dim=0), self.device)
         obs = {key: batch[key] for key in self._obs_keys}
         result = (
             obs,
@@ -236,8 +198,6 @@ class SequenceBuffer(EpisodeReplay):
             batch["reward"].float(),
             batch["terminal"].float(),
         )
-        if self._has_goal_relation:
-            result += (batch["goal_relation"].float(),)
         if not with_context:
             return result
         contexts = [

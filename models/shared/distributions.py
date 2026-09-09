@@ -2,8 +2,6 @@ import torch
 from torch import distributions as torchd
 from torch.nn import functional as F
 
-from .utils import to_f32, to_i32
-
 
 def symlog(x):
     return torch.sign(x) * torch.log1p(torch.abs(x))
@@ -14,9 +12,11 @@ def symexp(x):
 
 
 class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
+    has_rsample = True
+
     def __init__(self, logits, unimix_ratio=0.0):
         # (..., K)
-        probs = F.softmax(to_f32(logits), dim=-1)
+        probs = F.softmax(logits.float(), dim=-1)
         uniform = unimix_ratio / probs.shape[-1]
         probs = probs * (1.0 - unimix_ratio) + torch.ones_like(probs, dtype=torch.float32) * uniform
         logits = torch.log(probs)
@@ -26,20 +26,18 @@ class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
     def mode(self):
         # (..., K)
         _mode = F.one_hot(torch.argmax(self.logits, axis=-1), self.logits.shape[-1])
-        return _mode.detach() + self.logits - self.logits.detach()
+        return _mode + (self.probs - self.probs.detach())
 
-    def rsample(self, sample_shape=(), temperature=1.0):
-        # (..., K)
-        return F.gumbel_softmax(self.logits, tau=temperature, hard=True, dim=-1)
-
-    def sample(self, **kwargs):
-        raise NotImplementedError
+    def rsample(self, sample_shape=torch.Size()):
+        # Hard categorical values with DreamerV3's probability straight-through gradient.
+        sample = super().sample(sample_shape)
+        return sample + (self.probs - self.probs.detach())
 
 
 class TwoHot:
     def __init__(self, logits, bins, squash=None, unsquash=None):
         # (..., N_bins), (N_bins,)
-        self.logits = to_f32(logits)
+        self.logits = logits.float()
         assert self.logits.shape[-1] == len(bins), (self.logits.shape, len(bins))
 
         self.bins = bins
@@ -75,8 +73,8 @@ class TwoHot:
         target = target.squeeze(-1)  # (...,)
         target_squashed = self.squash(target).detach()  # (...,)
         # below/above: (...,)
-        below = to_i32(self.bins <= target_squashed.unsqueeze(-1)).sum(dim=-1) - 1
-        above = len(self.bins) - to_i32(self.bins > target_squashed.unsqueeze(-1)).sum(dim=-1)
+        below = (self.bins <= target_squashed.unsqueeze(-1)).int().sum(dim=-1) - 1
+        above = len(self.bins) - (self.bins > target_squashed.unsqueeze(-1)).int().sum(dim=-1)
         below = torch.clamp(below, 0, len(self.bins) - 1)
         above = torch.clamp(above, 0, len(self.bins) - 1)
         equal = below == above
@@ -93,8 +91,8 @@ class TwoHot:
         total = dist_to_below + dist_to_above
         weight_below = dist_to_above / total
         weight_above = dist_to_below / total
-        oh_below = to_f32(F.one_hot(below, num_classes=len(self.bins)))
-        oh_above = to_f32(F.one_hot(above, num_classes=len(self.bins)))
+        oh_below = F.one_hot(below, num_classes=len(self.bins)).float()
+        oh_above = F.one_hot(above, num_classes=len(self.bins)).float()
         # (..., N_bins)
         mixed_target = oh_below * weight_below.unsqueeze(-1) + oh_above * weight_above.unsqueeze(-1)
         log_pred = self.logits - torch.logsumexp(self.logits, dim=-1, keepdim=True)  # (..., N_bins)
@@ -104,7 +102,7 @@ class TwoHot:
 class MSEDist:
     def __init__(self, mode, agg="sum"):
         # (..., D)
-        self._mode = to_f32(mode)
+        self._mode = mode.float()
         self._agg = agg
 
     def mode(self):
@@ -127,15 +125,38 @@ class MSEDist:
         return -loss  # (...)
 
 
-def bounded_normal(x, min_std, max_std, **kwargs):
-    mean, std = torch.chunk(x, 2, dim=-1)
+class TanhNormal(torchd.TransformedDistribution):
+    """Diagonal Gaussian squashed into the continuous action bounds."""
+
+    def __init__(self, mean, std):
+        normal = torchd.Independent(torchd.Normal(mean.float(), std.float()), 1)
+        super().__init__(normal, [torchd.TanhTransform(cache_size=1)])
+
+    @property
+    def mode(self):
+        # Deterministic policy action, not the mode of the transformed density.
+        return self.base_dist.mode.tanh()
+
+    def log_prob(self, action):
+        # Expert actions and float32 tanh can reach +/-1, where atanh is infinite.
+        return super().log_prob(action.float().clamp(-1.0 + 1e-6, 1.0 - 1e-6))
+
+    def entropy(self):
+        # Reparameterized estimate: H(tanh(X)) = H(X) + E[log |tanh'(X)|].
+        raw = self.base_dist.rsample()
+        transform = self.transforms[0]
+        correction = transform.log_abs_det_jacobian(raw, raw.tanh()).sum(-1)
+        return self.base_dist.entropy() + correction
+
+
+def tanh_normal(x, min_std, max_std):
+    mean, std = torch.chunk(x.float(), 2, dim=-1)
     std = (max_std - min_std) * torch.sigmoid(std + 2.0) + min_std
-    dist = torchd.normal.Normal(torch.tanh(to_f32(mean)), to_f32(std))
-    return torchd.independent.Independent(dist, 1)
+    return TanhNormal(mean, std)
 
 
 def binary(logits, **kwargs):
-    return torchd.independent.Independent(torchd.bernoulli.Bernoulli(logits=to_f32(logits)), 1)
+    return torchd.independent.Independent(torchd.bernoulli.Bernoulli(logits=logits.float()), 1)
 
 
 def symexp_twohot(logits, bin_num, **kwargs):
@@ -147,16 +168,8 @@ def symexp_twohot(logits, bin_num, **kwargs):
         half = torch.linspace(-20, 0, bin_num // 2, dtype=torch.float32, device=logits.device)
         half = symexp(half)
         bins = torch.concatenate([half, -half.flip(dims=(0,))], 0)
-    return TwoHot(to_f32(logits), bins)
+    return TwoHot(logits, bins)
 
 
 def mse(logits, **kwargs):
-    return MSEDist(to_f32(logits))
-
-
-def kl(logits_left, logits_right):
-    # (..., K), (..., K)
-    logprob_left = torch.log_softmax(logits_left, -1)
-    logprob_right = torch.log_softmax(logits_right, -1)
-    prob = torch.softmax(logits_left, -1)
-    return (prob * (logprob_left - logprob_right)).sum(-1)  # (...)
+    return MSEDist(logits)

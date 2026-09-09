@@ -29,6 +29,7 @@ training:
     - env.time_limit=8
     - expert_data.train_episodes=1
     - expert_data.heldout_episodes=2
+    - expert_data.policy_mode=actor
     - replay.batch_size=1
     - replay.sequence_length=4
     - replay.max_size=32
@@ -44,9 +45,10 @@ training:
     - evaluation.final.episodes=1
     - evaluation.final.context_length=3
     - evaluation.final.horizons=[1]
-    - evaluation.final.probe_train_windows=1
-    - evaluation.final.probe_test_windows=1
-    - evaluation.final.probe_batch_size=1
+    - evaluation.final.state_windows=1
+    - evaluation.final.state_batch_size=1
+    - evaluation.final.state_samples=1
+    - state_head.samples_per_update=1
 
 evaluation:
   dataset_root: ${oc.env:DMC_SMOKE_DATA_DIR,data/dmc_smoke}
@@ -191,7 +193,6 @@ smoke_models:
     - jepa_model.planner.iterations=1
   temporal_straightening:
     - jepa_model.encoder.embedding_dim=64
-    - jepa_model.encoder.proprio_embedding_dim=4
     - jepa_model.encoder.vision.base_channels=4
     - jepa_model.predictor.layers=1
     - jepa_model.predictor.heads=2

@@ -6,6 +6,8 @@ import torch
 from torch import nn
 from torch.distributions import OneHotCategorical
 
+from models.shared.physical_state import STATE_KEY
+
 from .cores import (
     HyenaSequenceCore,
     MambaSequenceCore,
@@ -212,18 +214,27 @@ class WorldModel(nn.Module):
     def update(self, obs, action, reward, termination, contexts=None):
         self.train()
         obs = {key: value.to(self.device, non_blocking=True) for key, value in obs.items()}
+        labels = obs.pop(STATE_KEY)
         action = action.to(self.device, non_blocking=True)
         reward = reward.to(self.device, non_blocking=True)
         termination = termination.to(self.device, non_blocking=True)
-        cache = self.replay_cache(contexts)
-        loss, metrics, state = self.loss(obs, action, reward, termination, cache)
-        optimize(self, self.optimizer, self.scaler, loss, self.grad_clip)
+        for skipped in range(32):
+            cache = self.replay_cache(contexts)
+            loss, metrics, state = self.loss(obs, action, reward, termination, cache)
+            if optimize(self, self.optimizer, self.scaler, loss, self.grad_clip):
+                break
+        else:
+            raise RuntimeError("STORM world-model gradients overflowed in 32 consecutive attempts.")
+        metrics["wm/skipped_steps"] = skipped
+        feature = torch.cat((state["stoch"][:, 1:], state["deter"][:, :-1]), dim=-1)
+        metrics.update(self.state_head.fit(feature, labels[:, 1:]))
         return metrics, state, (obs, action, reward, termination)
 
     @torch.no_grad()
     def next_policy_features(self, state: dict[str, torch.Tensor]) -> torch.Tensor:
-        prior = categorical_sample(state["prior_logits"][:, :-1]).flatten(-2)
-        return torch.cat([prior, state["deter"][:, :-1]], dim=-1)
+        # Decisions for states 1..T; the final predicted state supplies the critic bootstrap.
+        prior = categorical_sample(state["prior_logits"]).flatten(-2)
+        return torch.cat([prior, state["deter"]], dim=-1)
 
     @torch.no_grad()
     def context_feature(self, obs, action) -> torch.Tensor:

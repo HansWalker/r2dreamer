@@ -12,7 +12,7 @@ def _path(value):
     return path if path.is_absolute() else ROOT / path
 
 
-def parse_args():
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-name", required=True, help="Hydra training config used by the checkpoint.")
     parser.add_argument("--scenario", required=True, help="Scenario config name, such as cartpole_balance_sparse.")
@@ -23,11 +23,7 @@ def parse_args():
     parser.add_argument("--skip-state-prediction", action="store_true", help="Evaluate policy metrics only.")
     parser.add_argument("--override", action="append", default=[], help="Additional Hydra override; repeat as needed.")
     parser.add_argument("--output", type=Path, help="JSON output path; defaults to <logdir>/evaluation.json.")
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
+    args = parser.parse_args()
     import torch
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
@@ -38,6 +34,7 @@ def main():
     from training import load_model_family
     from training.evaluation import evaluate_state_prediction
     from training.protocol import (
+        EVALUATION_PROTOCOL,
         completion_checkpoint,
         dynamics_targets_per_update,
         evaluation_identity,
@@ -68,28 +65,32 @@ def main():
     horizons = tuple(map(int, settings.horizons))
     print(
         f"Evaluation | checkpoint={checkpoint_path.name} | episodes={settings.episodes} | "
-        f"context={settings.context_length} | horizons={','.join(map(str, horizons))}"
+        f"history=common_prefix | prefix_images={settings.context_length} | "
+        f"stochastic_samples={settings.state_samples} | horizons={','.join(map(str, horizons))}"
     )
     seed = int(settings.seed)
     tools.configure_randomness(seed, bool(config.deterministic_run))
     family = load_model_family(str(config.model_family))
     model = family.build_model(config)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    identity = validate_checkpoint(checkpoint, config)
-    if checkpoint_path.name == completion_checkpoint(config) and not training_complete(checkpoint, config):
+    identity = validate_checkpoint(checkpoint, config, training=False)
+    training_config = OmegaConf.create(checkpoint["training_config"]) if "training_config" in checkpoint else config
+    if checkpoint_path.name == completion_checkpoint(training_config) and not training_complete(
+        checkpoint, training_config, training=False
+    ):
         raise ValueError(f"{checkpoint_path.name} does not contain a completed training run.")
-    if bool(config.training.expert.enabled) and int(checkpoint.get("expert_updates", -1)) < int(
-        config.training.expert.updates
+    if bool(training_config.training.expert.enabled) and int(checkpoint.get("expert_updates", -1)) < int(
+        training_config.training.expert.updates
     ):
         raise ValueError("Checkpoint was saved before the configured expert-training budget completed.")
-    if int(config.training.online.steps) and checkpoint.get("phase") != "online":
+    if int(training_config.training.online.steps) and checkpoint.get("phase") != "online":
         raise ValueError("Online evaluation requires a checkpoint saved during online training.")
     checkpoint_protocol = identity["protocol"]
 
-    metadata = validate_dataset(dataset_path, config, splits=("heldout",))
+    metadata = validate_dataset(dataset_path, training_config, splits=("heldout",))
     evaluation_dataset = dataset_identity(metadata)
     training_dataset = checkpoint.get("dataset_identity")
-    if bool(config.training.expert.enabled) and training_dataset != evaluation_dataset:
+    if bool(training_config.training.expert.enabled) and training_dataset != evaluation_dataset:
         raise ValueError("Evaluation dataset does not match the expert dataset recorded in the checkpoint.")
 
     family.load_checkpoint(model, checkpoint, training=False)
@@ -109,7 +110,7 @@ def main():
     prediction = None
     if not args.skip_state_prediction:
         print(f"Evaluation | state_prediction=running | dataset={dataset_path}")
-        tools.configure_randomness(int(settings.probe_seed), bool(config.deterministic_run))
+        tools.configure_randomness(int(settings.state_seed), bool(config.deterministic_run))
         prediction = evaluate_state_prediction(
             model,
             config,
@@ -120,11 +121,14 @@ def main():
     trainer_state = checkpoint.get("trainer_state", {})
     expert_updates = int(checkpoint.get("expert_updates", 0))
     online_updates = int(trainer_state.get("world_model_updates", 0))
-    world_model_observations_per_update = int(config.replay.batch_size) * int(config.replay.sequence_length)
-    dynamics_targets = dynamics_targets_per_update(config)
+    world_model_observations_per_update = int(training_config.replay.batch_size) * int(
+        training_config.replay.sequence_length
+    )
+    dynamics_targets = dynamics_targets_per_update(training_config)
     result = {
         "experiment_protocol": checkpoint_protocol,
-        "evaluation_protocol": str(config.experiment_protocol),
+        "evaluation_protocol": EVALUATION_PROTOCOL,
+        "evaluation_implementation_sha256": freeze_implementation(),
         "run_identity": identity,
         "evaluation_identity": evaluation_identity(config, prediction is not None),
         "checkpoint_id": checkpoint.get("checkpoint_id"),
@@ -142,8 +146,8 @@ def main():
         "online_dynamics_targets": online_updates * dynamics_targets,
         "world_model_observations_per_update": world_model_observations_per_update,
         "dynamics_targets_per_update": dynamics_targets,
-        "replay_capacity": int(config.replay.max_size),
-        "online_warmup_transitions": int(config.training.online.warmup_transitions),
+        "replay_capacity": int(training_config.replay.max_size),
+        "online_warmup_transitions": int(training_config.training.online.warmup_transitions),
         "training_seed": int(checkpoint.get("training_seed", config.seed)),
         "evaluation_episodes": int(settings.episodes),
         "evaluation_seed_start": seed,
@@ -153,10 +157,14 @@ def main():
         "return_standard_error": float(extra["return_stderr"]),
         "mean_episode_length": float(episode_length),
         "task_success_rate": float(extra["success"]),
+        "reached_success_rate": float(extra["reached_success"]),
         "sustained_success_rate": float(extra["sustained_success"]),
         "success_threshold": float(config.evaluation.success_threshold),
         "sustained_success_steps": int(config.evaluation.sustained_success_steps),
-        "task_success_definition": "fraction of episodes that reach the normalized DMC reward threshold once",
+        "maintenance_fraction": float(config.evaluation.maintenance_fraction),
+        "maintenance_occupancy": float(config.evaluation.maintenance_occupancy),
+        "task_success_definition": "fraction of episodes meeting the required goal occupancy in their final window",
+        "reached_success_definition": "fraction of episodes that reach the normalized DMC reward threshold once",
         "sustained_success_definition": "fraction that remain above the threshold for consecutive agent steps",
         "goal_conditioned": goal_conditioned,
         "goal_definition": (
@@ -174,13 +182,27 @@ def main():
     temporary = Path(f"{output}.tmp")
     temporary.write_text(json.dumps(result, indent=2), encoding="utf-8")
     temporary.replace(output)
-    state_metric = "-" if prediction is None else f"{prediction['mean_nrmse']:.3f}"
     print(
         f"Result | return={result['mean_return']:.2f} +/- {result['return_standard_error']:.2f} | "
         f"success={100 * result['task_success_rate']:.1f}% | "
         f"sustained={100 * result['sustained_success_rate']:.1f}% | "
-        f"state_nrmse={state_metric} | episode_length={result['mean_episode_length']:.1f}"
+        f"episode_length={result['mean_episode_length']:.1f}"
     )
+    if prediction is not None:
+        print(
+            f"Evaluation | readout_history={prediction['readout_history_length']} | "
+            f"readout_updates={prediction['readout_updates']} | evaluation_fitting=false"
+        )
+        counts = " | ".join(f"{name}_windows={values['windows']}" for name, values in prediction["cohorts"].items())
+        print(f"Evaluation | split=heldout | rollout=open_loop | {counts}")
+        for horizon, errors in prediction["rmse"].items():
+            baseline = prediction["persistence_rmse"][horizon]
+            values = " | ".join(f"{key}={value:.4g} (hold={baseline[key]:.4g})" for key, value in errors.items())
+            print(f"Prediction | horizon={horizon} | RMSE (original units) | {values}")
+            derived = prediction["derived_rmse"][horizon]
+            if derived:
+                values = " | ".join(f"{key}={value:.4g}" for key, value in derived.items())
+                print(f"Kinematics | horizon={horizon} | RMSE (m, m/s) | {values}")
     print(f"Output | evaluation={output}")
 
 

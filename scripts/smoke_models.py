@@ -9,6 +9,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 
+from models.shared.physical_state import STATE_KEY
 from training import load_model_family
 from training.evaluation import latent_rollout
 
@@ -49,6 +50,7 @@ def synthetic_batch(config, model, batch_size=2, length=4):
     reward = torch.rand(batch_size, length, 1)
     terminal = torch.zeros(batch_size, length, 1)
     family = str(config.model_family)
+    labels = torch.randn(batch_size, length, len(model.state_head.coordinates))
     if family == "dreamer":
         action[:, 0] = reward[:, 0] = 0
         first = torch.zeros(batch_size, length, 1, dtype=torch.bool)
@@ -58,6 +60,7 @@ def synthetic_batch(config, model, batch_size=2, length=4):
         batch = TensorDict(
             {
                 **observation,
+                STATE_KEY: labels,
                 "action": action,
                 "reward": reward,
                 "is_first": first,
@@ -67,15 +70,10 @@ def synthetic_batch(config, model, batch_size=2, length=4):
             batch_size=(batch_size, length),
         )
     elif family == "storm":
-        returns = reward.flip(1).cumsum(1).flip(1)
-        batch = (observation, action, reward, terminal, returns)
+        batch = ({**observation, STATE_KEY: labels}, action, reward, terminal)
     else:
         training_observation = model.stack_sequence(observation) if family == "tdmpc2" else observation
-        batch = (training_observation, action[:, :-1], reward[:, :-1], terminal[:, :-1])
-        if family in {"leworldmodel", "temporal_straightening"}:
-            tolerance = torch.as_tensor(list(config.jepa_model.goal.tolerance)).reshape(1, 1, -1)
-            relation = torch.randn(batch_size, length, 2) * tolerance
-            batch = (*batch, relation)
+        batch = ({**training_observation, STATE_KEY: labels}, action[:, :-1], reward[:, :-1], terminal[:, :-1])
     return batch, observation, action
 
 
@@ -139,11 +137,15 @@ def main():
         if decision.shape != (batch_size, action.shape[-1]) or not torch.isfinite(decision).all():
             raise RuntimeError(f"{name} produced an invalid policy action.")
         device = next(model.parameters()).device
+        rollout_options = {}
+        if config.model_family == "storm":
+            rollout_options["storm_context_length"] = int(config.storm_train.context_length)
         observed, predicted = latent_rollout(
             model,
             {key: value.to(device) for key, value in observation.items()},
             action[:, :3].to(device),
             context_length=3,
+            **rollout_options,
         )
         if observed.shape[:2] != (batch_size, 4) or predicted.shape[:2] != (batch_size, 1):
             raise RuntimeError(f"{name} returned invalid rollout shapes {observed.shape}, {predicted.shape}.")

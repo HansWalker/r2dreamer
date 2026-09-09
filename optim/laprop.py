@@ -42,6 +42,7 @@ class LaProp(Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, amsgrad=amsgrad, centered=centered)
         super().__init__(params, defaults)
 
+    @torch.no_grad()
     def step(self):
         """Performs a single optimization step."""
 
@@ -49,7 +50,7 @@ class LaProp(Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad.data
+                grad = p.grad
                 if grad.is_sparse:
                     raise RuntimeError("Adam does not support sparse gradients, please consider SparseAdam instead")
                 amsgrad = group["amsgrad"]
@@ -61,18 +62,18 @@ class LaProp(Optimizer):
                 if len(state) == 0:
                     state["step"] = 0
                     # Exponential moving average of gradient values
-                    state["exp_avg"] = torch.zeros_like(p.data)
+                    state["exp_avg"] = torch.zeros_like(p)
                     # Exponential moving average of learning rates
                     state["exp_avg_lr_1"] = 0.0
                     state["exp_avg_lr_2"] = 0.0
                     # Exponential moving average of squared gradient values
-                    state["exp_avg_sq"] = torch.zeros_like(p.data)
+                    state["exp_avg_sq"] = torch.zeros_like(p)
                     if centered:
                         # Exponential moving average of gradient values as calculated by beta2
-                        state["exp_mean_avg_beta2"] = torch.zeros_like(p.data)
+                        state["exp_mean_avg_beta2"] = torch.zeros_like(p)
                     if amsgrad:
                         # Maintains max of all exp. moving avg. of sq. grad. values
-                        state["max_exp_avg_sq"] = torch.zeros_like(p.data)
+                        state["max_exp_avg_sq"] = torch.zeros_like(p)
 
                 exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
                 if centered:
@@ -112,6 +113,6 @@ class LaProp(Optimizer):
                 step_of_this_grad = grad / denom
                 exp_avg.mul_(beta1).add_(step_of_this_grad, alpha=(1 - beta1) * group["lr"])
 
-                p.data.add_(exp_avg, alpha=-step_size)
+                p.add_(exp_avg, alpha=-step_size)
                 if group["weight_decay"] != 0:
-                    p.data.mul_(1 - group["weight_decay"])
+                    p.mul_(1 - group["weight_decay"])

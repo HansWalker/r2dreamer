@@ -39,7 +39,7 @@ class Projector(nn.Module):
     def forward(self, value):
         shape = value.shape
         value = self.net(value.reshape(-1, shape[-1]))
-        return value.reshape(*shape[:-1], shape[-1])
+        return value.reshape(shape)
 
 
 class ConditionalBlock(nn.Module):
@@ -53,14 +53,10 @@ class ConditionalBlock(nn.Module):
         nn.init.zeros_(self.modulation[-1].weight)
         nn.init.zeros_(self.modulation[-1].bias)
 
-    @staticmethod
-    def _modulate(value, shift, scale):
-        return value * (1 + scale) + shift
-
     def forward(self, value, condition):
         shift1, scale1, gate1, shift2, scale2, gate2 = self.modulation(condition).chunk(6, -1)
-        value = value + gate1 * self.attention(self._modulate(self.norm1(value), shift1, scale1))
-        return value + gate2 * self.feed_forward(self._modulate(self.norm2(value), shift2, scale2))
+        value = value + gate1 * self.attention(self.norm1(value) * (1 + scale1) + shift1)
+        return value + gate2 * self.feed_forward(self.norm2(value) * (1 + scale2) + shift2)
 
 
 class Predictor(nn.Module):
@@ -133,7 +129,6 @@ class VisionEncoder(nn.Module):
         super().__init__()
         self.key, (height, width, channels) = image_spec(model_io)
         self.keys = (self.key,)
-        self.shapes = {self.key: (height, width, channels)}
         self.out_dim = int(config.embedding_dim)
         vision = config.vision
         patch = int(vision.patch_size)
@@ -166,10 +161,6 @@ class VisionEncoder(nn.Module):
         output = self.norm(self.blocks(torch.cat((cls, tokens), dim=1) + self.position))[:, 0]
         return output.reshape(*prefix, self.out_dim)
 
-    @staticmethod
-    def pool(latent):
-        return latent
-
 
 class LeWorldModel(LatentPlanner):
     def __init__(self, config, model_io):
@@ -183,7 +174,6 @@ class LeWorldModel(LatentPlanner):
             Predictor(latent_dim, int(settings.history_size), settings.predictor),
             encoder,
             ActionEncoder(math.prod(parse_model_io(model_io)[1]), latent_dim),
-            goal_readout=nn.Linear(latent_dim, 2),
             projector=Projector(latent_dim, projector_dim),
             pred_projector=Projector(latent_dim, projector_dim),
         )
@@ -193,18 +183,12 @@ class LeWorldModel(LatentPlanner):
         )
         self.sigreg_weight = float(settings.sigreg.weight)
         self.model_lr = float(settings.optim.lr)
-        goal_parameters = list(self.goal_readout.parameters())
-        goal_ids = {id(parameter) for parameter in goal_parameters}
+        readout_ids = {id(parameter) for parameter in self.state_head.parameters()}
         self.optimizers = {
             "model": optim.AdamW(
-                [parameter for parameter in self.parameters() if id(parameter) not in goal_ids],
+                [parameter for parameter in self.parameters() if id(parameter) not in readout_ids],
                 lr=self.model_lr,
                 weight_decay=float(settings.optim.weight_decay),
-            ),
-            "goal": optim.AdamW(
-                goal_parameters,
-                lr=float(settings.goal.lr),
-                weight_decay=float(settings.goal.weight_decay),
             ),
         }
         self.scheduler = None

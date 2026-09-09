@@ -1,5 +1,7 @@
 """Losses, returns, and policy distributions for native STORM training."""
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -12,9 +14,11 @@ def optimize(module, optimizer, scaler, loss, grad_clip):
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
     nn.utils.clip_grad_norm_(module.parameters(), max_norm=grad_clip)
+    scale = scaler.get_scale()
     scaler.step(optimizer)
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
+    return scaler.get_scale() >= scale
 
 
 class SymLogTwoHotLoss(nn.Module):
@@ -77,15 +81,17 @@ class TanhNormal:
         return torch.tanh(self.mean)
 
     def log_prob(self, action: torch.Tensor, raw: torch.Tensor | None = None) -> torch.Tensor:
-        eps = torch.finfo(action.dtype).eps
-        action = action.clamp(-1 + 1e-6, 1 - 1e-6)
         if raw is None:
+            action = action.clamp(-1 + 1e-6, 1 - 1e-6)
             raw = 0.5 * (torch.log1p(action) - torch.log1p(-action))
-        log_prob = self.normal.log_prob(raw) - torch.log(1 - action.pow(2) + eps)
+        log_prob = self.normal.log_prob(raw) - 2 * (math.log(2) - raw - F.softplus(-2 * raw))
         return log_prob.sum(dim=-1)
 
     def entropy(self) -> torch.Tensor:
-        return self.normal.entropy().sum(dim=-1)
+        # Reparameterized estimate of the tanh Jacobian, including its mean/std gradients.
+        raw = self.normal.rsample()
+        log_jacobian = 2 * (math.log(2) - raw - F.softplus(-2 * raw))
+        return (self.normal.entropy() + log_jacobian).sum(dim=-1)
 
 
 def percentile(x: torch.Tensor, percentage: float) -> torch.Tensor:

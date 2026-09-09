@@ -134,57 +134,49 @@ class ActorCriticAgent(nn.Module):
         action: torch.Tensor,
         reward: torch.Tensor,
         termination: torch.Tensor,
+        *,
+        expert: bool = False,
     ) -> Mapping[str, torch.Tensor]:
         self.train()
-        with self._amp():
-            dist = self.dist(latent[:, :-1])
-            raw_value = self.critic(latent)
-            log_prob = dist.log_prob(action)
-            entropy = dist.entropy()
-            value = self.twohot.decode(raw_value)
-            slow_value = self.slow_value(latent)
-            returns = lambda_return(reward, value, termination, self.gamma, self.lambd)
-            slow_returns = lambda_return(reward, slow_value, termination, self.gamma, self.lambd)
+        latent = latent.detach()
+        for skipped in range(32):
+            bounds = self.lowerbound_ema.value, self.upperbound_ema.value
+            with self._amp():
+                dist = self.dist(latent[:, :-1])
+                raw_value = self.critic(latent)
+                log_prob = dist.log_prob(action.to(torch.float32))
+                value = self.twohot.decode(raw_value)
+                slow_value = self.slow_value(latent)
+                returns = lambda_return(reward, value, termination, self.gamma, self.lambd)
+                slow_returns = lambda_return(reward, slow_value, termination, self.gamma, self.lambd)
+                value_loss = self.twohot(raw_value[:, :-1], returns.detach())
+                slow_value_loss = self.twohot(raw_value[:, :-1], slow_returns.detach())
 
-            value_loss = self.twohot(raw_value[:, :-1], returns.detach())
-            slow_value_loss = self.twohot(raw_value[:, :-1], slow_returns.detach())
-            low = self.lowerbound_ema(percentile(returns, 0.05))
-            high = self.upperbound_ema(percentile(returns, 0.95))
-            scale = torch.maximum(torch.ones_like(high), high - low)
-            advantage = (returns - value[:, :-1]) / scale
-            policy_loss = -(log_prob * advantage.detach().squeeze(-1)).mean()
-            entropy_loss = entropy.mean()
-            loss = policy_loss + value_loss + slow_value_loss - self.entropy_coef * entropy_loss
+                if expert:
+                    policy_loss = -log_prob.mean()
+                    entropy_loss = log_prob.new_zeros(())
+                else:
+                    low = self.lowerbound_ema(percentile(returns, 0.05))
+                    high = self.upperbound_ema(percentile(returns, 0.95))
+                    scale = torch.maximum(torch.ones_like(high), high - low)
+                    advantage = (returns - value[:, :-1]) / scale
+                    policy_loss = -(log_prob * advantage.detach().squeeze(-1)).mean()
+                    entropy_loss = dist.entropy().mean()
+                loss = policy_loss + value_loss + slow_value_loss - self.entropy_coef * entropy_loss
 
-        optimize(self, self.optimizer, self.scaler, loss, self.grad_clip)
+            if optimize(self, self.optimizer, self.scaler, loss, self.grad_clip):
+                break
+            self.lowerbound_ema.value, self.upperbound_ema.value = bounds
+        else:
+            raise RuntimeError("STORM actor-critic gradients overflowed in 32 consecutive attempts.")
         self.update_slow_critic()
+        prefix = "expert" if expert else "ac"
         return {
-            "ac/loss": loss.detach(),
-            "ac/policy": policy_loss.detach(),
-            "ac/value": value_loss.detach(),
-            "ac/slow_value": slow_value_loss.detach(),
-            "ac/entropy": entropy_loss.detach(),
-            "ac/return": returns.mean().detach(),
-        }
-
-    def update_expert(
-        self,
-        feature: torch.Tensor,
-        action: torch.Tensor,
-        returns: torch.Tensor,
-    ) -> Mapping[str, torch.Tensor]:
-        self.train()
-        with self._amp():
-            feature = feature.detach()
-            dist = self.dist(feature)
-            bc_loss = -dist.log_prob(action.to(torch.float32)).mean()
-            value_loss = self.twohot(self.critic(feature), returns)
-            loss = bc_loss + value_loss
-
-        optimize(self, self.optimizer, self.scaler, loss, self.grad_clip)
-        self.update_slow_critic()
-        return {
-            "expert/bc": bc_loss.detach(),
-            "expert/value": value_loss.detach(),
-            "expert/ac_loss": loss.detach(),
+            f"{prefix}/ac_loss" if expert else "ac/loss": loss.detach(),
+            f"{prefix}/bc" if expert else "ac/policy": policy_loss.detach(),
+            f"{prefix}/value": value_loss.detach(),
+            f"{prefix}/slow_value": slow_value_loss.detach(),
+            f"{prefix}/entropy": entropy_loss.detach(),
+            f"{prefix}/return": returns.mean().detach(),
+            f"{prefix}/skipped_steps": skipped,
         }

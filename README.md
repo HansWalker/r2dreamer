@@ -4,7 +4,27 @@ This comparison framework is based on [R2-Dreamer][r2dreamer]. It trains capacit
 STORM, TD-MPC2, LeWorldModel, and Temporal Straightening models on DeepMind Control Suite tasks with
 64x64 image observations and optional expert pretraining.
 
-## Instructions
+## Code Map
+
+| Path | Responsibility |
+|---|---|
+| `main.py` | Resolve and validate the matrix once, collect datasets, then train and evaluate each run. |
+| `train.py` | Hydra entrypoint for a single training run. |
+| `training/trainer.py` | Model creation, resume, expert pretraining, and online scheduling. |
+| `training/dreamer.py`, `training/storm.py`, `training/planning.py` | Family-specific updates, replay adapters, and environment policies. |
+| `models/<family>/` | Architecture, objectives, and optimizers; Dreamer/STORM variants live in `cores/`. |
+| `models/shared/`, `models/planning.py` | Common numerical layers, physical-state head, and latent planning. |
+| `buffer.py`, `dmc_expert/replay.py` | Online raw-episode replay and offline HDF5 sampling. |
+| `dmc_expert/collection.py`, `storage.py`, `tdmpc2.py` | Expert rollouts, dataset schema/resume, and external expert loading. |
+| `scripts/evaluate_dmc.py`, `training/evaluation.py` | Checkpoint evaluation, episode metrics, and physical-state forecasts. |
+| `training/protocol.py` | Experiment budgets, provenance, and checkpoint compatibility checks. |
+| `envs/` | DMC observations/actions and environment subprocesses. |
+| `configs/` | Shared budgets, family recipes, core selectors, and scenario definitions. |
+
+Active code is image-only. Archived state-input experiments, reference checkouts, notebooks, tests,
+and prior results stay under ignored `local/`; collection uses the external `TDMPC2_DIR` checkout.
+
+## Setup
 
 This repository is tested with Ubuntu 22.04 and Python 3.10; the pinned wheels also support Python
 3.11. The setup script creates or updates the shared `environment/` virtual environment, installs
@@ -25,7 +45,7 @@ repeated with `python -m scripts.check_dmc_setup`. Before a full experiment, run
 `python -m scripts.smoke_models` to exercise every configured model's update, checkpoint, policy,
 and latent-rollout path.
 
-### DMC expert experiments
+## Run
 
 Expert datasets use the `dmc_expert_hdf5_dense_v1` layout: each dataset directory contains
 `metadata.json`, `data.hdf5`, and `progress.json`. The primary experiments use 64x64 RGB observations
@@ -98,8 +118,8 @@ succeeds, and select the compute device with
 evaluates finished training runs, and resumes interrupted expert or online training. Set
 `training.overwrite: true` to delete existing runs and start them again.
 
-Run each reported experiment with independent training seeds. Log directories include the seed, so a
-Hydra multirun does not mix checkpoints:
+The initial matrix uses one training seed, so it does not estimate training-seed variability.
+Additional independent seeds can be run separately without mixing checkpoints:
 
 ```bash
 python3 train.py --config-name offline_dmc_expert_gru_vision --multirun \
@@ -118,6 +138,8 @@ python3 train.py --config-name offline_dmc_expert_mamba3_vision \
 tensorboard --logdir ./logdir
 ```
 
+## Checkpoints
+
 Checkpoint names identify their phase: `pretrain_latest.pt` resumes interrupted expert training,
 `pretrained.pt` is the completed expert-pretraining state, `pretrained_best.pt` is its best
 validation-return state, `latest.pt` resumes online training, `best.pt` is the best online
@@ -125,43 +147,105 @@ validation state, and `final.pt` is the completed online state. Checkpoints and 
 written atomically so an interrupted write does not replace the previous valid file. Production
 evaluation reports `final.pt` as the primary result and `best.pt` as a supplementary result. The best
 checkpoint is chosen lexicographically by mean validation return, sustained success, and then later
-training step. The physical-state probe is run only for the primary final checkpoint.
+training step. Physical-state prediction is evaluated only for the primary final checkpoint.
+
+Checkpoints retain their original source/runtime fingerprints. New checkpoints separately validate
+model settings and the training recipe: logging/save intervals and unrelated source edits do not block
+resume. Older checkpoints without compatibility metadata still require their original training settings.
+Source stays frozen within a running orchestration; restart the process after making changes. Resumed
+checkpoints record their parent checkpoint and its provenance. Evaluation has its own version, so metric
+fixes can be applied to compatible saved weights without relabeling their training provenance.
 
 Intermediate checkpoint selection uses five policy episodes. All families skip rollout evaluation
 during expert pretraining, then evaluate at the start of online training and every 20,000 steps through
 80,000 steps. Reported final metrics still use 50 fresh episodes.
 
-The image models keep each family's visual design rather than routing pixels through shared state
-MLPs:
-
-- Dreamer uses its convolutional encoder and spatial convolutional decoder.
-- STORM uses its Conv-BatchNorm-ReLU encoder and transposed-convolution decoder with Transformer,
-  sliding-window attention, Mamba3, S5, or Hyena sequence dynamics.
-- LeWorldModel uses a compact train-from-scratch ViT and its decoder-free latent objective.
-- Temporal Straightening combines spatial ResNet tokens with its native proprioceptive embedding,
-  aggregate-cosine curvature, and a convolutional decoder.
-- TD-MPC2 uses its native three-frame pixel stack, four-layer encoder, and random-shift augmentation.
+## Data And Metrics
 
 Each scenario is collected once into one 10,500-episode dataset. Episodes 0 through 9,999 are available
 to training, while episodes 10,000 through 10,499 are reserved for evaluation. The RGB array is about
-60 GiB before HDF5 compression. Collection also stores simulator state for the held-out physical-state
-probe. Temporal Straightening alone receives each task's configured proprioceptive subset;
-target-relative state remains excluded.
+60 GiB before HDF5 compression. Collection also stores simulator state as supervised labels. Every
+family receives images only; physical measurements never enter the encoder or policy as inputs.
 
 Collection stores a two-coordinate task relation beside each image: cart position and pole-angle error
 for Cartpole, finger-to-target for Reacher, and ball-to-moving-cup-target for Ball-in-Cup. LeWorldModel and
-Temporal Straightening train a detached readout for this label; it does not alter their encoder or
-predictor objective. Their online replay computes the identical relation from simulator state but removes
-it before encoding. The held-out range in the same HDF5 file supplies physical-state prediction data.
+Temporal Straightening derive these relations from the shared physical-state head for planning, rather
+than learning duplicate goal outputs. All five families use the same targets within each scenario:
+
+| Scenario | Learned physical targets | Outputs |
+| --- | --- | --- |
+| Cartpole | Cart position, pole cosine/sine, cart velocity, pole angular velocity | 5 |
+| Reacher | Cosine/sine of each joint angle, fingertip-to-target vector, joint velocities | 8 |
+| Ball-in-Cup | Cup/ball positions and velocities in the simulator's planar x/z coordinates | 8 |
+
+Reacher angles are encoded on read, removing arbitrary full revolutions from the labels. Cartpole
+already supplies cosine/sine. Velocities remain useful history-dependent targets, not quantities that
+can be uniquely recovered from one frame. Pixel resolution and occlusion still limit observability.
+Existing HDF5 observations and collection metadata are unchanged; no recollection is needed.
+
+Its own Adam optimizer minimizes standardized state MSE on detached observed features, using 256
+targets per model update. Training-split mean and standard deviation are fixed before pretraining and
+saved with the head and its optimizer. Online-only runs use zero mean and unit scale. No physical-state,
+reward, or planning loss from this head updates the native representation or dynamics. Online replay
+computes identical labels from the simulator. The held-out range supplies prediction evaluation data.
 Dataset metadata fingerprints the expert checkpoint, collector, external TD-MPC2 source, and collection
 runtime so an interrupted collection cannot resume into a mixture of incompatible trajectories.
+Completed datasets are reused after checking their task, splits, action repeat, image size, and HDF5
+layout. Reuse does not load the expert or require its current checkpoint path, source hash, or runtime
+to match, and leaves the original dataset identity and provenance intact.
 
 Evaluate an image-model checkpoint on that held-out dataset. Every family reports fresh policy
-return, one-step success, sustained success, and physical-state prediction. LeWorldModel and Temporal
-Straightening remain reward-free during representation training; validation return only selects
-checkpoints.
-Their planners minimize the fixed DMC success geometry predicted from latent state, with no goal
-image supplied at evaluation time:
+return, late-episode success, first-hit/sustained-success diagnostics, and physical-state prediction.
+Primary success requires the reward threshold on at least 90% of the final 20% of each episode
+(`evaluation.maintenance_occupancy` and `evaluation.maintenance_fraction`). Evaluation protocol
+`dmc_evaluation_v8` reports supplementary physical-state RMSE separately for each physical coordinate
+at each prediction horizon, in its original units. It includes constant coordinates and does not divide
+by dataset variance or average unrelated units into one score. JSON stores these values in
+`physical_state_prediction.rmse["<horizon>"]["<coordinate>"]`, for example `"1"` and `"velocity[0]"`.
+Reacher's angle coordinates are `cos(position[0])`, `sin(position[0])`, and the corresponding joint-1
+pair. Cosine/sine are unitless; other positions and velocities retain metres, radians, and seconds.
+Separate `derived_rmse` and `derived_observed_rmse` report Reacher fingertip position/velocity and
+Ball-in-Cup target separation/ball-minus-cup velocity. These use analytic DMC geometry, with no extra
+learned outputs; kinematics are calculated per rollout before averaging predictions.
+Evaluation uses the head saved in the checkpoint, with no fitting on held-out data. A shared per-token
+projection and MLP decode LeWorldModel's and Temporal Straightening's native latent-history windows;
+TS retains ordered spatial patches. Dreamer and STORM use temporally conditioned state, while TD-MPC2
+uses its stacked-image latent. Forecast history contains only the observed prefix and predicted future
+features, never actual future observations. `observed_rmse` separately measures decoding of observed
+features, helping distinguish readout error from accumulated dynamics error. JSON records
+`readout_history_length`, `readout_updates`, and `readout_examples`. RMSE still depends on the readout,
+not only the dynamics; do not interpret it as a decoder-independent measure of world-model quality.
+All models now receive the same 64-image prefix and its 63 actions, with no earlier episode history.
+They then consume the same recorded future actions, feeding back only predicted internal states.
+Physical measurements are decoded for scoring, never fed back into dynamics. Errors are reported after
+1, 5, 10, 25, 50, and 100 agent actions. Real future images are used only in the separate observed-state
+decoding diagnostic. Native memory mechanisms are unchanged: default STORM still retains its configured
+window, planners retain their short histories, and TD-MPC2 constructs frame stacks inside the common
+prefix. `persistence_rmse` holds the last decoded observed state constant; it does not receive true
+simulator state. `derived_persistence_rmse` provides the corresponding kinematic baseline.
+
+Prediction windows come only from the held-out episode range, never the training range. The evaluator
+rejects overlapping splits and attempted reads from training episodes. The 128-window default budget
+is split equally between uniform starts and motion-focused starts. For the latter, select the most
+active forecast segment among eight candidate starts in its held-out episode, using squared position
+increments scaled by that episode's coordinate ranges (floor 1e-3). These labels affect selection only,
+not model inputs or fitting. This favors motion when available; it cannot create movement in stationary
+data. Aggregate scores describe this stratified benchmark, not a uniform sample of task experience.
+`cohorts.uniform` and `cohorts.motion` separately report all errors and baselines. Every JSON records the
+exact `windows` (episode, start, forecast start, cohort, motion score), reproducible from `state_seed`
+independently of model family or training seed. Models receive identical windows within each scenario.
+
+Dreamer/STORM use native latent sampling;
+`state_samples` defaults to eight rollouts whose decoded physical predictions are averaged before RMSE.
+Deterministic planners need one rollout. `state_batch_size` caps concurrent rollout samples, including
+these repetitions. Evaluation records the history policy, sample count, and seed.
+The `dmc_physical_state_v2` target layout requires fresh v20 training checkpoints. Older heads cannot
+be resumed under the new meanings (including Reacher, whose output width stays eight). Existing
+datasets remain reusable. The v8 evaluation changes do not require retraining v20 checkpoints; rerun
+evaluation to obtain the common-prefix metrics. Do not mix previous prediction scores with v8 scores.
+LeWorldModel and Temporal Straightening remain reward-free during representation training;
+validation return only selects checkpoints. Their planners minimize the fixed DMC success geometry
+predicted from latent state, with no goal image supplied at evaluation time:
 
 ```bash
 python3 -m scripts.evaluate_dmc \
@@ -171,49 +255,44 @@ python3 -m scripts.evaluate_dmc \
   --dataset "$DMC_EXPERT_VISION_DATA_DIR/cartpole_balance_sparse"
 ```
 
-The image cohort is the comparison. Every family receives 5,000 expert updates and 10,000 online
-updates, with exactly 1,024 sampled observations from 16 source episodes in each world-model or
-representation update. Dreamer and STORM use one 64-frame sequence per source episode; TD-MPC2,
-LeWorldModel, and Temporal Straightening use sixteen native four-frame clips per source episode. Online
-replay has a shared rolling capacity of 20,000 transitions and training starts after 1,024 collected
-transitions. LeWorldModel and Temporal Straightening collect
+## Training Budget
+
+Every family receives 5,000 expert updates and 10,000 online
+updates, sampling from 16 source episodes in each world-model or representation update. Dreamer and
+STORM use one 64-frame sequence per source episode (batch 16); TD-MPC2, LeWorldModel, and Temporal
+Straightening use twenty-one native four-frame clips per source episode (batch 336). Online
+replay has a shared rolling capacity of 20,000 transitions. Updates require both the 1,024-transition
+warmup and 16 usable source episodes; the scheduler then catches up to the update budget.
+LeWorldModel and Temporal Straightening collect
 with their own planners and continue their unchanged representation objectives; they receive no actor,
-critic, reward, or behavior-cloning loss. Each family retains its native input branches, visual frontend,
-objective, and planner while tasks, action spaces, sampled-data budget, update count, and replay capacity
-are matched.
+critic, reward, or behavior-cloning loss. Tasks, action spaces, adjacent-state target counts, update
+counts, and replay capacity are matched; family-specific objectives and planners remain separate.
 Dreamer and STORM also use 512 starting states for each imagined controller update; their native ways
 of obtaining those starts remain different.
 
-The observation budget is the controlled data/compute measure. Every update encodes 1,024 images.
-Dreamer has 1,024 RSSM state targets per update, STORM has 1,008 adjacent-state targets, and the
-short-horizon planning models have 768 adjacent-state targets. Training logs and evaluation JSON
-record both counts so this consequence of retaining each family's native temporal horizon remains
-explicit.
+Each update has 1,008 adjacent-state targets. Dreamer additionally trains 16 initial-state targets,
+for 1,024 total RSSM state targets; none are masked out. Dreamer and STORM sample 1,024 observations
+per update, while the short-horizon planning models sample 1,344. It is not an equal-compute budget.
+Training logs and evaluation JSON
+record both observation and dynamics-target counts. Use a fresh training output directory for this
+recipe; existing collected datasets remain compatible.
 
-All experiment configs enter through `train.py`. The shared lifecycle in `training/trainer.py`
-handles pretraining, online scheduling, evaluation, logging, checkpoints, and resume state.
-Each module under `training/` contains only its family-specific construction and update hooks.
+## Models
 
-The `scenario` selection keeps each DMC task, dataset directory, action shape, success geometry, and
-planning horizon together. Active benchmark values are `cartpole_balance_sparse`, `reacher`, and
-`ball_in_cup`.
-
-Only the Mamba3 configs require the Mamba runtime, but the setup script installs one shared
-environment so every comparison model runs against the same PyTorch and DMC dependencies.
-
-The first five commands use the Dreamer training recipe and share the Dreamer encoder, posterior,
-prior, decoders, and losses; only the deterministic sequence core changes. The next five commands
-use the native STORM recipe and share the STORM encoder, observation-only posterior, and training
+The five Dreamer variants share their convolutional encoder/decoder, posterior, prior, and losses;
+only the deterministic sequence core changes. The five STORM variants share their
+Conv-BatchNorm-ReLU encoder, transposed-convolution decoder, observation-only posterior, and training
 losses; only the sequence core changes. Dreamer sliding attention streams through the episode with
 a 64-step rolling KV cache. The default STORM Transformer retains its fixed 16-step policy context;
 STORM sliding attention streams through the whole episode with a 64-token KV window. Mamba3 and
 S5 carry fixed-size recurrent states until the episode ends. Hyena trains with causal FFT
 convolutions and streams with an exact rolling 64-token filter history.
 
-Trainable capacity is centered on 5.25M parameters without inactive padding. Frozen target critics
-and value networks are reported separately because they are optimizer state, not independently
-trainable capacity. The remaining same-task spread comes mostly from action-conditioned modules,
-including TD-MPC2's five Q networks.
+The learning/control budget is centered on 5.25M parameters without inactive padding. It includes
+encoders, dynamics, prediction heads, controllers, and decoders whose losses train the representation.
+Temporal Straightening's detached visualization decoder is optional and reported separately, as are
+frozen target-network copies. Neither counts toward the matched budget. The remaining same-task
+spread comes mostly from action-conditioned modules, including TD-MPC2's five Q networks.
 
 Run the complete image-model and scenario matrix after changing any architecture setting:
 
@@ -221,10 +300,20 @@ Run the complete image-model and scenario matrix after changing any architecture
 python3 -m scripts.model_size_report
 ```
 
-The report breaks each model into encoder, dynamics, decoder, prediction heads, and controller. It
-checks each image model against the component proportions of its own reference implementation, then
-fails if a component differs by more than 10%, a same-task spread exceeds 65K parameters, a recurrent
-pair gap exceeds 2K, or a model moves more than 60K away from the shared target.
+The standalone report breaks each model into encoder, dynamics, decoder, prediction heads, and
+controller, plus the physical-state head, auxiliary weights, and frozen copies. The detached head is
+auxiliary for Dreamer, STORM, and TD-MPC2; it is part of the controller budget for the two goal planners.
+It checks component proportions
+against each family's reference implementation, using the scratch-ResNet variant for Temporal
+Straightening. It fails if a component's relative share differs by more than 10%, a same-task budget
+spread exceeds 50K parameters, a recurrent pair gap exceeds 2K, or a model moves more than 50K away
+from the shared target. These size checks do not run inside training.
+
+Temporal Straightening has 5,248,804 to 5,249,009 learning/control parameters across the three scenarios:
+about 19.6% encoder, 79.4% dynamics, and 1.0% physical readout. Its six predictor layers retain roughly
+equal attention and feedforward parameter allocations. Visualization is disabled by default;
+`jepa_model.decoder.enabled=true` adds 1,526,355 separately reported parameters. Its reconstruction
+losses still receive detached latents and do not train the encoder or predictor.
 
 The Dreamer and STORM variants use the shared architecture budget in `configs/dmc_model.yaml`, while
 retaining their family-specific input transforms, normalization, and activation functions. Dreamer's prior,
@@ -232,37 +321,35 @@ posterior, and recurrent settings live in `configs/model/_base_.yaml`; the corre
 settings live in `configs/storm_dmc.yaml`. Their implementations remain separate under
 `models/dreamer` and `models/storm`.
 
-The additional configs bring the comparison to five model families: Dreamer, STORM,
-LeWorldModel, Temporal Straightening, and TD-MPC2. Dreamer has five sequence-core variants and STORM
-has five, so there are thirteen configurations in total. Eleven use their native reward-driven online
-updates. LeWorldModel and Temporal Straightening instead continue their representation objectives on
-self-collected trajectories.
-
-- [TD-MPC2][tdmpc2] keeps its pixel encoder, random-shift augmentation, SimNorm latent model,
+- [TD-MPC2][tdmpc2] keeps its three-frame pixel stack, encoder, random-shift augmentation, SimNorm latent model,
   distributional reward and five-critic losses, Gaussian policy prior, target critics, and MPPI planner.
-- [LeWorldModel][leworldmodel] keeps its image ViT, three-frame autoregressive prediction, AdaLN-zero
+- [LeWorldModel][leworldmodel] keeps its train-from-scratch image ViT, three-frame autoregressive prediction, AdaLN-zero
   action conditioning, learned projectors, SIGReg, and CEM planner.
-- [Temporal Straightening][temporal-straightening] keeps its visual and proprioceptive encoders,
-  decoder, causal action-conditioned prediction, stop-gradient targets, visual cosine-curvature
-  objective, reconstruction, and gradient-based action planning.
+- [Temporal Straightening][temporal-straightening] keeps its visual encoder,
+  causal action-conditioned prediction, stop-gradient targets, visual cosine-curvature objective,
+  and gradient-based action planning. Its detached reconstruction decoder remains available for
+  visualization but is disabled in the comparison runs. Removing the proprioceptive branch is a
+  deliberate deviation; the remaining visual prediction term retains its previous effective weight.
 
-LeWorldModel and Temporal Straightening are kept as goal-conditioned representation models. They do
-not receive added reward or value heads. During the online phase, each model's planner supplies the
-actions and its unchanged self-supervised loss trains on the resulting replay samples. Their small
-task-relation readout is trained on detached latents and used only to expose each DMC task's native
-success region to the planner.
+The goal planners use task-relation outputs of the detached physical readout. During action
+optimization its weights are fixed, but gradients can pass through it and the dynamics to candidate
+actions. Planning and evaluation share the same autoregressive rollout implementation.
+Temporal Straightening computes action gradients in batches of at most
+`jepa_model.planner.gradient_batch_size=32` candidate trajectories. This bounds planning memory
+without changing the number of environments, restarts, iterations, or future steps, and preserves
+the full-batch cost normalization. The batch size is an execution setting, not a checkpoint recipe.
 
 The shared trainer does not impose one optimizer or update rule on every family. Dreamer keeps its
 joint world-model/actor-critic update; STORM keeps one separate world-model and imagined actor-critic
 update per shared update; TD-MPC2 keeps its joint latent-model/Q update,
 separate policy update, and soft target-Q update; LeWorldModel keeps AdamW and its prediction plus
 SIGReg objective; and Temporal Straightening keeps separate Adam/AdamW optimizers for its encoder,
-predictor, action encoder, and decoder. The common fixed-update expert phase, 64x64 images, and matched
-parameter budget are deliberate comparison adaptations rather than claims about the original paper
-defaults. Sequence lengths remain family-specific where the reference recipes differ, so batch sizes are
-chosen to equalize sampled observations while source-episode diversity is held constant.
+predictor, action encoder, and optional visualization decoder. The common fixed-update expert phase,
+64x64 images, and matched parameter budget are deliberate comparison adaptations rather than claims
+about the original paper defaults. Sequence lengths remain family-specific where the reference recipes
+differ, so batch sizes equalize adjacent-state targets while source-episode diversity is held constant.
 
-The production configs use the predeclared `dmc_frozen_defaults_v15` hyperparameter protocol. Recurrent
+The production configs use the predeclared `dmc_frozen_defaults_v20` hyperparameter protocol. Recurrent
 variants inherit one unchanged family recipe: Dreamer uses LaProp at `4e-5`, batch size 16, and AGC
 0.3; STORM uses Adam at `1e-4` for the world model and `3e-5` for the actor-critic, batch size 16, and
 its reference gradient limits. TD-MPC2 uses its `3e-4` reference learning rate,
@@ -270,29 +357,27 @@ while LeWorldModel and Temporal Straightening retain their native optimizer sepa
 set only by the shared parameter budget. These defaults must be frozen before production runs and must
 not be adjusted for individual tasks or variants after observing results.
 
-All active STORM variants live under `models/storm`. Collection loads an external TD-MPC2
-checkout from `TDMPC2_DIR`; neither training path imports an upstream reference checkout from this
-repository. The retired state-input ablation, reference copies, old notebooks, tests, and prior
-experiment artifacts live under `local/`, which is excluded from version control.
+Dreamer, STORM, and TD-MPC2 share `reward_discount: 0.99` for expert value targets, online returns,
+and reward-based planning. This sets an effective reward horizon of 100 agent steps, or 200 physics
+steps with the shared action repeat of two. Override `reward_discount` to change all three together;
+family-specific discounts are rejected by the recipe check. Imagination and planning rollout lengths
+remain model-specific. LeWorldModel and Temporal Straightening do not optimize discounted rewards.
+
+All Dreamer variants use a tanh-squashed Gaussian actor instead of clipping Gaussian samples.
+Behavior cloning and imagined policy updates use its transformed log probability; entropy includes
+the tanh correction. This is a deliberate policy adaptation, with unchanged parameter counts and
+standard-deviation settings. Existing Gaussian-policy Dreamer checkpoints require a fresh training run;
+the expert datasets remain reusable.
+
+STORM's expert critic uses the same bootstrapped lambda returns, symlog two-hot loss, and slow-critic
+regularization as its online critic; only the expert actor uses behavior cloning. Truncated sequences
+bootstrap rather than treating time limits as terminals. Its continuous-policy entropy includes the
+tanh transformation. AMP overflows retry only the affected update (at most 32 attempts); update
+budgets, schedulers, target networks, and auxiliary heads advance only after a successful optimizer
+step. These recipe and target changes require fresh v20 training checkpoints, but collected datasets are reusable.
 
 For easier code reading, inline tensor shape annotations are provided. See
 [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
-
-
-## DMC environments
-
-The active comparison targets DeepMind Control Suite with image observations.
-
-| Environment | Observation | Action | Budget | Description |
-|-------------------|---|---|---|-----------------------|
-| [DMC Vision](https://github.com/deepmind/dm_control) | Image | Continuous | 80K | DeepMind Control Suite with image inputs. |
-
-Choose an image config explicitly. The `scenario` group keeps the task, dataset, and action shape
-together.
-
-```bash
-python3 train.py --config-name offline_dmc_expert_gru_vision scenario=cartpole_balance_sparse
-```
 
 ## Headless rendering
 

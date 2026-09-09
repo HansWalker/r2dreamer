@@ -7,7 +7,7 @@ from tensordict import TensorDict
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
 
-from models.shared.utils import to_f32
+from models.shared.physical_state import STATE_KEY, PhysicalStateHead
 from optim import LaProp, clip_grad_agc_
 
 from .model import DreamerModel
@@ -21,7 +21,7 @@ class Dreamer(DreamerModel):
         self.kl_free = float(config.kl_free)
         self.imag_horizon = int(config.imag_horizon)
         self.imag_batch_size = int(config.imag_batch_size)
-        self.horizon = int(config.horizon)
+        self.gamma = float(config.gamma)
         self.lamb = float(config.lamb)
         self.return_ema = ReturnEMA(device=self.device)
         self.slow_target_update = int(config.slow_target_update)
@@ -65,6 +65,7 @@ class Dreamer(DreamerModel):
         if config.compile:
             print("Model | compiling=torch.compile")
             self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")
+        self.state_head = PhysicalStateHead(self.rssm.feat_size, config.state_head)
 
     def training_state_dict(self):
         return {
@@ -81,25 +82,29 @@ class Dreamer(DreamerModel):
         self._slow_value_updates = int(state["slow_value_updates"])
 
     def _update_slow_target(self):
-        """Update slow-moving value target network."""
+        """Prepare the target for the next update, counting only successful steps."""
+        self._slow_value_updates += 1
         if self._slow_value_updates % self.slow_target_update == 0:
             with torch.no_grad():
                 mix = self.slow_target_fraction
                 for v, s in zip(self.value.parameters(), self._slow_value.parameters(), strict=True):
                     s.data.copy_(mix * v.data + (1 - mix) * s.data)
-        self._slow_value_updates += 1
 
     def _optimizer_step(self, metrics):
         """Apply one optimizer step and append optimizer metrics."""
         self._scaler.unscale_(self._optimizer)
         self._agc(self._named_params.values())
+        scale = self._scaler.get_scale()
         self._scaler.step(self._optimizer)
         self._scaler.update()
-        self._scheduler.step()
         self._optimizer.zero_grad(set_to_none=True)
+        if self._scaler.get_scale() < scale:
+            return False
+        self._scheduler.step()
+        self._update_slow_target()
         metrics["opt/lr"] = self._scheduler.get_last_lr()[0]
         metrics["opt/grad_scale"] = self._scaler.get_scale()
-        return metrics
+        return True
 
     def train(self, mode=True):
         super().train(mode)
@@ -115,7 +120,7 @@ class Dreamer(DreamerModel):
         embed = self.encoder(p_obs)
         feat, state_update = self.rssm.actor_step(embed, state, obs["is_first"])
         action_dist = self.actor(feat)
-        action = (action_dist.mode if eval else action_dist.rsample()).clamp(-1.0, 1.0)
+        action = action_dist.mode if eval else action_dist.rsample()
         next_state = self.rssm.actor_state_after_action(state_update, action)
         return action, TensorDict(next_state, batch_size=state.batch_size)
 
@@ -126,32 +131,49 @@ class Dreamer(DreamerModel):
     def update(self, replay_buffer):
         """Sample a batch from replay and perform one optimization step."""
         contexts, data = replay_buffer.sample()
-        torch.compiler.cudagraph_mark_step_begin()
+        labels = data[STATE_KEY]
+        data = data.exclude(STATE_KEY)
         p_data = self.preprocess(data)
-        initial = self._replay_initial(contexts)
-        self._update_slow_target()
-        with autocast(
-            device_type=self.device.type,
-            dtype=torch.float16,
-            enabled=self.device.type == "cuda",
-        ):
-            metrics = self._cal_grad(p_data, initial)
-        self._optimizer_step(metrics)
+        for skipped in range(32):
+            torch.compiler.cudagraph_mark_step_begin()
+            initial = self._replay_initial(contexts)
+            return_ema = self.return_ema.ema_vals.clone()
+            with autocast(
+                device_type=self.device.type,
+                dtype=torch.float16,
+                enabled=self.device.type == "cuda",
+            ):
+                metrics, feature = self._cal_grad(p_data, initial)
+            if self._optimizer_step(metrics):
+                break
+            self.return_ema.ema_vals.copy_(return_ema)
+        else:
+            raise RuntimeError("Dreamer gradients overflowed in 32 consecutive attempts.")
+        metrics["opt/skipped_steps"] = skipped
+        metrics.update(self.state_head.fit(feature, labels))
         return metrics
 
     def update_expert_pretrain(self, data, contexts=None):
         """Perform one supervised expert update from a reconstructed replay state."""
-        torch.compiler.cudagraph_mark_step_begin()
+        labels = data[STATE_KEY]
+        data = data.exclude(STATE_KEY)
         p_data = self.preprocess(data)
-        initial = self._replay_initial(contexts) if contexts is not None else self._initial_tuple(data.shape[0])
-        self._update_slow_target()
-        with autocast(
-            device_type=self.device.type,
-            dtype=torch.float16,
-            enabled=self.device.type == "cuda",
-        ):
-            metrics = self._cal_expert_pretrain_grad(p_data, initial)
-        return self._optimizer_step(metrics)
+        for skipped in range(32):
+            torch.compiler.cudagraph_mark_step_begin()
+            initial = self._replay_initial(contexts) if contexts is not None else self._initial_tuple(data.shape[0])
+            with autocast(
+                device_type=self.device.type,
+                dtype=torch.float16,
+                enabled=self.device.type == "cuda",
+            ):
+                metrics, feature = self._cal_expert_pretrain_grad(p_data, initial)
+            if self._optimizer_step(metrics):
+                break
+        else:
+            raise RuntimeError("Dreamer expert gradients overflowed in 32 consecutive attempts.")
+        metrics["opt/skipped_steps"] = skipped
+        metrics.update(self.state_head.fit(feature, labels))
+        return metrics
 
     @torch.no_grad()
     def _replay_initial(self, contexts):
@@ -227,8 +249,8 @@ class Dreamer(DreamerModel):
         )
 
         feat = self.rssm.get_feat(post_stoch, post_deter)
-        losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))
-        losses["con"] = torch.mean(-self.cont(feat).log_prob(1.0 - to_f32(data["is_terminal"])))
+        losses["rew"] = torch.mean(-self.reward(feat).log_prob(data["reward"].float()))
+        losses["con"] = torch.mean(-self.cont(feat).log_prob(1.0 - data["is_terminal"].float()))
         metrics = {
             "dyn_entropy": torch.mean(self.rssm.get_dist(prior_logit).entropy()),
             "rep_entropy": torch.mean(self.rssm.get_dist(post_logit).entropy()),
@@ -251,7 +273,7 @@ class Dreamer(DreamerModel):
         """Compute one world-model and actor-critic update."""
         batch_size, sequence_length = data["reward"].shape[:2]
         start_length = min(sequence_length, max(1, self.imag_batch_size // batch_size))
-        losses, metrics, _, post = self._world_model_loss(
+        losses, metrics, feature, post = self._world_model_loss(
             data,
             initial,
             return_cache=True,
@@ -277,7 +299,7 @@ class Dreamer(DreamerModel):
             imag_cont = self.cont(imag_feat).mean
             imag_value = self.value(imag_feat).mode()
             imag_slow_value = self._slow_value(imag_feat).mode()
-            disc = 1 - 1 / self.horizon
+            disc = self.gamma
             weight = torch.cumprod(imag_cont * disc, dim=1) / disc
             last = torch.zeros_like(imag_cont)
             term = 1 - imag_cont
@@ -302,9 +324,9 @@ class Dreamer(DreamerModel):
             post_stoch[:, -start_length:],
             post_deter[:, -start_length:],
         )
-        replay_last = to_f32(data["is_last"][:, -start_length:])
-        replay_term = to_f32(data["is_terminal"][:, -start_length:])
-        replay_reward = to_f32(data["reward"][:, -start_length:])
+        replay_last = data["is_last"][:, -start_length:].float()
+        replay_term = data["is_terminal"][:, -start_length:].float()
+        replay_reward = data["reward"][:, -start_length:].float()
         replay_boot = ret[:, 0].reshape(batch_size, start_length, 1)
         with torch.no_grad():
             replay_value = self.value(replay_feat).mode()
@@ -341,32 +363,32 @@ class Dreamer(DreamerModel):
         metrics["action_entropy"] = torch.mean(entropy)
         metrics["imag_starts"] = start[0].shape[0]
 
-        return self._backward_losses(losses, metrics)
+        return self._backward_losses(losses, metrics), feature.detach()
 
     def _cal_expert_pretrain_grad(self, data, initial):
         """Compute expert pretraining gradients without imagined policy rollouts."""
         losses, metrics, feat, _ = self._world_model_loss(data, initial, return_cache=False)
         # Feature t is the decision state for action t + 1 in the padded expert sequence.
         policy_feat = feat[:, :-1].detach()
-        expert_action = to_f32(data["action"][:, 1:])
+        expert_action = data["action"][:, 1:].float()
         bc_dist = self.actor(policy_feat)
         losses["bc"] = torch.mean(-bc_dist.log_prob(expert_action))
 
         last, term, reward = (
-            to_f32(data["is_last"]),
-            to_f32(data["is_terminal"]),
-            to_f32(data["reward"]),
+            data["is_last"].float(),
+            data["is_terminal"].float(),
+            data["reward"].float(),
         )
         with torch.no_grad():
             value = self.value(feat).mode()
             slow_value = self._slow_value(feat).mode()
-        disc = 1 - 1 / self.horizon
+        disc = self.gamma
         ret = self._lambda_return(last, term, reward, value, value, disc, self.lamb)
         weight = (1.0 - last)[:, :-1]
         losses["repval"] = self._value_loss(policy_feat, ret, slow_value[:, :-1], weight)
 
         metrics["bc_logprob"] = -losses["bc"]
-        return self._backward_losses(losses, metrics)
+        return self._backward_losses(losses, metrics), feat.detach()
 
     def _imagine(self, start, imag_horizon):
         """Roll out the policy in latent space."""
@@ -380,7 +402,7 @@ class Dreamer(DreamerModel):
                 # (B, F)
                 feat = self.rssm.get_feat(stoch, deter)
                 # (B, A)
-                action = self.actor(feat).rsample().clamp(-1.0, 1.0)
+                action = self.actor(feat).rsample()
                 # Append feat and its corresponding sampled action at the same time step.
                 feats.append(feat)
                 actions.append(action)
@@ -396,8 +418,8 @@ class Dreamer(DreamerModel):
         lamb=0 means fixed 1-step return.
         """
         assert last.shape == term.shape == reward.shape == value.shape == boot.shape
-        live = (1 - to_f32(term))[:, 1:] * disc
-        cont = (1 - to_f32(last))[:, 1:] * lamb
+        live = (1 - term.float())[:, 1:] * disc
+        cont = (1 - last.float())[:, 1:] * lamb
         interm = reward[:, 1:] + (1 - cont) * live * boot[:, 1:]
         out = [boot[:, -1]]
         for i in reversed(range(live.shape[1])):
@@ -407,5 +429,5 @@ class Dreamer(DreamerModel):
     @torch.no_grad()
     def preprocess(self, data):
         if "image" in data:
-            data["image"] = to_f32(data["image"]) / 255.0
+            data["image"] = data["image"].float() / 255.0
         return data
