@@ -162,6 +162,26 @@ during expert pretraining, then evaluate at the start of online training and eve
 
 ## Data And Metrics
 
+Before training, audit all three collected datasets with:
+
+```bash
+python -m scripts.check_dmc_data --dataset-root /absolute/path/to/data/dmc_expert_vision
+```
+
+Omit `--dataset-root` to use `DMC_EXPERT_VISION_DATA_DIR` or the matrix's default path. This read-only
+audit checks the HDF5 schema, completeness, train/held-out splits, every numeric transition, action
+bounds, returns, termination/discount consistency, physical goal labels, and exact duplicate
+trajectories across splits. It reports expert returns and motion statistics as quality diagnostics.
+By default it reads every valid image from 16 reproducibly sampled episodes per split; add
+`--full-images` to read every image, which requires substantially more disk I/O. No GPU or expert
+checkpoint is needed. Run after collection has stopped.
+
+Results are saved to `runs/dataset_audit/report.json` and one frame contact sheet per scenario.
+`FAIL` exits nonzero for structural/data errors or detected split leakage; `WARN` flags quality
+concerns such as mostly static episodes without rejecting them. Inspect the contact sheets as well:
+without replaying the simulator, the audit cannot prove that images/actions/states are correctly
+time-aligned. Use `--config-name dmc_smoke` for the smoke dataset, or `--override` for matrix overrides.
+
 Each scenario is collected once into one 10,500-episode dataset. Episodes 0 through 9,999 are available
 to training, while episodes 10,000 through 10,499 are reserved for evaluation. The RGB array is about
 60 GiB before HDF5 compression. Collection also stores simulator state as supervised labels. Every
