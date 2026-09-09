@@ -1,7 +1,9 @@
 """Full-size, checkpoint-free training/resource smoke check on existing expert data."""
 
 import argparse
+import copy
 import csv
+import hashlib
 import io
 import itertools
 import json
@@ -82,6 +84,31 @@ def pin_batch(value):
     return value
 
 
+def batch_digest(batch):
+    """Compare the actual CPU samples across storage/compilation benchmark cases."""
+    import torch
+
+    digest = hashlib.sha256()
+
+    def visit(value):
+        if torch.is_tensor(value):
+            value = value.detach().contiguous()
+            digest.update(f"{value.dtype}:{tuple(value.shape)}:".encode())
+            digest.update(value.numpy().tobytes())
+        elif hasattr(value, "items"):
+            for key, item in sorted(value.items()):
+                digest.update(str(key).encode())
+                visit(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                visit(item)
+        else:
+            digest.update(json.dumps(value).encode())
+
+    visit(batch)
+    return digest.hexdigest()
+
+
 def seed_online_replay(config, dataset, replay):
     """Translate complete expert episodes to the native online replay layouts, in RAM only."""
     import numpy as np
@@ -154,16 +181,24 @@ def run_worker(job):
         "phases": [],
         "resources": {},
         "seed_runs": job.get("seed_runs", 1),
+        "warmup_updates": job.get("warmup_updates", 1),
+        "sample_sha256": [],
     }
     device = torch.device(config.device)
     monitor = None
     envs = None
     stop = threading.Event()
     started = time.perf_counter()
+    compilation_counters = None
+    if config.model_family == "dreamer" and config.model.compile:
+        from torch._dynamo.utils import counters
+
+        compilation_counters = counters
 
     def measure(name, operation):
         stage = {"name": name}
         result["phases"].append(stage)
+        graphs_before = compilation_counters["stats"]["unique_graphs"] if compilation_counters is not None else 0
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.reset_peak_memory_stats(device)
@@ -177,6 +212,8 @@ def run_worker(job):
         finally:
             stage["seconds"] = time.perf_counter() - start
             stage.setdefault("status", "FAIL")
+            if compilation_counters is not None:
+                stage["compiled_graphs"] = compilation_counters["stats"]["unique_graphs"] - graphs_before
             if device.type == "cuda":
                 stage.update(
                     {
@@ -235,6 +272,8 @@ def run_worker(job):
 
             for step in range(job["updates"]):
                 batch = measure(f"sample/{step + 1}", sample)
+                if job.get("verify_samples"):
+                    result["sample_sha256"].append(batch_digest(batch))
                 update(f"expert/{step + 1}", lambda batch=batch: family.expert_update(model, batch))
                 del batch
 
@@ -292,6 +331,11 @@ def run_worker(job):
         )
         usage = resource.getrusage(resource.RUSAGE_SELF)
         result["resources"]["cpu_seconds"] = usage.ru_utime + usage.ru_stime
+        if compilation_counters is not None:
+            result["compilation"] = {
+                "unique_graphs": compilation_counters["stats"]["unique_graphs"],
+                "graph_breaks": dict(compilation_counters["graph_break"]),
+            }
         result["timing_projection"] = project_time(result)
         path = Path(job["result_path"])
         path.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8")
@@ -304,18 +348,26 @@ def project_time(result):
         return None
     config = OmegaConf.create(result["config_yaml"])
     rates = {}
+    cold_overhead = 0.0
     for name in ("sample", "expert", "online", "collect"):
-        times = [phase["seconds"] for phase in result["phases"] if phase["name"].startswith(name + "/")]
+        phases = [phase for phase in result["phases"] if phase["name"].startswith(name + "/")]
+        times = [phase["seconds"] for phase in phases]
         if times:
-            warm = times[1:] or times
+            discard = 1 if name == "collect" else result.get("warmup_updates", 1)
+            warm = times[discard:] or times[-1:]
             rates[name] = {
                 "samples": len(times),
+                "measured_samples": len(warm),
+                "compilation_in_measured_calls": sum(
+                    phase.get("compiled_graphs", 0) for phase in (phases[discard:] or phases[-1:])
+                ),
                 "cold_seconds": times[0],
                 "seconds_per_call": statistics.mean(warm),
                 "min_seconds": min(warm),
                 "max_seconds": max(warm),
-                "basis": "after first call" if len(times) > 1 else "cold call only; not steady state",
+                "basis": f"after {discard} warmup calls" if len(times) > discard else "insufficient warmup",
             }
+            cold_overhead += sum(max(0, seconds - statistics.mean(warm)) for seconds in times[:discard])
     expert = config["training"]["expert"]
     online = config["training"]["online"]
     expert_updates = int(expert["updates"]) if expert["enabled"] else 0
@@ -345,7 +397,6 @@ def project_time(result):
             "env_prime",
         }
     )
-    cold_overhead = sum(max(0, rate["cold_seconds"] - rate["seconds_per_call"]) for rate in rates.values())
     return {
         "rates": rates,
         "expert_updates": expert_updates,
@@ -362,7 +413,7 @@ def project_time(result):
             for seconds in expert_range
         ],
         "collection_included": collect_seconds is not None or calls == 0,
-        "steady_samples": all(rate["samples"] >= 3 for rate in rates.values()),
+        "steady_samples": all(rate["measured_samples"] >= 2 for rate in rates.values()),
     }
 
 
@@ -444,12 +495,15 @@ def run_job(job):
     log_path = path.with_name("stdout.log")
     started = time.perf_counter()
     returncode = 0
+    label = f"{job.get('case', 'serial')} | {job['name']}"
+    print(f"START | {label}", flush=True)
     try:
         execute(
-            job["name"],
+            label,
             [sys.executable, "-u", "-m", "scripts.smoke_training", "--worker"],
             log_path,
             input_text=json.dumps(job),
+            quiet=True,
         )
     except SystemExit as error:
         returncode = error.code
@@ -460,45 +514,179 @@ def run_job(job):
     )
     if returncode:
         result["status"] = "FAIL"
-    result.update(log=str(log_path), wall_seconds=time.perf_counter() - started)
+    result.update(case=job.get("case", "serial"), log=str(log_path), wall_seconds=time.perf_counter() - started)
+    print(f"{result['status']} | {label} | {result['wall_seconds']:.1f}s", flush=True)
     return result
 
 
-def compare_parallel(jobs, output):
+def write_summary(results, output, comparisons=()):
+    """Keep terminal/paste output short; full phase details remain in JSON and worker logs."""
+
+    def number(value, digits=2):
+        return "-" if value is None else f"{value:.{digits}f}"
+
+    lines = [
+        "Training smoke summary | no checkpoints",
+        "Seconds/call: sample/expert/online/collect (warm). Memory: process GPU / PyTorch reserved / host RAM, GiB.",
+        "Case | Run | BxT | Trainable/frozen M | Seconds/call | Memory GiB | GPU avg/max % | Hours/seed",
+    ]
+    for row in results:
+        label = f"{row.get('case', 'serial')} | {row['name']}"
+        if row["status"] != "PASS":
+            lines.append(f"FAIL | {label} | {row.get('error', 'see log')} | {row.get('log', '')}")
+            continue
+        config = OmegaConf.create(row["config_yaml"])
+        projection = row["timing_projection"]
+        rates = projection["rates"]
+        seconds = "/".join(
+            number(rates.get(name, {}).get("seconds_per_call"), 3) for name in ("sample", "expert", "online", "collect")
+        )
+        resources = row["resources"]
+        peak = resources.get("process_gpu_peak_mib")
+        reserved = max((phase.get("reserved_peak_mib", 0) for phase in row["phases"]), default=0)
+        memory = "/".join(
+            number(value / 1024 if value is not None else None)
+            for value in (peak, reserved, resources.get("host_peak_rss_mib"))
+        )
+        utilization = "/".join(
+            number(resources.get(f"device_utilization_{name}_percent"), 0) for name in ("mean", "max")
+        )
+        params = row["parameters"]
+        hours = "-".join(number(value) for value in projection["training_hours_range"])
+        lines.append(
+            f"{label} | {config.replay.batch_size}x{config.replay.sequence_length}"
+            f" | {params['trainable'] / 1e6:.3f}/{params['frozen'] / 1e6:.3f}"
+            f" | {seconds} | {memory} | {utilization} | {hours}"
+        )
+        if "compilation" in row:
+            compilation = row["compilation"]
+            lines.append(
+                f"Compilation | {row['name']} | graphs={compilation['unique_graphs']}"
+                f" | graph_breaks={sum(compilation['graph_breaks'].values())}"
+            )
+    if comparisons:
+        lines.append("Comparison | Wall speedup | Estimated warm speedup: sample/expert/online/collect")
+        for case in comparisons:
+            if not case["passed"]:
+                lines.append(f"FAIL | {case['name']} | {case.get('error', 'worker failure')}")
+                continue
+            ratios = "/".join(
+                number(case["warm_speedup"].get(name)) for name in ("sample", "expert", "online", "collect")
+            )
+            lines.append(f"{case['name']} | {case['wall_speedup']:.2f}x | {ratios}")
+    passed = sum(row["status"] == "PASS" for row in results)
+    lines.append(f"Workers: {passed}/{len(results)} passed. Full diagnostics: {output / 'report.json'}")
+    if not comparisons:
+        timing = timing_summary(results, results)
+        lower, upper = timing["serial_training_hours_range"]
+        lines.append(
+            f"Serial training subtotal: {lower:.1f}-{upper:.1f} hours"
+            f" ({timing['projected_runs']}/{len(results)} runs projected)."
+        )
+    if comparisons:
+        lines.append("Pair warm speedup = sum(serial rates) / max(concurrent rates); phases are not synchronized.")
+        lines.append("Wall ratios include startup. Cases run baseline first; OS/compiler caches are not cleared.")
+    lines.append("Hours exclude evaluation/checkpoint I/O; ranges bound prefetch overlap, not uncertainty.")
+    if any(not row["timing_projection"]["steady_samples"] for row in results if row.get("timing_projection")):
+        lines.append("Timing caution: fewer than two post-warmup calls in some phases; increase updates/rollout steps.")
+    if any(
+        rate.get("compilation_in_measured_calls", 0)
+        for row in results
+        if row.get("timing_projection")
+        for rate in row["timing_projection"]["rates"].values()
+    ):
+        lines.append("Timing caution: compilation occurred after warmup; inspect phase timings and increase warmup.")
+    if any(
+        not row.get("timing_projection", {}).get("collection_included", True)
+        for row in results
+        if row.get("timing_projection")
+    ):
+        lines.append("Collection was skipped for some runs; their projected hours omit environment interaction.")
+    lines.append("Short rollouts do not bound late-episode memory; GPU utilization is device-wide.")
+    text = "\n".join(lines) + "\n"
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "summary.txt").write_text(text, encoding="utf-8")
+    print("\n" + text, end="", flush=True)
+    print(f"Pasteable summary | {output / 'summary.txt'}", flush=True)
+
+
+def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None):
+    """Reuse serial baselines, then change only concurrency, compilation, or storage."""
     from main import run_jobs
 
-    report = {}
-    for name, parallelism in (("serial", 1), ("parallel", 2)):
-        results = [None] * len(jobs)
+    jobs = copy.deepcopy(jobs)
+    if compile_dreamer:
+        for job in jobs:
+            if job["config"]["model_family"] == "dreamer":
+                job["config"]["model"]["compile"] = False
+    for job in jobs:
+        job["verify_samples"] = True
+    report = {"runs": [], "comparisons": []}
 
-        def measure(item, name=name, results=results):
+    def run_case(name, selected, parallelism=1):
+        results = [None] * len(selected)
+
+        def measure(item):
             index, job = item
             path = output / name / job["name"] / "resources.json"
-            results[index] = run_job(dict(job, result_path=str(path)))
+            results[index] = run_job(dict(job, case=name, result_path=str(path)))
 
         started = time.perf_counter()
-        run_jobs(measure, list(enumerate(jobs)), parallelism)
-        report[name] = {"wall_seconds": time.perf_counter() - started, "runs": results}
-        if any(result["status"] != "PASS" for result in results):
-            break
-    passed = len(report) == 2 and all(row["status"] == "PASS" for group in report.values() for row in group["runs"])
-    report["passed"] = passed
-    if passed:
-        report["combined_wall_speedup"] = report["serial"]["wall_seconds"] / report["parallel"]["wall_seconds"]
-        report["warm_phase_slowdown"] = {
-            before["name"]: {
-                phase: after["timing_projection"]["rates"][phase]["seconds_per_call"] / rate["seconds_per_call"]
-                for phase, rate in before["timing_projection"]["rates"].items()
-            }
-            for before, after in zip(report["serial"]["runs"], report["parallel"]["runs"], strict=True)
-        }
-        print(f"Pair | combined wall-time speedup={report['combined_wall_speedup']:.2f}x", flush=True)
-        print("Pair | includes process startup; inspect warm-phase rates and repeat before selecting concurrency.")
+        run_jobs(measure, list(enumerate(selected)), parallelism)
+        wall = time.perf_counter() - started
+        report["runs"].extend(results)
+        return results, wall
+
+    baseline, _ = run_case("serial", jobs)
     output.mkdir(parents=True, exist_ok=True)
-    path = output / "parallel_report.json"
-    path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    print(f"Pair | {'PASS' if passed else 'FAIL'} | report={path}", flush=True)
-    return passed
+    (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    references = {row["name"]: row for row in baseline}
+    cases = [
+        (f"pair_{index}", [job for job in jobs if job["name"].split("/", 1)[1] in pair], 2)
+        for index, pair in enumerate(pairs, 1)
+    ]
+    for job in jobs:
+        if compile_dreamer and job["config"]["model_family"] == "dreamer":
+            compiled = copy.deepcopy(job)
+            compiled["config"]["model"]["compile"] = True
+            cases.append(("compiled", [compiled], 1))
+        if storage is not None:
+            local = copy.deepcopy(job)
+            local["config"]["training"]["expert"]["data_path"] = str(storage / job["config"]["scenario"]["dataset"])
+            cases.append(("local_data", [local], 1))
+
+    for name, selected, parallelism in cases:
+        before = [references[job["name"]] for job in selected]
+        if any(row["status"] != "PASS" for row in before):
+            report["comparisons"].append({"name": name, "passed": False, "error": "serial baseline failed"})
+            continue
+        after, wall = run_case(name, selected, parallelism)
+        case = {
+            "name": f"{name}: {', '.join(row['name'] for row in after)}",
+            "passed": False,
+            "parallelism": parallelism,
+            "wall_seconds": wall,
+        }
+        if all(row["status"] == "PASS" for row in after):
+            same_samples = all(a["sample_sha256"] == b["sample_sha256"] for a, b in zip(before, after, strict=True))
+            case.update(passed=same_samples, identical_samples=same_samples)
+            if not same_samples:
+                case["error"] = "sampled batches differ from the serial baseline"
+            case["wall_speedup"] = sum(row["wall_seconds"] for row in before) / wall
+            rates = [row["timing_projection"]["rates"] for row in before]
+            case["warm_speedup"] = {
+                phase: sum(rate[phase]["seconds_per_call"] for rate in rates)
+                / max(row["timing_projection"]["rates"][phase]["seconds_per_call"] for row in after)
+                for phase in rates[0]
+            }
+        report["comparisons"].append(case)
+        (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    report["passed"] = all(row["status"] == "PASS" for row in report["runs"]) and all(
+        case["passed"] for case in report["comparisons"]
+    )
+    (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    write_summary(report["runs"], output, report["comparisons"])
+    return report["passed"]
 
 
 def main():
@@ -513,12 +701,29 @@ def main():
         "--updates", type=int, default=1, help="Native updates per phase; keep production schedule lengths."
     )
     parser.add_argument(
+        "--warmup-updates", type=int, default=1, help="Initial updates excluded from warm timing means."
+    )
+    parser.add_argument(
         "--rollout-steps", type=int, help="Real batched collection steps (default: --updates); 0 skips DMC."
     )
     parser.add_argument("--override", action="append", default=[], help="Hydra matrix override.")
     parser.add_argument("--model-override", action="append", default=[], help="Hydra override for each selected model.")
     parser.add_argument(
         "--compare-parallel", action="store_true", help="Benchmark exactly two runs serially, then together."
+    )
+    parser.add_argument(
+        "--pair",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("MODEL_A", "MODEL_B"),
+        help="Repeat for specific concurrent pairs; serial baselines are shared.",
+    )
+    parser.add_argument("--compare-compile", action="store_true", help="Compare eager and compiled Dreamer modules.")
+    parser.add_argument(
+        "--compare-storage",
+        type=Path,
+        help="Compare with an existing copy of the same datasets at this root (no automatic copy).",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -527,6 +732,8 @@ def main():
         raise SystemExit(0 if run_worker(json.load(sys.stdin)) else 1)
     if args.updates < 1:
         parser.error("--updates must be positive")
+    if args.warmup_updates < 0:
+        parser.error("--warmup-updates cannot be negative")
     if args.rollout_steps is not None and args.rollout_steps < 0:
         parser.error("--rollout-steps cannot be negative")
     output = args.output.expanduser().resolve()
@@ -539,7 +746,9 @@ def main():
             for family, variants in matrix.models.items()
             for variant, entry in variants.items()
         }
-        scenarios, models = args.scenarios or list(matrix.scenarios), args.models or list(entries)
+        paired_models = list(dict.fromkeys(name for pair in args.pair for name in pair))
+        scenarios = args.scenarios or list(matrix.scenarios)
+        models = args.models or paired_models or list(entries)
         if set(scenarios) - set(matrix.scenarios) or set(models) - set(entries):
             parser.error("Unknown scenario or family/variant for this matrix")
         root = args.dataset_root or Path(str(matrix.evaluation.dataset_root))
@@ -568,6 +777,7 @@ def main():
                         "name": f"{scenario}/{name}",
                         "config": OmegaConf.to_container(config),
                         "updates": args.updates,
+                        "warmup_updates": args.warmup_updates,
                         "rollout_steps": args.updates if args.rollout_steps is None else args.rollout_steps,
                         "seed_runs": len(matrix.seeds),
                         "result_path": str(output / scenario / name / "resources.json"),
@@ -575,8 +785,32 @@ def main():
                 )
     if not jobs:
         parser.error("The selected matrix contains no runs")
+    if len({job["name"] for job in jobs}) != len(jobs):
+        parser.error("Duplicate scenarios/models would write the same diagnostic files")
+    if args.pair and args.compare_parallel:
+        parser.error("Use --pair or --compare-parallel, not both")
     if args.compare_parallel and (len(jobs) != 2 or len(set(scenarios)) != 1 or len(set(models)) != 2):
         parser.error("--compare-parallel requires one scenario and two distinct models")
+    pairs = args.pair or ([models] if args.compare_parallel else [])
+    if pairs and (len(scenarios) != 1 or any(len(set(pair)) != 2 or set(pair) - set(models) for pair in pairs)):
+        parser.error("Pairs require one scenario and two distinct selected models per pair")
+    if args.compare_compile and not any(job["config"]["model_family"] == "dreamer" for job in jobs):
+        parser.error("--compare-compile requires at least one Dreamer model")
+    storage = args.compare_storage.expanduser().resolve() if args.compare_storage else None
+    if storage is not None and not args.dry_run:
+        # Validate before spending GPU time; measured sample hashes also check the data actually consumed.
+        for dataset in {job["config"]["scenario"]["dataset"] for job in jobs}:
+            source, target = root / dataset, storage / dataset
+            if source.resolve() == target.resolve():
+                parser.error("--compare-storage must name a different dataset location")
+            for filename in ("metadata.json", "data.hdf5"):
+                if not (source / filename).is_file() or not (target / filename).is_file():
+                    parser.error(f"Storage comparison requires both copies of {dataset}/{filename}")
+            if json.loads((source / "metadata.json").read_text()) != json.loads((target / "metadata.json").read_text()):
+                parser.error(f"Dataset metadata differs between storage locations: {dataset}")
+            if (source / "data.hdf5").stat().st_size != (target / "data.hdf5").stat().st_size:
+                parser.error(f"Dataset file size differs between storage locations: {dataset}")
+        print("Storage | existing copies; no cache flushing; equality checked on sampled batches", flush=True)
     print(
         f"Training smoke | runs={len(jobs)} | updates={args.updates} expert + {args.updates} online"
         f" | collection_steps={jobs[0]['rollout_steps']}"
@@ -584,60 +818,28 @@ def main():
         flush=True,
     )
     results = []
-    if args.compare_parallel and not args.dry_run:
-        raise SystemExit(0 if compare_parallel(jobs, output) else 1)
-    for index, job in enumerate(jobs, 1):
-        config = job["config"]
-        print(
-            f"START | {index}/{len(jobs)} | {job['name']}"
-            f" | batch={config['replay']['batch_size']} | sequence={config['replay']['sequence_length']}",
-            flush=True,
-        )
+    if pairs or args.compare_compile or storage is not None:
         if args.dry_run:
+            print(
+                f"Comparison plan | serial={len(jobs)} | pairs={pairs}"
+                f" | compile_dreamer={args.compare_compile} | storage={storage}"
+            )
+        else:
+            raise SystemExit(
+                0
+                if compare_runs(jobs, output, pairs=pairs, compile_dreamer=args.compare_compile, storage=storage)
+                else 1
+            )
+    for index, job in enumerate(jobs, 1):
+        if args.dry_run:
+            config = job["config"]
+            print(
+                f"PLAN | {index}/{len(jobs)} | {job['name']}"
+                f" | batch={config['replay']['batch_size']} | sequence={config['replay']['sequence_length']}"
+            )
             continue
         result = run_job(job)
-        log_path = Path(result["log"])
         results.append(result)
-        print(f"{result['status']} | {job['name']} | log={log_path}", flush=True)
-        if result["status"] == "FAIL":
-            print("\n".join(log_path.read_text(errors="replace").splitlines()[-16:]), flush=True)
-        else:
-            params = result["parameters"]
-            print(f"  Model | trainable={params['trainable']:,} | frozen={params['frozen']:,}", flush=True)
-            for name, rate in result["timing_projection"]["rates"].items():
-                peaks = [
-                    phase["reserved_peak_mib"]
-                    for phase in result["phases"]
-                    if phase["name"].startswith(name + "/") and "reserved_peak_mib" in phase
-                ]
-                peak = max(peaks, default=None)
-                memory = f"{peak / 1024:.2f} GiB" if peak is not None else "CPU"
-                print(
-                    f"  {name:8} | first={rate['cold_seconds']:.2f}s | estimate/call={rate['seconds_per_call']:.2f}s"
-                    f" | samples={rate['samples']} | GPU reserved peak={memory}",
-                    flush=True,
-                )
-            resources = result["resources"]
-            print(
-                f"  Resources | process GPU peak MiB={resources.get('process_gpu_peak_mib')}"
-                f" | host RAM peak={resources['host_peak_rss_mib'] / 1024:.2f} GiB",
-                flush=True,
-            )
-            print(
-                f"  GPU use | mean={resources.get('device_utilization_mean_percent')}%"
-                f" | peak={resources.get('device_utilization_max_percent')}% (device-wide)",
-                flush=True,
-            )
-            print(
-                f"  Replay | full-capacity tensors~{result['replay']['full_capacity_raw_tensor_mib'] / 1024:.2f} GiB"
-                " (excludes Python/allocator overhead)",
-                flush=True,
-            )
-            lower, upper = result["timing_projection"]["training_hours_range"]
-            print(
-                f"  Training estimate | {lower:.2f}-{upper:.2f} hours/seed | excludes evaluation/checkpoint I/O",
-                flush=True,
-            )
         report = {
             "runs": results,
             "memory_only_candidates": memory_candidates(results),
@@ -646,20 +848,11 @@ def main():
         (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     if not args.dry_run:
         failures = sum(row["status"] != "PASS" for row in results)
-        print(f"\nSmoke | passed={len(results) - failures}/{len(jobs)} | failed={failures} | checkpoints=disabled")
+        write_summary(results, output)
         pairs = report["memory_only_candidates"]["pairs"]
         print(f"\nMemory-only candidate pairs: {len(pairs)}; concurrent testing is still required.")
         for pair in pairs[:5]:
             print(f"  {' + '.join(pair['models'])}: estimated {pair['estimated_mib'] / 1024:.2f} GiB")
-        lower, upper = report["timing"]["serial_training_hours_range"]
-        print(
-            f"Serial training estimate | {lower:.1f}-{upper:.1f} hours"
-            f" | projected={report['timing']['projected_runs']}/{len(jobs)} configurations"
-            " | excludes evaluation/checkpoint I/O"
-        )
-        if args.updates < 3:
-            print("Timing caution | cold-start dominated; rerun with --updates 3 for a better estimate.")
-        print(f"Report | {output / 'report.json'}")
         raise SystemExit(int(bool(failures)))
 
 

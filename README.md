@@ -110,7 +110,9 @@ sizes, sequence lengths, optimizers, and planning budgets. It performs three exp
 native online updates, and three batched environment collection steps. Online replay is seeded in
 memory from complete **training-split** expert episodes so updates can run immediately; this is a
 runtime check, not a learning experiment. The dataset is read-only and no model checkpoints are saved.
-Only logs and diagnostic reports are written under `runs/training_smoke/`.
+Only logs and diagnostic reports are written under `runs/training_smoke/`. The terminal ends with a
+compact table (one row per run); `summary.txt` contains that same pasteable summary. Full per-phase
+details, cold timings, losses, and resource samples remain in `report.json` and worker logs.
 
 The default is one update/collection step; `--updates 3` separates cold compilation/initialization from
 subsequent calls for more useful timing estimates. `--rollout-steps N` controls collection separately;
@@ -134,10 +136,47 @@ bash scripts/run_training_smoke.sh --dataset-root /absolute/path/to/data/dmc_exp
   --updates 10 --rollout-steps 3 --compare-parallel --output runs/parallel_check
 ```
 
-`parallel_report.json` records both sets of diagnostics, combined wall-time speedup, and warm-phase
-slowdowns. Wall times include process startup and compilation; repeat the check and inspect warm
-rates before extrapolating. Each worker keeps its own model, replay, optimizer, seeds, and logs.
+`report.json` records both sets of diagnostics, wall-time speedup, and warm-phase throughput ratios;
+`summary.txt` includes both sets of rates and memory peaks. Wall times include process startup and
+compilation; repeat the check and inspect warm rates before extrapolating. Each worker keeps its own
+model, replay, optimizer, seeds, and logs.
 The benchmark does not save checkpoints or automatically change the production configuration.
+
+To test complementary pairs and Dreamer compilation together, reusing each serial baseline:
+
+```bash
+bash scripts/run_training_smoke.sh --dataset-root /absolute/path/to/data/dmc_expert_vision \
+  --scenarios ball_in_cup --updates 10 --warmup-updates 3 --rollout-steps 3 \
+  --pair dreamer/gru storm/mamba3 \
+  --pair temporal_straightening/default storm/mamba3 \
+  --compare-compile --output runs/runtime_check
+```
+
+Dreamer's opt-in `model.compile=true` compiles tensor-only encoder, decoder, recurrent-core, posterior,
+and prior modules in place. These are shared by expert updates, online training, history reconstruction,
+and acting. Sampling, sequence loops, and optimizers stay eager; recurrent CUDA graph capture is not
+enabled. Parameter/checkpoint keys are unchanged. Production defaults remain eager until measurements
+justify enabling compilation; compile warnings and graph counts are recorded in the worker diagnostics.
+
+For a storage comparison, first copy the selected scenario to **local SSD**, not another path on the
+same network mount. Keep the original dataset and persistent run outputs:
+
+```bash
+mkdir -p /tmp/dmc_expert_vision
+rsync -a /absolute/path/to/data/dmc_expert_vision/ball_in_cup_catch /tmp/dmc_expert_vision/
+bash scripts/run_training_smoke.sh --dataset-root /absolute/path/to/data/dmc_expert_vision \
+  --scenarios ball_in_cup --models tdmpc2/default dreamer/gru \
+  --updates 10 --warmup-updates 3 --rollout-steps 0 \
+  --compare-storage /tmp/dmc_expert_vision --output runs/storage_check
+```
+
+Check free space and the mount with `df -h /tmp` before copying; `/tmp` is not guaranteed to be local
+SSD on every machine. No copy or deletion is performed by the benchmark. It checks matching metadata,
+file sizes, and hashes of the actual sampled batches (not every byte of the dataset). Storage,
+compilation, and pair comparisons can be combined in one invocation. Each alternative is compared
+separately to the same original-storage, eager, serial baseline. Baselines run first; OS/compiler
+caches are not flushed, so these are warm-workload comparisons, not controlled cold-disk benchmarks.
+With collection skipped, the projected hours omit collection and are only a training subtotal.
 
 Temporal Straightening uses 128 candidate trajectories per planning autograd pass (previously 32).
 This changes memory/work scheduling, not candidate count, iterations, horizon, or the globally averaged

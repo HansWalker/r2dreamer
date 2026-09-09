@@ -63,8 +63,17 @@ class Dreamer(DreamerModel):
 
         self.train()
         if config.compile:
-            print("Model | compiling=torch.compile")
-            self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")
+            print("Model | compiling=tensor modules | phases=expert,online,history,acting")
+            # Keep sampling, sequence loops, and optimizer/scaler state in eager mode.
+            # In-place compilation preserves parameter names and does not capture recurrent CUDA graphs.
+            for module in (
+                self.encoder.encoder,
+                self.decoder.decoder,
+                self.rssm._deter_net,
+                self.rssm._obs_net,
+                self.rssm._prior_net,
+            ):
+                module.compile(dynamic=True)
         self.state_head = PhysicalStateHead(self.rssm.feat_size, config.state_head)
 
     def training_state_dict(self):
@@ -115,7 +124,6 @@ class Dreamer(DreamerModel):
     @torch.no_grad()
     def act(self, obs, state, eval=False):
         """Policy inference step."""
-        torch.compiler.cudagraph_mark_step_begin()
         p_obs = self.preprocess(obs)
         embed = self.encoder(p_obs)
         feat, state_update = self.rssm.actor_step(embed, state, obs["is_first"])
@@ -135,7 +143,6 @@ class Dreamer(DreamerModel):
         data = data.exclude(STATE_KEY)
         p_data = self.preprocess(data)
         for skipped in range(32):
-            torch.compiler.cudagraph_mark_step_begin()
             initial = self._replay_initial(contexts)
             return_ema = self.return_ema.ema_vals.clone()
             with autocast(
@@ -159,7 +166,6 @@ class Dreamer(DreamerModel):
         data = data.exclude(STATE_KEY)
         p_data = self.preprocess(data)
         for skipped in range(32):
-            torch.compiler.cudagraph_mark_step_begin()
             initial = self._replay_initial(contexts) if contexts is not None else self._initial_tuple(data.shape[0])
             with autocast(
                 device_type=self.device.type,

@@ -268,13 +268,14 @@ def stop_active_processes():
         stop_process(process)
 
 
-def execute(label, command, log_path, *, dry_run=False, input_text=None):
+def execute(label, command, log_path, *, dry_run=False, input_text=None, quiet=False):
     rendered = shlex.join(map(str, command))
     if dry_run:
         print(f"PLAN | {label}", flush=True)
         return
 
-    print(f"START | {label}", flush=True)
+    if not quiet:
+        print(f"START | {label}", flush=True)
     started = time.perf_counter()
     output_tail = deque(maxlen=120)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -302,7 +303,7 @@ def execute(label, command, log_path, *, dry_run=False, input_text=None):
                 log.write(line)
                 message = line.rstrip()
                 output_tail.append(message)
-                if message.startswith(CONSOLE_PREFIXES):
+                if not quiet and message.startswith(CONSOLE_PREFIXES):
                     print(f"  [{label}] {message}", flush=True)
             returncode = process.wait()
         except BaseException:
@@ -324,7 +325,8 @@ def execute(label, command, log_path, *, dry_run=False, input_text=None):
         print(f"LOG | {log_path}", flush=True)
         raise SystemExit(returncode)
     elapsed = timedelta(seconds=round(time.perf_counter() - started))
-    print(f"DONE | {label} | elapsed={elapsed}", flush=True)
+    if not quiet:
+        print(f"DONE | {label} | elapsed={elapsed}", flush=True)
 
 
 def run_jobs(function, jobs, parallelism):
