@@ -36,6 +36,16 @@ class S5SequenceCore(nn.Module):
     def forward(self, samples, action):
         return self.output_norm(self.layer(self._token(samples, action)))
 
+    def scan(self, samples, action, cache):
+        output, state = self.layer(self._token(samples, action), cache[0], return_state=True)
+        return self.output_norm(output), (state,)
+
+    def prepare_sequence(self, reference):
+        self.layer.ssm.prepare_sequence(reference)
+
+    def clear_sequence(self):
+        self.layer.ssm.clear_sequence()
+
     def step(self, samples, action, cache=None):
         assert samples.shape[1] == 1
         state = None if cache is None else cache[0]

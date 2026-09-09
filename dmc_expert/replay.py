@@ -137,23 +137,58 @@ class DMCExpertDataset:
             ),
         }
 
-    def _transition_batch(self, transitions):
+    def _observation_windows(self, episode, starts, length, *, context=False):
+        requests = {(start, length) for start in starts}
+        if context:
+            requests.add((0, max(starts)))
+        ranges = []
+        for start, count in sorted(requests):
+            if ranges and start <= ranges[-1][1]:
+                ranges[-1][1] = max(ranges[-1][1], start + count)
+            else:
+                ranges.append([start, start + count])
+        windows = {}
+        for first, stop in ranges:
+            # Overlapping windows (and burn-in) share one read and frame-stack construction.
+            observations = self._read_observations(episode, first, stop - first)
+            for start, count in requests:
+                if first <= start and start + count <= stop:
+                    windows[start, count] = {
+                        key: value[start - first : start - first + count] for key, value in observations.items()
+                    }
+        return windows
+
+    def _transition_batch(self, transitions, *, reconstruct_context=False):
         """Keep T observation frames, with T actions for STORM or T-1 for planners."""
         groups = self._sample_episode_groups(lambda ep_idx: int(self.lengths[ep_idx]) - transitions + 1)
-        rows = []
+        rows, contexts = [], []
         for ep_idx, starts in groups:
+            observations = self._observation_windows(ep_idx, starts, self.sequence_length, context=reconstruct_context)
+            first = 0 if reconstruct_context else min(starts)
+            stop = max(starts) + transitions
+            values = {
+                key: np.asarray(dataset[ep_idx, first:stop], dtype=np.float32)
+                for key, dataset in (
+                    ("action", self.actions),
+                    ("reward", self.rewards),
+                    ("terminal", self.terminations),
+                )
+            }
             for start in starts:
-                row = self._read_observations(ep_idx, start, self.sequence_length)
-                window = slice(start, start + transitions)
-                row.update({
-                    "action": np.asarray(self.actions[ep_idx, window], dtype=np.float32),
-                    "reward": np.asarray(self.rewards[ep_idx, window], dtype=np.float32),
-                    "terminal": np.asarray(self.terminations[ep_idx, window], dtype=np.float32),
-                })
+                row = dict(observations[start, self.sequence_length])
+                window = slice(start - first, start - first + transitions)
+                row.update({key: value[window] for key, value in values.items()})
                 rows.append(row)
+            if reconstruct_context:
+                length = max(starts)
+                context = dict(observations[0, length], action=values["action"][:length])
+                context = TensorDict(
+                    {key: torch.as_tensor(value) for key, value in context.items()}, batch_size=(length,)
+                ).unsqueeze(0)
+                contexts.append((context, starts))
         data = {key: torch.as_tensor(np.stack([row[key] for row in rows])) for key in rows[0]}
         batch = ({key: data[key] for key in self.obs_keys}, data["action"], data["reward"], data["terminal"])
-        return groups, batch
+        return contexts, batch
 
     def _state_stats(self):
         total = np.zeros(len(self.state_targets.coordinates), dtype=np.float64)
@@ -183,24 +218,28 @@ class DMCExpertEpisodeReplay(DMCExpertDataset):
 
     def sample_episode_batch(self):
         groups = self._sample_episode_groups(lambda ep_idx: int(self.lengths[ep_idx]) - self.sequence_length + 2)
-        rows = [self._make_window(ep_idx, start, self.sequence_length) for ep_idx, starts in groups for start in starts]
-        data = {key: torch.as_tensor(np.stack([row[key] for row in rows], axis=0)) for key in rows[0]}
-        batch = TensorDict(data, batch_size=(self.batch_size, self.sequence_length))
-        contexts = []
+        rows, contexts = [], []
         for ep_idx, starts in groups:
+            observations = self._observation_windows(ep_idx, starts, self.sequence_length, context=True)
+            rows.extend(
+                self._make_window(ep_idx, start, self.sequence_length, observations[start, self.sequence_length])
+                for start in starts
+            )
             context_length = max(starts)
-            row = self._make_window(ep_idx, 0, context_length)
+            row = self._make_window(ep_idx, 0, context_length, observations[0, context_length])
             context = TensorDict(
                 {key: torch.as_tensor(value) for key, value in row.items()},
                 batch_size=(context_length,),
             ).unsqueeze(0)
             contexts.append((context, starts))
+        data = {key: torch.as_tensor(np.stack([row[key] for row in rows], axis=0)) for key in rows[0]}
+        batch = TensorDict(data, batch_size=(self.batch_size, self.sequence_length))
         return contexts, batch
 
-    def _make_window(self, ep_idx, start, length):
+    def _make_window(self, ep_idx, start, length, observations=None):
         ep_idx = int(ep_idx)
         start, length = int(start), int(length)
-        obs = self._read_observations(ep_idx, start, length)
+        obs = self._read_observations(ep_idx, start, length) if observations is None else dict(observations)
         # Dreamer pairs each observation with the action and reward that led to it.
         actions = np.zeros((length, self.action_dim), dtype=np.float32)
         rewards = np.zeros((length, 1), dtype=np.float32)
@@ -219,13 +258,15 @@ class DMCExpertEpisodeReplay(DMCExpertDataset):
                 np.asarray(self.truncations[ep_idx, transition], dtype=bool),
             )
 
-        obs.update({
-            "action": actions,
-            "reward": rewards,
-            "is_first": np.zeros((length, 1), dtype=bool),
-            "is_last": is_last,
-            "is_terminal": terminations,
-        })
+        obs.update(
+            {
+                "action": actions,
+                "reward": rewards,
+                "is_first": np.zeros((length, 1), dtype=bool),
+                "is_last": is_last,
+                "is_terminal": terminations,
+            }
+        )
         if length and start == 0:
             obs["is_first"][0] = True
         return obs
@@ -242,21 +283,8 @@ class DMCExpertSequenceReplay(DMCExpertDataset):
         self.reconstruct_context = str(config.storm_model.sequence_core) != "transformer"
 
     def sample_episode_batch(self):
-        groups, batch = self._transition_batch(self.sequence_length)
-        if not self.reconstruct_context:
-            return batch
-
-        contexts = []
-        for ep_idx, starts in groups:
-            context_length = max(starts)
-            context = self._read_observations(ep_idx, 0, context_length)
-            context["action"] = np.asarray(self.actions[ep_idx, :context_length], dtype=np.float32)
-            context = TensorDict(
-                {key: torch.as_tensor(value) for key, value in context.items()},
-                batch_size=(context_length,),
-            ).unsqueeze(0)
-            contexts.append((context, starts))
-        return contexts, batch
+        contexts, batch = self._transition_batch(self.sequence_length, reconstruct_context=self.reconstruct_context)
+        return (contexts, batch) if self.reconstruct_context else batch
 
 
 class DMCExpertTransitionReplay(DMCExpertDataset):

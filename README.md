@@ -126,6 +126,24 @@ checkpoint I/O, and logging are unmeasured additions; longer contexts and differ
 can change runtime and memory. Memory-only parallel-pair candidates include headroom, but require a
 concurrent trial before assuming they are safe or faster. Profile on an otherwise idle GPU.
 
+Measure the same two jobs **serially and concurrently** before enabling parallel training:
+
+```bash
+bash scripts/run_training_smoke.sh --dataset-root /absolute/path/to/data/dmc_expert_vision \
+  --scenarios ball_in_cup --models dreamer/gru dreamer/s5 \
+  --updates 10 --rollout-steps 3 --compare-parallel --output runs/parallel_check
+```
+
+`parallel_report.json` records both sets of diagnostics, combined wall-time speedup, and warm-phase
+slowdowns. Wall times include process startup and compilation; repeat the check and inspect warm
+rates before extrapolating. Each worker keeps its own model, replay, optimizer, seeds, and logs.
+The benchmark does not save checkpoints or automatically change the production configuration.
+
+Temporal Straightening uses 128 candidate trajectories per planning autograd pass (previously 32).
+This changes memory/work scheduling, not candidate count, iterations, horizon, or the globally averaged
+action gradient. Check its memory on the target GPU; compare 128 with 256 using
+`--models temporal_straightening/default --model-override jepa_model.planner.gradient_batch_size=256`.
+
 The wrappers use the `environment/` created by `scripts/setup_dmc.sh`. Set `PYTHON` to use another
 interpreter. The smoke and full-run wrappers forward additional arguments to `main.py`; all three
 configs can also be invoked directly as `dmc_smoke`, `dmc_preflight`, or `dmc_benchmark`.
@@ -137,7 +155,11 @@ on failure, the useful end of the traceback and the exact log path are printed a
 The default production matrix first runs all thirteen image-model variants on all three scenarios with
 seed 0. It collects the three independent scenario datasets concurrently on the shared GPU, then trains
 and evaluates every model one at a time, scenario by scenario. Set `collection.parallelism=1` to collect
-serially. Training writes each run under
+serially. After a successful paired benchmark, use
+`./scripts/run_full.sh --override stages.collect=false --override training.parallelism=2`
+to run two independent model jobs on the same GPU. Each job trains then evaluates before freeing its
+slot; the next scenario starts only after all jobs in the current scenario finish. Failures stop active
+workers, and the existing resume behavior applies separately to each run. Training writes each run under
 `runs/dmc_vision/<scenario>/<family>/<variant>/seed_<seed>`, and evaluation writes
 `evaluation.json` for `final.pt` and `evaluation_best.json` for `best.pt` in that run directory. Set
 the booleans under `stages` to run only part of the lifecycle, add seeds after the initial matrix

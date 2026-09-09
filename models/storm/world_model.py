@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 from torch import nn
 from torch.distributions import OneHotCategorical
+from torch.nn.utils.rnn import pad_sequence
 
 from models.shared.physical_state import STATE_KEY
 
@@ -123,20 +126,36 @@ class WorldModel(nn.Module):
     def streaming(self):
         return bool(getattr(self.sequence_core, "streaming", False))
 
+    @contextmanager
+    def sequence_context(self, reference):
+        prepare = getattr(self.sequence_core, "prepare_sequence", None)
+        if prepare is not None:
+            prepare(reference)
+        try:
+            yield
+        finally:
+            if prepare is not None:
+                self.sequence_core.clear_sequence()
+
+    def _scan(self, stoch, action, cache):
+        scan = getattr(self.sequence_core, "scan", None)
+        if scan is not None:
+            return scan(stoch, action, cache)
+        outputs = []
+        for position in range(stoch.shape[1]):
+            output, cache = self.sequence_core.step(
+                stoch[:, position : position + 1], action[:, position : position + 1], cache
+            )
+            outputs.append(output)
+        return torch.cat(outputs, dim=1), cache
+
     def observe(self, obs, action, cache=None) -> dict[str, torch.Tensor]:
         stoch, post_logits = self._encode_obs_with_logits(obs)
         if cache is None:
             deter = self.sequence_core(stoch, action)
         else:
-            outputs = []
-            for position in range(stoch.shape[1]):
-                output, cache = self.sequence_core.step(
-                    stoch[:, position : position + 1],
-                    action[:, position : position + 1],
-                    cache,
-                )
-                outputs.append(output)
-            deter = torch.cat(outputs, dim=1)
+            with self.sequence_context(stoch):
+                deter, _ = self._scan(stoch, action, cache)
         prior_logits = self.prior(deter)
         feat = torch.cat([stoch, deter], dim=-1)
         return {"stoch": stoch, "deter": deter, "feat": feat, "post_logits": post_logits, "prior_logits": prior_logits}
@@ -147,8 +166,20 @@ class WorldModel(nn.Module):
         if not self.streaming or not contexts:
             return None
 
-        cache_rows = None
         cache_dtype = self.amp_dtype if self.use_amp and self.device.type == "cuda" else next(self.parameters()).dtype
+        cache = self.sequence_core.initial_cache(len(contexts), dtype=cache_dtype, device=self.device)
+        schedule = {}
+        for index, (_, starts) in enumerate(contexts):
+            for start in set(starts):
+                schedule.setdefault(start, []).append(index)
+        anchors = {}
+
+        def capture(position):
+            for index in schedule[position]:
+                anchors[index, position] = tuple(value[index : index + 1].detach().clone() for value in cache)
+
+        if 0 in schedule:
+            capture(0)
         # Reconstruct prefixes with the same fixed normalization used for online inference.
         # Batch statistics would make an early cache anchor depend on later sampled frames.
         batch_norms = [module for module in self.encoder.modules() if isinstance(module, nn.BatchNorm2d)]
@@ -156,34 +187,36 @@ class WorldModel(nn.Module):
         for norm in batch_norms:
             norm.eval()
         try:
-            for context, starts in contexts:
-                wanted = set(starts)
-                cache = self.sequence_core.initial_cache(1, dtype=cache_dtype, device=self.device)
-                anchors = {0: tuple(value.detach().clone() for value in cache)} if 0 in wanted else {}
-                if max(starts, default=0):
-                    context = context.to(self.device, non_blocking=True)
-                    with self._amp():
-                        stoch = self.encode_obs({self.encoder.key: context[self.encoder.key]})
-                        action = context["action"]
-                        for position in range(max(starts)):
-                            _, cache = self.sequence_core.step(
-                                stoch[:, position : position + 1],
-                                action[:, position : position + 1],
-                                cache,
-                            )
-                            if position + 1 in wanted:
-                                anchors[position + 1] = tuple(value.detach().clone() for value in cache)
-
-                for start in starts:
-                    anchor = anchors[start]
-                    if cache_rows is None:
-                        cache_rows = [[] for _ in anchor]
-                    for rows, value in zip(cache_rows, anchor, strict=True):
-                        rows.append(value)
+            if max(schedule):
+                # Encode one episode at a time to bound image activation memory, then
+                # advance all histories together. Padding is never used by an anchor.
+                samples, actions = [], []
+                with self._amp():
+                    for context, starts in contexts:
+                        length = max(starts)
+                        if length:
+                            image = context[self.encoder.key][:, :length].to(self.device, non_blocking=True)
+                            samples.append(self.encode_obs({self.encoder.key: image})[0])
+                        else:
+                            samples.append(None)
+                        actions.append(context["action"][0, :length].to(self.device, non_blocking=True))
+                    reference = next(value for value in samples if value is not None)
+                    stoch = pad_sequence(
+                        [value if value is not None else reference[:0] for value in samples], batch_first=True
+                    )
+                    action = pad_sequence(actions, batch_first=True)
+                    with self.sequence_context(stoch):
+                        position = 0
+                        for stop in sorted(schedule):
+                            if stop:
+                                _, cache = self._scan(stoch[:, position:stop], action[:, position:stop], cache)
+                                capture(stop)
+                                position = stop
         finally:
             for norm, training in zip(batch_norms, batch_norm_training, strict=True):
                 norm.train(training)
-        return tuple(torch.cat(rows, dim=0) for rows in cache_rows)
+        rows = [anchors[index, start] for index, (_, starts) in enumerate(contexts) for start in starts]
+        return tuple(torch.cat(values, dim=0) for values in zip(*rows, strict=True))
 
     def loss(
         self, obs, action, reward, terminal, cache=None
@@ -258,17 +291,12 @@ class WorldModel(nn.Module):
     def imagine(self, actor_critic, context_obs, context_action, horizon: int, cache=None) -> dict[str, torch.Tensor]:
         self.eval()
         actor_critic.eval()
-        with self._amp():
+        with self._amp(), self.sequence_context(context_action):
             stoch = self.encode_obs(context_obs)
             if cache is None:
                 cache = self.sequence_core.initial_cache(stoch.shape[0], dtype=stoch.dtype, device=stoch.device)
-            deter, cache = self.sequence_core.step(stoch[:, :1], context_action[:, :1], cache)
-            for idx in range(1, stoch.shape[1]):
-                deter, cache = self.sequence_core.step(
-                    stoch[:, idx : idx + 1],
-                    context_action[:, idx : idx + 1],
-                    cache,
-                )
+            deter, cache = self._scan(stoch, context_action, cache)
+            deter = deter[:, -1:]
             prior_logits = self.prior(deter[:, 0])
             stoch = categorical_sample(prior_logits).flatten(-2)
             deter = deter[:, 0]

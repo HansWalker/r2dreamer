@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+import itertools
 import json
 import math
 import os
@@ -14,7 +15,7 @@ import sys
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -40,6 +41,7 @@ from training.protocol import (
 ROOT = Path(__file__).resolve().parent
 ACTIVE_PROCESSES = set()
 ACTIVE_PROCESSES_LOCK = threading.Lock()
+STOP_REQUESTED = threading.Event()
 CONSOLE_PREFIXES = (
     "Run |",
     "Model |",
@@ -121,6 +123,8 @@ def validate_matrix(config, scenario_runs, stages):
         raise ValueError("Evaluation is enabled, but no checkpoints are configured.")
     if int(config["collection"]["parallelism"]) < 1:
         raise ValueError("Collection parallelism must be positive.")
+    if int(config["training"]["parallelism"]) < 1:
+        raise ValueError("Training parallelism must be positive.")
 
     resolved = {}
     signatures = {}
@@ -129,6 +133,8 @@ def validate_matrix(config, scenario_runs, stages):
         if not runs:
             raise ValueError(f"The experiment matrix contains no model runs for {scenario}.")
         for run in runs:
+            if run.name in resolved:
+                raise ValueError(f"Duplicate model run would write the same directory: {run.name}")
             run_config = load_config(run.config, run.overrides)
             validate_training_recipe(run_config)
             if str(run_config.model_family) != run.family:
@@ -256,12 +262,13 @@ def stop_process(process):
 
 def stop_active_processes():
     with ACTIVE_PROCESSES_LOCK:
+        STOP_REQUESTED.set()
         processes = tuple(ACTIVE_PROCESSES)
     for process in processes:
         stop_process(process)
 
 
-def execute(label, command, log_path, *, dry_run=False):
+def execute(label, command, log_path, *, dry_run=False, input_text=None):
     rendered = shlex.join(map(str, command))
     if dry_run:
         print(f"PLAN | {label}", flush=True)
@@ -273,24 +280,30 @@ def execute(label, command, log_path, *, dry_run=False):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8", buffering=1) as log:
         log.write(f"$ {rendered}\n\n")
-        process = subprocess.Popen(
-            list(map(str, command)),
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
         with ACTIVE_PROCESSES_LOCK:
+            if STOP_REQUESTED.is_set():
+                raise RuntimeError("Experiment cancelled; no further workers will be started.")
+            process = subprocess.Popen(
+                list(map(str, command)),
+                cwd=ROOT,
+                stdin=subprocess.PIPE if input_text is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
             ACTIVE_PROCESSES.add(process)
         try:
+            if input_text is not None:
+                process.stdin.write(input_text)
+                process.stdin.close()
             for line in process.stdout:
                 log.write(line)
                 message = line.rstrip()
                 output_tail.append(message)
                 if message.startswith(CONSOLE_PREFIXES):
-                    print(f"  {message}", flush=True)
+                    print(f"  [{label}] {message}", flush=True)
             returncode = process.wait()
         except BaseException:
             stop_process(process)
@@ -314,17 +327,23 @@ def execute(label, command, log_path, *, dry_run=False):
     print(f"DONE | {label} | elapsed={elapsed}", flush=True)
 
 
-def execute_parallel(jobs, parallelism, *, dry_run=False):
-    if dry_run or parallelism <= 1:
+def run_jobs(function, jobs, parallelism):
+    """Run a bounded number of independent jobs; stop their process groups on failure."""
+    STOP_REQUESTED.clear()
+    if parallelism <= 1:
         for job in jobs:
-            execute(*job, dry_run=dry_run)
+            function(job)
         return
 
     executor = ThreadPoolExecutor(max_workers=min(parallelism, len(jobs)))
-    futures = [executor.submit(execute, *job) for job in jobs]
+    pending = iter(jobs)
+    futures = {executor.submit(function, job) for job in itertools.islice(pending, parallelism)}
     try:
-        for future in as_completed(futures):
-            future.result()
+        while futures:
+            finished, futures = wait(futures, return_when=FIRST_COMPLETED)
+            for future in finished:
+                future.result()
+            futures.update(executor.submit(function, job) for job in itertools.islice(pending, len(finished)))
     except BaseException:
         for future in futures:
             future.cancel()
@@ -357,7 +376,7 @@ def collect_scenarios(config, scenarios, *, dry_run=False):
     parallelism = min(int(config["collection"]["parallelism"]), len(jobs))
     print(f"\nCollection | scenarios={len(jobs)} | parallelism={parallelism}", flush=True)
     started = time.perf_counter()
-    execute_parallel(jobs, parallelism, dry_run=dry_run)
+    run_jobs(lambda job: execute(*job, dry_run=dry_run), jobs, 1 if dry_run else parallelism)
     if not dry_run:
         elapsed = timedelta(seconds=round(time.perf_counter() - started))
         print(f"Collection | complete | scenarios={len(jobs)} | elapsed={elapsed}", flush=True)
@@ -452,7 +471,9 @@ def run_models(config, runs, resolved, dataset_identities, *, dry_run=False):
     evaluation = config["evaluation"]
     dataset_root = resolve_path(evaluation["dataset_root"]) if stages["evaluate"] else None
     evaluation_specs = tuple(evaluation.get("checkpoints", ()))
-    for index, run in enumerate(runs, 1):
+
+    def run_one(item):
+        index, run = item
         run_label = f"{index}/{len(runs)} | {run.name}"
         run_config = resolved[run.name]
         completed_checkpoint = run.logdir / completion_checkpoint(run_config)
@@ -563,6 +584,10 @@ def run_models(config, runs, resolved, dataset_identities, *, dry_run=False):
                     run.logdir / str(spec.get("log", f"evaluation_{name}.log")),
                     dry_run=dry_run,
                 )
+
+    parallelism = min(int(training["parallelism"]), len(runs))
+    print(f"\nModels | runs={len(runs)} | parallelism={parallelism} | device={device}", flush=True)
+    run_jobs(run_one, list(enumerate(runs, 1)), 1 if dry_run else parallelism)
 
 
 def main():

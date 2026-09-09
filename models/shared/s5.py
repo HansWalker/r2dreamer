@@ -96,6 +96,13 @@ class S5StateSpace(nn.Module):
         self.c_imag = nn.Parameter(c.imag)
         self.skip = nn.Parameter(torch.rand(self.d_model))
         self.log_step = nn.Parameter(torch.empty(self.state_dim).uniform_(math.log(dt_min), math.log(dt_max)))
+        self._sequence_coefficients = None
+
+    def prepare_sequence(self, reference):
+        self._sequence_coefficients = self._discrete()
+
+    def clear_sequence(self):
+        self._sequence_coefficients = None
 
     def initial_state(self, batch_size: int, device=None) -> torch.Tensor:
         device = device or self.log_decay.device
@@ -117,7 +124,7 @@ class S5StateSpace(nn.Module):
     def step(self, value: torch.Tensor, state: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         if state is None:
             state = self.initial_state(value.shape[0], value.device)
-        transition, drive, readout = self._discrete()
+        transition, drive, readout = self._sequence_coefficients or self._discrete()
         source = value.float().to(torch.complex64) @ drive.transpose(0, 1)
         state = transition * state.to(device=value.device, dtype=torch.complex64) + source
         output = (state @ readout.transpose(0, 1)).real + self.skip * value.float()
@@ -128,7 +135,7 @@ class S5StateSpace(nn.Module):
         value: torch.Tensor,
         state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        transition, drive, readout = self._discrete()
+        transition, drive, readout = self._sequence_coefficients or self._discrete()
         source = value.float().to(torch.complex64) @ drive.transpose(0, 1)
         transitions = transition.reshape(1, 1, -1).expand_as(source)
         if state is not None:

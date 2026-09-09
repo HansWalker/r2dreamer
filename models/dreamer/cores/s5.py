@@ -22,6 +22,12 @@ class DreamerS5Core(nn.Module):
     def initial_context(self, batch_size, device=None, dtype=None):
         return (self.layer.initial_state(batch_size, device),)
 
+    def prepare_sequence(self, reference):
+        self.layer.ssm.prepare_sequence(reference)
+
+    def clear_sequence(self):
+        self.layer.ssm.clear_sequence()
+
     def forward(self, stoch, action, state=None):
         batch_size = action.shape[0]
         stoch = stoch.reshape(batch_size, -1)

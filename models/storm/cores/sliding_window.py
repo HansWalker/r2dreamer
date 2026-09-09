@@ -44,16 +44,19 @@ class SlidingWindowSequenceCore(nn.Module):
         self.window_size = int(settings.window_size)
         self.stem = stem
         self.position_encoding = CyclicPositionalEncoding1D(int(config.transformer.max_length), self.feat_dim)
-        self.layer_stack = nn.ModuleList([
-            AttentionBlockKVCache(
-                feat_dim=self.feat_dim,
-                hidden_dim=int(config.transformer.ffn_dim),
-                num_heads=int(config.transformer.num_heads),
-                dropout=float(config.dropout),
-            )
-            for _ in range(int(config.layers))
-        ])
+        self.layer_stack = nn.ModuleList(
+            [
+                AttentionBlockKVCache(
+                    feat_dim=self.feat_dim,
+                    hidden_dim=int(config.transformer.ffn_dim),
+                    num_heads=int(config.transformer.num_heads),
+                    dropout=float(config.dropout),
+                )
+                for _ in range(int(config.layers))
+            ]
+        )
         self.layer_norm = nn.LayerNorm(self.feat_dim, eps=1e-6)
+        self._inference_projections = [None] * len(self.layer_stack)
 
     @staticmethod
     def _prepare_action(action: torch.Tensor, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -115,6 +118,27 @@ class SlidingWindowSequenceCore(nn.Module):
         for index, layer in enumerate(self.layer_stack):
             current = layer_cache[index].clone()
             current[batch, slot] = feats[:, 0]
-            feats, _ = layer(feats, current, current, valid.unsqueeze(1))
+            if torch.is_grad_enabled():
+                # Training must still differentiate projections of the raw burn-in history.
+                self._inference_projections[index] = None
+                feats, _ = layer(feats, current, current, valid.unsqueeze(1))
+            else:
+                attention = layer.slf_attn
+                projection_dtype = (
+                    torch.get_autocast_dtype(feats.device.type)
+                    if torch.is_autocast_enabled(feats.device.type)
+                    else feats.dtype
+                )
+                versions = (attention.w_ks.weight._version, attention.w_vs.weight._version, projection_dtype)
+                previous = self._inference_projections[index]
+                if previous is not None and previous[0] is layer_cache[index] and previous[3] == versions:
+                    key, value = previous[1].clone(), previous[2].clone()
+                    key[batch, slot] = attention.w_ks(feats)[:, 0]
+                    value[batch, slot] = attention.w_vs(feats)[:, 0]
+                else:
+                    key, value = attention.w_ks(current), attention.w_vs(current)
+                self._inference_projections[index] = (current, key, value, versions)
+                attended, _ = attention.forward_projected(feats, key, value, valid.unsqueeze(1))
+                feats = layer.pos_ffn(attended)
             next_cache.append(current)
         return feats, (position + 1, *next_cache)

@@ -435,6 +435,72 @@ def memory_candidates(results):
     }
 
 
+def run_job(job):
+    from main import execute
+
+    path = Path(job["result_path"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+    log_path = path.with_name("stdout.log")
+    started = time.perf_counter()
+    returncode = 0
+    try:
+        execute(
+            job["name"],
+            [sys.executable, "-u", "-m", "scripts.smoke_training", "--worker"],
+            log_path,
+            input_text=json.dumps(job),
+        )
+    except SystemExit as error:
+        returncode = error.code
+    result = (
+        json.loads(path.read_text())
+        if path.exists()
+        else {"name": job["name"], "status": "FAIL", "error": f"Worker exited {returncode} without a report"}
+    )
+    if returncode:
+        result["status"] = "FAIL"
+    result.update(log=str(log_path), wall_seconds=time.perf_counter() - started)
+    return result
+
+
+def compare_parallel(jobs, output):
+    from main import run_jobs
+
+    report = {}
+    for name, parallelism in (("serial", 1), ("parallel", 2)):
+        results = [None] * len(jobs)
+
+        def measure(item, name=name, results=results):
+            index, job = item
+            path = output / name / job["name"] / "resources.json"
+            results[index] = run_job(dict(job, result_path=str(path)))
+
+        started = time.perf_counter()
+        run_jobs(measure, list(enumerate(jobs)), parallelism)
+        report[name] = {"wall_seconds": time.perf_counter() - started, "runs": results}
+        if any(result["status"] != "PASS" for result in results):
+            break
+    passed = len(report) == 2 and all(row["status"] == "PASS" for group in report.values() for row in group["runs"])
+    report["passed"] = passed
+    if passed:
+        report["combined_wall_speedup"] = report["serial"]["wall_seconds"] / report["parallel"]["wall_seconds"]
+        report["warm_phase_slowdown"] = {
+            before["name"]: {
+                phase: after["timing_projection"]["rates"][phase]["seconds_per_call"] / rate["seconds_per_call"]
+                for phase, rate in before["timing_projection"]["rates"].items()
+            }
+            for before, after in zip(report["serial"]["runs"], report["parallel"]["runs"], strict=True)
+        }
+        print(f"Pair | combined wall-time speedup={report['combined_wall_speedup']:.2f}x", flush=True)
+        print("Pair | includes process startup; inspect warm-phase rates and repeat before selecting concurrency.")
+    output.mkdir(parents=True, exist_ok=True)
+    path = output / "parallel_report.json"
+    path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    print(f"Pair | {'PASS' if passed else 'FAIL'} | report={path}", flush=True)
+    return passed
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-name", default="dmc_benchmark")
@@ -450,6 +516,10 @@ def main():
         "--rollout-steps", type=int, help="Real batched collection steps (default: --updates); 0 skips DMC."
     )
     parser.add_argument("--override", action="append", default=[], help="Hydra matrix override.")
+    parser.add_argument("--model-override", action="append", default=[], help="Hydra override for each selected model.")
+    parser.add_argument(
+        "--compare-parallel", action="store_true", help="Benchmark exactly two runs serially, then together."
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -485,6 +555,7 @@ def main():
                     overrides=[
                         *matrix.training.overrides,
                         *extra,
+                        *args.model_override,
                         f"scenario={scenario}",
                         f"seed={matrix.seeds[0]}",
                         f"device={args.device or matrix.device}",
@@ -504,6 +575,8 @@ def main():
                 )
     if not jobs:
         parser.error("The selected matrix contains no runs")
+    if args.compare_parallel and (len(jobs) != 2 or len(set(scenarios)) != 1 or len(set(models)) != 2):
+        parser.error("--compare-parallel requires one scenario and two distinct models")
     print(
         f"Training smoke | runs={len(jobs)} | updates={args.updates} expert + {args.updates} online"
         f" | collection_steps={jobs[0]['rollout_steps']}"
@@ -511,6 +584,8 @@ def main():
         flush=True,
     )
     results = []
+    if args.compare_parallel and not args.dry_run:
+        raise SystemExit(0 if compare_parallel(jobs, output) else 1)
     for index, job in enumerate(jobs, 1):
         config = job["config"]
         print(
@@ -520,32 +595,8 @@ def main():
         )
         if args.dry_run:
             continue
-        path = Path(job["result_path"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.unlink(missing_ok=True)  # Never mistake an earlier attempt for this worker's result.
-        log_path = path.with_name("stdout.log")
-        with log_path.open("w", encoding="utf-8") as log:
-            worker = subprocess.run(
-                [sys.executable, "-u", "-m", "scripts.smoke_training", "--worker"],
-                input=json.dumps(job),
-                text=True,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                cwd=ROOT,
-                check=False,
-            )
-        result = (
-            json.loads(path.read_text())
-            if path.exists()
-            else {
-                "name": job["name"],
-                "status": "FAIL",
-                "error": f"Worker exited {worker.returncode} without a report",
-            }
-        )
-        if worker.returncode:
-            result["status"] = "FAIL"
-        result["log"] = str(log_path)
+        result = run_job(job)
+        log_path = Path(result["log"])
         results.append(result)
         print(f"{result['status']} | {job['name']} | log={log_path}", flush=True)
         if result["status"] == "FAIL":

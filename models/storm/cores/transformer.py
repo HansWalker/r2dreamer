@@ -64,11 +64,14 @@ class MultiHeadAttention(nn.Module):
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None = None):
+        return self.forward_projected(q, self.w_ks(k), self.w_vs(v), mask)
+
+    def forward_projected(self, q, k, v, mask=None):
         batch, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
         residual = q
         q = self.w_qs(q).view(batch, len_q, self.n_head, self.d_k)
-        k = self.w_ks(k).view(batch, len_k, self.n_head, self.d_k)
-        v = self.w_vs(v).view(batch, len_v, self.n_head, self.d_v)
+        k = k.view(batch, len_k, self.n_head, self.d_k)
+        v = v.view(batch, len_v, self.n_head, self.d_v)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         if mask is not None:
             mask = mask.unsqueeze(1)
@@ -123,15 +126,17 @@ class TransformerSequenceCore(nn.Module):
             max_length=int(transformer.max_length),
             embed_dim=self.feat_dim,
         )
-        self.layer_stack = nn.ModuleList([
-            AttentionBlockKVCache(
-                feat_dim=self.feat_dim,
-                hidden_dim=int(transformer.ffn_dim),
-                num_heads=int(transformer.num_heads),
-                dropout=float(config.dropout),
-            )
-            for _ in range(int(config.layers))
-        ])
+        self.layer_stack = nn.ModuleList(
+            [
+                AttentionBlockKVCache(
+                    feat_dim=self.feat_dim,
+                    hidden_dim=int(transformer.ffn_dim),
+                    num_heads=int(transformer.num_heads),
+                    dropout=float(config.dropout),
+                )
+                for _ in range(int(config.layers))
+            ]
+        )
         self.layer_norm = nn.LayerNorm(self.feat_dim, eps=1e-6)
 
     def _prepare_action(self, action: torch.Tensor, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:

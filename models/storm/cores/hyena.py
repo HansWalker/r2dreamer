@@ -18,6 +18,13 @@ class HyenaSequenceCore(nn.Module):
         self.stem = stem
         self.layer = HyenaBlock(int(feat_dim), config.hyena)
         self.output_norm = nn.LayerNorm(int(feat_dim), eps=1e-6)
+        self._kernel = None
+
+    def prepare_sequence(self, reference):
+        self._kernel = self.layer.kernel(reference)
+
+    def clear_sequence(self):
+        self._kernel = None
 
     def _token(self, samples, action):
         if action.dim() == 2:
@@ -43,5 +50,5 @@ class HyenaSequenceCore(nn.Module):
 
     def step(self, samples, action, cache=None):
         assert samples.shape[1] == 1
-        output, cache = self.layer.step(self._token(samples, action)[:, 0], cache)
+        output, cache = self.layer.step(self._token(samples, action)[:, 0], cache, kernel=self._kernel)
         return self.output_norm(output).unsqueeze(1), cache

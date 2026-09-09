@@ -47,6 +47,7 @@ collection:
   parallelism: 3
 
 training:
+  parallelism: 1  # Set to 2 after measuring paired throughput and memory on the target GPU.
   resume: true
   overwrite: false
   overrides: []
