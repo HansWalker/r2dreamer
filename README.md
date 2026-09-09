@@ -98,6 +98,34 @@ and validates the resulting checkpoints and metrics:
 ./scripts/run_preflight.sh
 ```
 
+For a **full-size training and resource check** using the already collected datasets:
+
+```bash
+bash scripts/run_training_smoke.sh \
+  --dataset-root /absolute/path/to/data/dmc_expert_vision --updates 3
+```
+
+This runs every production model/scenario in a separate process, preserving model dimensions, batch
+sizes, sequence lengths, optimizers, and planning budgets. It performs three expert updates, three
+native online updates, and three batched environment collection steps. Online replay is seeded in
+memory from complete **training-split** expert episodes so updates can run immediately; this is a
+runtime check, not a learning experiment. The dataset is read-only and no model checkpoints are saved.
+Only logs and diagnostic reports are written under `runs/training_smoke/`.
+
+The default is one update/collection step; `--updates 3` separates cold compilation/initialization from
+subsequent calls for more useful timing estimates. `--rollout-steps N` controls collection separately;
+zero skips the simulator. Use `--scenarios reacher` or `--models dreamer/gru storm/mamba3` to narrow the
+matrix, and `--dry-run` to inspect it without loading data or models.
+
+`report.json` includes parameter counts, finite-loss/update checks, per-phase GPU allocated/reserved
+peaks, sampled process GPU memory (including compute-visible environment children), device-wide GPU
+utilization, worker host RAM/CPU usage, and estimated full-capacity replay tensor memory. It projects
+per-run and serial-matrix **training** time from configured update/environment-step budgets. The
+reported range reflects expert data-prefetch overlap, not a confidence interval. Evaluation,
+checkpoint I/O, and logging are unmeasured additions; longer contexts and different online trajectories
+can change runtime and memory. Memory-only parallel-pair candidates include headroom, but require a
+concurrent trial before assuming they are safe or faster. Profile on an otherwise idle GPU.
+
 The wrappers use the `environment/` created by `scripts/setup_dmc.sh`. Set `PYTHON` to use another
 interpreter. The smoke and full-run wrappers forward additional arguments to `main.py`; all three
 configs can also be invoked directly as `dmc_smoke`, `dmc_preflight`, or `dmc_benchmark`.
