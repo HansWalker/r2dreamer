@@ -171,7 +171,13 @@ python -m scripts.check_dmc_data --dataset-root /absolute/path/to/data/dmc_exper
 Omit `--dataset-root` to use `DMC_EXPERT_VISION_DATA_DIR` or the matrix's default path. This read-only
 audit checks the HDF5 schema, completeness, train/held-out splits, every numeric transition, action
 bounds, returns, termination/discount consistency, physical goal labels, and exact duplicate
-trajectories across splits. It reports expert returns and motion statistics as quality diagnostics.
+trajectories across splits. Quality summaries cover expert episode returns (mean, population variance,
+standard deviation, range, and percentiles), per-agent-step rewards, success/zero-return/perfect-reward
+rates, first-success timing, action saturation/variability, and physical-state variability. These describe
+the collected expert policy, not the world models. Ten chronological blocks per split and a held-out versus
+training summary help reveal collection drift or differing expert performance. Detailed physical-coordinate
+and initial-state statistics are included in JSON. Shorter episodes are weighted by their valid timestep
+counts for step-level statistics; episode-return statistics weight episodes equally.
 By default it reads every valid image from 16 reproducibly sampled episodes per split; add
 `--full-images` to read every image, which requires substantially more disk I/O. No GPU or expert
 checkpoint is needed. Run after collection has stopped.
