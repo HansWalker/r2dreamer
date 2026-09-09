@@ -142,6 +142,31 @@ compilation; repeat the check and inspect warm rates before extrapolating. Each 
 model, replay, optimizer, seeds, and logs.
 The benchmark does not save checkpoints or automatically change the production configuration.
 
+To test **the same model/variant across all three scenarios**, compare a serial baseline with two-
+and three-worker queues:
+
+```bash
+bash scripts/run_training_smoke.sh --dataset-root /absolute/path/to/data/dmc_expert_vision \
+  --scenario-workers 2 3 --updates 20 --warmup-updates 5 --rollout-steps 32 \
+  --output runs/scenario_concurrency
+```
+
+By default this tests all 13 variants: 39 serial workers, then 39 at each concurrency level (117 total).
+Use `--models storm/mamba3 tdmpc2/default` to narrow it. Each trial runs the same selected scenarios:
+with two workers, the third scenario starts when a slot becomes free; with three, all start together.
+Within each variant, the longest serial jobs start first. Different variants never share a concurrent
+trial. The serial baselines are reused, and actual sampled batches must match each scenario's baseline.
+No memory prefilter excludes tight triples, including Dreamer; CUDA OOMs are recorded as failures and
+later trials continue. A failed trial gets no speedup, and the script exits nonzero if any trial failed.
+Use this on an otherwise idle GPU: host OOM or a driver failure can still interrupt the whole check.
+
+The compact `summary.txt` has one row per variant/concurrency level, with serial/concurrent seconds,
+wall speedup, estimated warm phase speedups, summed worker memory peaks, and process-overlap fraction.
+The memory sum uses the largest N sampled worker peaks, not simultaneously measured GPU occupancy.
+Phase speedups simulate bounded queues using warm call times; they are not synchronized phase trials.
+Full worker diagnostics and queue start/end times remain in `report.json`. This mode is separate from
+pair/compile/storage comparisons, and does not change the production scheduler or enable compilation.
+
 To test complementary pairs, reusing each serial baseline:
 
 ```bash

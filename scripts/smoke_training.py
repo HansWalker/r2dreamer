@@ -4,6 +4,7 @@ import argparse
 import copy
 import csv
 import hashlib
+import heapq
 import importlib.metadata
 import io
 import itertools
@@ -544,6 +545,9 @@ def run_job(job):
 
 def write_summary(results, output, comparisons=()):
     """Keep terminal/paste output short; full phase details remain in JSON and worker logs."""
+    if comparisons and all("model" in case for case in comparisons):
+        write_scenario_summary(results, output, comparisons)
+        return
 
     def number(value, digits=2):
         return "-" if value is None else f"{value:.{digits}f}"
@@ -608,7 +612,7 @@ def write_summary(results, output, comparisons=()):
             f" ({timing['projected_runs']}/{len(results)} runs projected)."
         )
     if comparisons:
-        lines.append("Pair warm speedup = sum(serial rates) / max(concurrent rates); phases are not synchronized.")
+        lines.append("Warm speedups estimate phase-only queues at the worker limit; phases are not synchronized.")
         lines.append("Wall ratios include startup. Cases run baseline first; OS/compiler caches are not cleared.")
     lines.append("Hours exclude evaluation/checkpoint I/O; ranges bound prefetch overlap, not uncertainty.")
     if any(not row["timing_projection"]["steady_samples"] for row in results if row.get("timing_projection")):
@@ -634,7 +638,63 @@ def write_summary(results, output, comparisons=()):
     print(f"Pasteable summary | {output / 'summary.txt'}", flush=True)
 
 
-def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None):
+def write_scenario_summary(results, output, comparisons):
+    lines = [
+        "Scenario concurrency | same model/variant across scenarios | no checkpoints",
+        "Model | Workers | Serial/concurrent s | Speedup | S/E/O/C | GPU peak-sum GiB | Overlap | Result",
+    ]
+    for case in comparisons:
+        wall = case.get("wall_seconds")
+        elapsed = f"{case['serial_wall_seconds']:.1f}/" + (f"{wall:.1f}" if wall is not None else "-")
+        speedup = f"{case['wall_speedup']:.2f}x" if case["passed"] else "-"
+        rates = case.get("warm_speedup", {})
+        phases = "/".join(
+            f"{rates[name]:.2f}" if name in rates else "-" for name in ("sample", "expert", "online", "collect")
+        )
+        peak = case.get("process_gpu_peak_sum_mib")
+        memory = f"{peak / 1024:.2f}" if peak is not None else "-"
+        overlap = case.get("overlap_fraction")
+        overlap = f"{overlap:.0%}" if overlap is not None else "-"
+        status = "PASS" if case["passed"] else "FAIL"
+        lines.append(
+            f"{case['model']} | {case['parallelism']} | {elapsed} | {speedup} | {phases}"
+            f" | {memory} | {overlap} | {status}"
+        )
+    failed = [row for row in results if row["status"] != "PASS"]
+    for row in failed:
+        error = " ".join(row.get("error", "see log").split())
+        lines.append(f"FAIL | {row.get('case', 'serial')} | {row['name']} | {error[:160]} | {row.get('log', '')}")
+    lines.extend(
+        [
+            f"Workers: {len(results) - len(failed)}/{len(results)} passed. Full diagnostics: {output / 'report.json'}",
+            "S/E/O/C = sample/expert/online/collect. Phase speedups simulate a queue at the tested worker limit.",
+            "Each trial runs all selected scenarios, longest serial job first; levels differ only in concurrency.",
+            "Wall time includes startup and warmup. Overlap = fraction with at least two worker processes alive.",
+            "GPU peak-sum = largest N measured process peaks, not a simultaneous measurement or a full-run bound.",
+            "Failed trials have no speedup. OOMs do not stop later trials; final exit status remains nonzero.",
+            "OS/compiler caches are not cleared; phases are not synchronized; evaluation/checkpoint I/O is untested.",
+        ]
+    )
+    if any(not row["timing_projection"]["steady_samples"] for row in results if row.get("timing_projection")):
+        lines.append("Timing caution: fewer than two post-warmup calls in some phases; increase updates/rollout steps.")
+    if any(not row["timing_projection"]["collection_included"] for row in results if row.get("timing_projection")):
+        lines.append("Collection was skipped for some runs; those comparisons measure training only.")
+    output.mkdir(parents=True, exist_ok=True)
+    text = "\n".join(lines) + "\n"
+    (output / "summary.txt").write_text(text, encoding="utf-8")
+    print("\n" + text, end="", flush=True)
+    print(f"Pasteable summary | {output / 'summary.txt'}", flush=True)
+
+
+def queue_seconds(durations, workers):
+    """Estimate phase-only makespan with the same bounded FIFO scheduling as run_jobs."""
+    slots = [0.0] * min(workers, len(durations))
+    for seconds in durations:
+        heapq.heapreplace(slots, slots[0] + seconds)
+    return max(slots, default=0.0)
+
+
+def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None, scenario_workers=()):
     """Reuse serial baselines, then change only concurrency, compilation, or storage."""
     from main import run_jobs
 
@@ -653,7 +713,9 @@ def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None)
         def measure(item):
             index, job = item
             path = output / name / job["name"] / "resources.json"
+            start = time.perf_counter() - started
             results[index] = run_job(dict(job, case=name, result_path=str(path)))
+            results[index].update(case_start_seconds=start, case_end_seconds=time.perf_counter() - started)
 
         started = time.perf_counter()
         run_jobs(measure, list(enumerate(selected)), parallelism)
@@ -669,6 +731,13 @@ def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None)
         (f"pair_{index}", [job for job in jobs if job["name"].split("/", 1)[1] in pair], 2)
         for index, pair in enumerate(pairs, 1)
     ]
+    if scenario_workers:
+        groups = {}
+        for job in jobs:
+            groups.setdefault(job["name"].split("/", 1)[1], []).append(job)
+        for selected in groups.values():
+            selected.sort(key=lambda job: references[job["name"]]["wall_seconds"], reverse=True)
+            cases.extend((f"scenarios_{workers}", selected, workers) for workers in scenario_workers)
     for job in jobs:
         if compile_dreamer and job["config"]["model_family"] == "dreamer":
             compiled = copy.deepcopy(job)
@@ -681,26 +750,49 @@ def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None)
 
     for name, selected, parallelism in cases:
         before = [references[job["name"]] for job in selected]
-        if any(row["status"] != "PASS" for row in before):
-            report["comparisons"].append({"name": name, "passed": False, "error": "serial baseline failed"})
-            continue
-        after, wall = run_case(name, selected, parallelism)
         case = {
-            "name": f"{name}: {', '.join(row['name'] for row in after)}",
+            "name": f"{name}: {', '.join(job['name'] for job in selected)}",
             "passed": False,
             "parallelism": parallelism,
-            "wall_seconds": wall,
+            "runs": [job["name"] for job in selected],
+            "serial_wall_seconds": sum(row["wall_seconds"] for row in before),
         }
+        if scenario_workers:
+            case["model"] = selected[0]["name"].split("/", 1)[1]
+        if any(row["status"] != "PASS" for row in before):
+            case["error"] = "serial baseline failed"
+            report["comparisons"].append(case)
+            continue
+        after, wall = run_case(name, selected, parallelism)
+        case["wall_seconds"] = wall
+        peaks = [row.get("resources", {}).get("process_gpu_peak_mib") for row in after]
+        if all(peak is not None for peak in peaks):
+            case["process_gpu_peak_sum_mib"] = sum(sorted(peaks, reverse=True)[:parallelism])
+        events = sorted(
+            event for row in after for event in ((row["case_start_seconds"], 1), (row["case_end_seconds"], -1))
+        )
+        active, previous, overlap = 0, 0.0, 0.0
+        for at, change in events:
+            if active >= 2:
+                overlap += at - previous
+            active += change
+            previous = at
+        case["overlap_fraction"] = overlap / wall
         if all(row["status"] == "PASS" for row in after):
             same_samples = all(a["sample_sha256"] == b["sample_sha256"] for a, b in zip(before, after, strict=True))
             case.update(passed=same_samples, identical_samples=same_samples)
             if not same_samples:
                 case["error"] = "sampled batches differ from the serial baseline"
-            case["wall_speedup"] = sum(row["wall_seconds"] for row in before) / wall
+        else:
+            case["error"] = "worker failure"
+        if case["passed"]:
+            case["wall_speedup"] = case["serial_wall_seconds"] / wall
             rates = [row["timing_projection"]["rates"] for row in before]
             case["warm_speedup"] = {
                 phase: sum(rate[phase]["seconds_per_call"] for rate in rates)
-                / max(row["timing_projection"]["rates"][phase]["seconds_per_call"] for row in after)
+                / queue_seconds(
+                    [row["timing_projection"]["rates"][phase]["seconds_per_call"] for row in after], parallelism
+                )
                 for phase in rates[0]
             }
         report["comparisons"].append(case)
@@ -734,6 +826,14 @@ def main():
     parser.add_argument("--model-override", action="append", default=[], help="Hydra override for each selected model.")
     parser.add_argument(
         "--compare-parallel", action="store_true", help="Benchmark exactly two runs serially, then together."
+    )
+    parser.add_argument(
+        "--scenario-workers",
+        type=int,
+        nargs="+",
+        choices=(2, 3),
+        default=[],
+        help="Compare each model across scenarios: shared serial baseline, then worker limits 2 and/or 3.",
     )
     parser.add_argument(
         "--pair",
@@ -811,6 +911,13 @@ def main():
         parser.error("The selected matrix contains no runs")
     if len({job["name"] for job in jobs}) != len(jobs):
         parser.error("Duplicate scenarios/models would write the same diagnostic files")
+    if args.scenario_workers:
+        if args.pair or args.compare_parallel or args.compare_compile or args.compare_storage:
+            parser.error("--scenario-workers is separate from pair/compile/storage comparisons")
+        if len(set(args.scenario_workers)) != len(args.scenario_workers):
+            parser.error("Duplicate scenario worker limits would overwrite reports")
+        if max(args.scenario_workers) > len(scenarios):
+            parser.error("Select at least as many scenarios as the largest --scenario-workers limit")
     if args.pair and args.compare_parallel:
         parser.error("Use --pair or --compare-parallel, not both")
     if args.compare_parallel and (len(jobs) != 2 or len(set(scenarios)) != 1 or len(set(models)) != 2):
@@ -852,16 +959,30 @@ def main():
         flush=True,
     )
     results = []
-    if pairs or args.compare_compile or storage is not None:
+    if args.scenario_workers:
+        print(
+            f"Scenario concurrency | variants={len(models)} | levels={[1, *args.scenario_workers]}"
+            f" | worker_runs={len(jobs) * (1 + len(args.scenario_workers))} | no memory prefilter",
+            flush=True,
+        )
+    if pairs or args.compare_compile or storage is not None or args.scenario_workers:
         if args.dry_run:
             print(
                 f"Comparison plan | serial={len(jobs)} | pairs={pairs}"
                 f" | compile_dreamer={args.compare_compile} | storage={storage}"
+                f" | scenario_workers={args.scenario_workers}"
             )
         else:
             raise SystemExit(
                 0
-                if compare_runs(jobs, output, pairs=pairs, compile_dreamer=args.compare_compile, storage=storage)
+                if compare_runs(
+                    jobs,
+                    output,
+                    pairs=pairs,
+                    compile_dreamer=args.compare_compile,
+                    storage=storage,
+                    scenario_workers=args.scenario_workers,
+                )
                 else 1
             )
     for index, job in enumerate(jobs, 1):
