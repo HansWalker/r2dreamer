@@ -2,6 +2,7 @@
 # Keep these pins together: CUTLASS, TVM FFI, TileLang, and Quack share private APIs.
 # Mamba itself is installed from its pinned source commit with --no-deps by setup_dmc.sh.
 # Triton 3.5 overrides Torch 2.8's 3.4 pin because Mamba3 needs small matrix dots.
+# This override supports eager Mamba kernels, not Torch 2.8's Inductor compiler.
 apache-tvm-ffi==0.1.11
 cuda-bindings==13.3.1
 cuda-core==1.0.0

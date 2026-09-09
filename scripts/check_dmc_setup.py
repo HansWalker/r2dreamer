@@ -269,7 +269,7 @@ def main():
     check_mamba3()
     check_runtime()
     check_tdmpc2()
-    print("DMC setup check passed.")
+    print("DMC setup check passed (eager execution; torch.compile is not checked).")
 
 
 if __name__ == "__main__":

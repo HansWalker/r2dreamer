@@ -4,6 +4,7 @@ import argparse
 import copy
 import csv
 import hashlib
+import importlib.metadata
 import io
 import itertools
 import json
@@ -21,9 +22,31 @@ from pathlib import Path
 
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
+from packaging.requirements import Requirement
 
 ROOT = Path(__file__).resolve().parents[1]
 MIB = 1024**2
+
+
+def check_cuda_compile_dependencies():
+    """The eager Mamba runtime's Triton override is not an Inductor-compatible stack."""
+    for text in importlib.metadata.requires("torch") or ():
+        requirement = Requirement(text)
+        if requirement.name != "triton" or (requirement.marker and not requirement.marker.evaluate()):
+            continue
+        try:
+            installed = importlib.metadata.version("triton")
+        except importlib.metadata.PackageNotFoundError:
+            installed = None
+        if installed is None or not requirement.specifier.contains(installed, prereleases=True):
+            torch_version = importlib.metadata.version("torch")
+            raise RuntimeError(
+                f"torch {torch_version} requires triton{requirement.specifier} for CUDA compilation;"
+                f" installed: {installed or 'missing'}. The pinned Mamba stack overrides this dependency"
+                " for eager kernels, not torch.compile. Omit --compare-compile and keep model.compile=false."
+                " Test compilation in a separate environment with matching Torch/Triton versions;"
+                " do not downgrade Triton in the working Mamba environment."
+            )
 
 
 def collect_gpu_samples(stop, result):
@@ -533,7 +556,8 @@ def write_summary(results, output, comparisons=()):
     for row in results:
         label = f"{row.get('case', 'serial')} | {row['name']}"
         if row["status"] != "PASS":
-            lines.append(f"FAIL | {label} | {row.get('error', 'see log')} | {row.get('log', '')}")
+            error = " ".join(row.get("error", "see log").split())
+            lines.append(f"FAIL | {label} | {error} | {row.get('log', '')}")
             continue
         config = OmegaConf.create(row["config_yaml"])
         projection = row["timing_projection"]
@@ -796,6 +820,16 @@ def main():
         parser.error("Pairs require one scenario and two distinct selected models per pair")
     if args.compare_compile and not any(job["config"]["model_family"] == "dreamer" for job in jobs):
         parser.error("--compare-compile requires at least one Dreamer model")
+    if not args.dry_run and any(
+        job["config"]["model_family"] == "dreamer"
+        and (args.compare_compile or job["config"]["model"]["compile"])
+        and job["config"]["device"].split(":", 1)[0] == "cuda"
+        for job in jobs
+    ):
+        try:
+            check_cuda_compile_dependencies()
+        except RuntimeError as error:
+            parser.exit(2, f"Compile preflight | {error}\n")
     storage = args.compare_storage.expanduser().resolve() if args.compare_storage else None
     if storage is not None and not args.dry_run:
         # Validate before spending GPU time; measured sample hashes also check the data actually consumed.

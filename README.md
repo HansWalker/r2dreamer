@@ -142,15 +142,24 @@ compilation; repeat the check and inspect warm rates before extrapolating. Each 
 model, replay, optimizer, seeds, and logs.
 The benchmark does not save checkpoints or automatically change the production configuration.
 
-To test complementary pairs and Dreamer compilation together, reusing each serial baseline:
+To test complementary pairs, reusing each serial baseline:
 
 ```bash
 bash scripts/run_training_smoke.sh --dataset-root /absolute/path/to/data/dmc_expert_vision \
   --scenarios ball_in_cup --updates 10 --warmup-updates 3 --rollout-steps 3 \
   --pair dreamer/gru storm/mamba3 \
   --pair temporal_straightening/default storm/mamba3 \
-  --compare-compile --output runs/runtime_check
+  --output runs/runtime_check
 ```
+
+The pinned **Torch 2.8 / Triton 3.5** Mamba environment does **not** support CUDA `torch.compile`:
+Inductor expects Triton 3.4 APIs, including `triton.compiler.compiler.triton_key`.
+Keep `model.compile=false` in this environment; do not downgrade Triton and break the Mamba kernels.
+The setup check validates eager execution, not Inductor. CUDA compilation benchmarks check Torch's
+declared Triton dependency before launching any workers and report mismatches without an eager fallback.
+This dependency check is necessary, not sufficient: successful GPU forward/backward benchmarks are still required.
+Only add `--compare-compile` in a separately validated, matching Torch/Triton environment. Use
+`--models dreamer/gru --compare-compile` to test compilation alone without repeating the paired trials.
 
 Dreamer's opt-in `model.compile=true` compiles tensor-only encoder, decoder, recurrent-core, posterior,
 and prior modules in place. These are shared by expert updates, online training, history reconstruction,
