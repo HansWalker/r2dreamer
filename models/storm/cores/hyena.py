@@ -48,6 +48,10 @@ class HyenaSequenceCore(nn.Module):
     def forward(self, samples, action):
         return self.output_norm(self.layer(self._token(samples, action)))
 
+    def scan(self, samples, action, cache):
+        output, cache = self.layer.scan(self._token(samples, action), cache, self._kernel)
+        return self.output_norm(output), cache
+
     def step(self, samples, action, cache=None):
         assert samples.shape[1] == 1
         output, cache = self.layer.step(self._token(samples, action)[:, 0], cache, kernel=self._kernel)

@@ -20,11 +20,17 @@ def run_seconds(config, training_row, serial_row, checkpoints):
     offline = [expert_updates * max(read, compute), expert_updates * (read + compute)]
     collection = calls * rates["collect"]["seconds_per_call"]
     episode_steps = math.ceil(int(config.env.time_limit) / int(config.env.action_repeat))
-    eval_rates = reference.get("evaluation_seconds_per_vector_step", {})
+    eval_rates = reference.get("evaluation", {})
 
     def evaluation(batch):
-        if str(batch) in eval_rates:
-            return eval_rates[str(batch)] * episode_steps
+        timing = eval_rates.get(str(batch), {})
+        if timing.get("warm_step_seconds") is not None:
+            # Preserve measured calls, including Dreamer's extra reset-only step.
+            warm_calls = timing["warm_samples"] + episode_steps - timing["vector_steps"]
+            return (
+                timing["build_seconds"] + timing["reset_seconds"] + timing["tail_seconds"]
+                + timing["first_step_seconds"] + max(0, warm_calls) * timing["warm_step_seconds"]
+            )
         # This fallback is explicitly labelled: planner throughput need not scale linearly with batch size.
         return reference["rates"]["collect"]["seconds_per_call"] * batch / int(config.env.env_num) * episode_steps
 
@@ -44,9 +50,9 @@ def run_seconds(config, training_row, serial_row, checkpoints):
         "final": final,
         "startup": training_row["timing_projection"].get("startup_seconds", 0)
         + training_row["timing_projection"].get("cold_overhead_seconds", 0),
-        "evaluation_basis": "short evaluation batch timings"
+        "evaluation_basis": "warm evaluation steps plus one-time reset/startup"
         if all(
-            str(batch) in eval_rates
+            eval_rates.get(str(batch), {}).get("warm_step_seconds") is not None
             for batch in (int(config.env.eval_episode_num), int(config.evaluation.final.episodes))
         )
         else "collection-rate extrapolation",
@@ -146,7 +152,7 @@ def render(rows):
         "- Historical projection: no assumed speedup for optimizations not present in the supplied measurements.",
         "- Prefetch ranges bound read/compute overlap, not statistical uncertainty.",
         "- Phase columns estimate each phase separately. Group totals schedule whole training jobs, then sum serialized final evaluations; columns need not sum exactly for concurrent groups.",
-        "- Evaluation uses measured short episodes at matching batch sizes when available; otherwise it scales collection time by episode count. Neither is a measured full-episode guarantee.",
+        "- Evaluation uses warm decision timings plus one-time reset/startup at matching batch sizes; otherwise it scales collection time by episode count. Legacy reset-inclusive step rates are not used. Neither is a measured full-episode guarantee.",
         "- Concurrent periodic evaluation contention, state-prediction evaluation, checkpoint I/O, dataset staging, and expert-data collection are not measured.",
         "- Uses the first measured seed for each configuration and assumes fresh, complete training. It does not subtract completed/resumed work.",
     ]

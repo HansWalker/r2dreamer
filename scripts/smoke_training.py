@@ -189,6 +189,65 @@ def seed_online_replay(config, dataset, replay):
     return list(map(int, selected))
 
 
+class EvaluationTimer:
+    """Benchmark-only environment proxy separating reset and per-decision work."""
+
+    def __init__(self, envs, device):
+        self.envs = envs
+        self.device = device
+        self.steps = []
+        self.resets = []
+        self.pending = 0.0
+        self.previous = self._clock()
+
+    def __getattr__(self, name):
+        return getattr(self.envs, name)
+
+    def _clock(self):
+        if self.device.type == "cuda":
+            import torch
+
+            torch.cuda.synchronize(self.device)
+        return time.perf_counter()
+
+    def _call(self, name, *args, **kwargs):
+        start = self._clock()
+        self.pending += start - self.previous
+        value = getattr(self.envs, name)(*args, **kwargs)
+        end = self._clock()
+        if name == "step":
+            self.steps.append({"policy_seconds": self.pending, "environment_seconds": end - start})
+            self.pending = 0.0
+        else:
+            self.resets.append({"name": name, "seconds": end - start})
+        self.previous = end
+        return value
+
+    def reset(self):
+        return self._call("reset")
+
+    def reset_done(self, *args, **kwargs):
+        return self._call("reset_done", *args, **kwargs)
+
+    def step(self, *args, **kwargs):
+        return self._call("step", *args, **kwargs)
+
+    def finish(self):
+        tail = self.pending + self._clock() - self.previous
+        warm = self.steps[1:]
+        return {
+            "steps": self.steps,
+            "resets": self.resets,
+            "reset_seconds": sum(reset["seconds"] for reset in self.resets),
+            "tail_seconds": tail,
+            "first_step_seconds": sum(self.steps[0].values()) if self.steps else None,
+            "warm_step_seconds": statistics.mean(sum(step.values()) for step in warm) if warm else None,
+            "warm_policy_seconds": statistics.mean(step["policy_seconds"] for step in warm) if warm else None,
+            "warm_environment_seconds": statistics.mean(step["environment_seconds"] for step in warm) if warm else None,
+            "warm_samples": len(warm),
+        }
+
+
 def run_worker(job):
     import torch
 
@@ -362,8 +421,17 @@ def run_worker(job):
                 eval_config.env.time_limit = job["eval_steps"] * int(config.env.action_repeat)
                 eval_config.env.eval_seed = int(config.evaluation.final.seed)
                 envs = measure(f"eval_build/{batch_size}", lambda cfg=eval_config: make_eval_envs(cfg.env))
-                measure(f"evaluation/{batch_size}", lambda cfg=eval_config, group=envs: family.evaluate(cfg, model, group))
+                timing = {}
+
+                def evaluate(group=envs, cfg=eval_config, timings=timing):
+                    timed_envs = EvaluationTimer(group, device)
+                    metrics = family.evaluate(cfg, model, timed_envs)
+                    timings.update(timed_envs.finish())
+                    return metrics
+
+                measure(f"evaluation/{batch_size}", evaluate)
                 result["phases"][-1].update(batch_size=batch_size, vector_steps=job["eval_steps"])
+                result["phases"][-1]["timing"] = timing
                 close_envs(envs)
                 envs = None
             if not all(torch.isfinite(parameter).all() for parameter in model.parameters()):
@@ -465,11 +533,23 @@ def project_time(result):
             "env_prime",
         }
     )
+    evaluation = {
+        str(phase["batch_size"]): {
+            **phase["timing"],
+            "vector_steps": phase["vector_steps"],
+            "build_seconds": next(
+                item["seconds"] for item in result["phases"] if item["name"] == f"eval_build/{phase['batch_size']}"
+            ),
+        }
+        for phase in result["phases"]
+        if phase["name"].startswith("evaluation/") and "timing" in phase
+    }
     return {
         "rates": rates,
+        "evaluation": evaluation,
         "evaluation_seconds_per_vector_step": {
-            str(phase["batch_size"]): phase["seconds"] / phase["vector_steps"]
-            for phase in result["phases"] if phase["name"].startswith("evaluation/")
+            batch: timing["warm_step_seconds"]
+            for batch, timing in evaluation.items() if timing["warm_step_seconds"] is not None
         },
         "expert_updates": expert_updates,
         "online_updates": online_updates,
@@ -604,7 +684,7 @@ def write_summary(results, output, comparisons=()):
         "Training smoke summary | no checkpoints",
         "Seconds/call: sample/expert/online/collect (warm). Memory: process GPU / PyTorch reserved / host RAM, GiB.",
         ("Case | Run | BxT | Trainable/frozen M | Seconds/call | Memory GiB | GPU avg/max % | Hours/seed"
-         " | Threads/online CPU cores | Eval s/step(batch)"),
+         " | Threads/online CPU cores | Eval batch:warm,reset,first s"),
     ]
     for row in results:
         label = f"{row.get('case', 'serial')} | {row['name']}"
@@ -632,8 +712,8 @@ def write_summary(results, output, comparisons=()):
         hours = "-".join(number(value) for value in projection["training_hours_range"])
         cpu = number(rates.get("online", {}).get("cpu_core_equivalents"))
         evaluation = "/".join(
-            f"{batch}:{seconds:.3f}"
-            for batch, seconds in projection.get("evaluation_seconds_per_vector_step", {}).items()
+            f"{batch}:{number(timing['warm_step_seconds'], 3)},{timing['reset_seconds']:.2f},{number(timing['first_step_seconds'], 3)}"
+            for batch, timing in projection.get("evaluation", {}).items()
         ) or "-"
         lines.append(
             f"{label} | {config.replay.batch_size}x{config.replay.sequence_length}"
@@ -691,8 +771,9 @@ def write_summary(results, output, comparisons=()):
     lines.append("Short rollouts do not bound late-episode memory; GPU utilization is device-wide.")
     if any(row.get("online_mode") == "interleaved" for row in results):
         lines.append("Online burst times are normalized per optimizer update; replay includes newly collected prefixes.")
-    if any(row.get("timing_projection", {}).get("evaluation_seconds_per_vector_step") for row in results if row.get("timing_projection")):
-        lines.append("Evaluation timings use short episodes at the requested batch sizes, include reset, and are not quality metrics.")
+    if any(row.get("timing_projection", {}).get("evaluation") for row in results if row.get("timing_projection")):
+        lines.append("Eval warm timings exclude explicit resets and the first step call; policy/bookkeeping and environment times are in JSON.")
+        lines.append("Evaluation reset/first-call costs are counted once per batch, not once per step; short episodes are not quality metrics.")
     text = "\n".join(lines) + "\n"
     output.mkdir(parents=True, exist_ok=True)
     (output / "summary.txt").write_text(text, encoding="utf-8")

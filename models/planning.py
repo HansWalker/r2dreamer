@@ -116,6 +116,9 @@ class LatentPlanner(nn.Module):
             **self.state_head.fit(latent, labels),
         }
 
+    def _predict_rollout(self, state, action, conditioning):
+        return self.predictor(state, action), None
+
     def rollout(self, history, past_action, candidates):
         """Predict action candidates [batch, samples, horizon, action] from encoded history."""
         batch, samples, horizon, _ = candidates.shape
@@ -134,9 +137,11 @@ class LatentPlanner(nn.Module):
         # Actions are known for the entire rollout; only latent states are recursive.
         encoded_action = self.action_encoder(torch.cat((action_history, candidates), dim=1))
         prediction = []
+        conditioning = None
         for step in range(horizon):
             conditioned_action = encoded_action[:, step : step + self.history_size]
-            next_state = self.pred_projector(self.predictor(state, conditioned_action))[:, -1]
+            output, conditioning = self._predict_rollout(state, conditioned_action, conditioning)
+            next_state = self.pred_projector(output)[:, -1]
             prediction.append(next_state)
             state = torch.cat((state[:, 1:], next_state[:, None]), dim=1)
         return torch.stack(prediction, dim=1).reshape(batch, samples, horizon, *latent_shape)

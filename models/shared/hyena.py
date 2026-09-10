@@ -157,6 +157,25 @@ class HyenaOperator(nn.Module):
         output = self.out_proj(mixed * x0)
         return output, (short_input[:, 1:], long_history, length)
 
+    def scan(self, value, state, kernel=None):
+        """Convolve known tokens together, including the incoming short/long history."""
+        short_history, long_history, length = state
+        projected = self.in_proj(value)
+        short_input = torch.cat((short_history.to(projected), projected), dim=1)
+        short = F.conv1d(
+            short_input.transpose(1, 2), self.short_filter.weight, self.short_filter.bias, groups=3 * self.d_model
+        )
+        x0, x1, content = short.chunk(3, dim=1)
+        content = self.dropout(content * x1)
+        long_history = long_history.to(content)
+        kernel = self._kernel(self.max_length, content) if kernel is None else kernel.to(content)
+        valid = torch.arange(self.max_length, device=value.device)[None, :] < length[:, None]
+        prefix = (long_history * valid.unsqueeze(-1)).flip(1).transpose(1, 2)
+        mixed = fft_convolution(torch.cat((prefix, content), dim=-1), kernel.T, self.filter.bias)
+        output = self.out_proj((mixed[..., self.max_length :] * x0).transpose(1, 2))
+        next_long = torch.cat((content.transpose(1, 2).flip(1), long_history), dim=1)[:, : self.max_length]
+        return output, (short_input[:, -2:], next_long, (length + value.shape[1]).clamp(max=self.max_length))
+
 
 class HyenaBlock(nn.Module):
     """Pre-normalized Hyena operator and gated feed-forward block."""
@@ -188,4 +207,8 @@ class HyenaBlock(nn.Module):
 
     def step(self, value: torch.Tensor, state=None, kernel=None) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         mixed, state = self.operator.step(self.norm(value), state, kernel)
+        return self._feed_forward(value + self.dropout(mixed)), state
+
+    def scan(self, value, state, kernel=None):
+        mixed, state = self.operator.scan(self.norm(value), state, kernel)
         return self._feed_forward(value + self.dropout(mixed)), state

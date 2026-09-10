@@ -51,6 +51,11 @@ class MambaSequenceCore(nn.Module):
         token = self._token(samples, action)
         return self.output_norm(token + self.dropout(self.layer(token)))
 
+    def scan(self, samples, action, cache):
+        token = self._token(samples, action)
+        output, *cache = self.layer.scan(token, *cache)
+        return self.output_norm(token + self.dropout(output)), tuple(cache)
+
     def step(
         self,
         samples: torch.Tensor,

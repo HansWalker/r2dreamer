@@ -234,7 +234,9 @@ and 50. It uses production-sized models and saves no checkpoints. Options can be
 `--scenarios cartpole_balance_sparse reacher ball_in_cup`. The test is not a task-performance evaluation.
 `--online-burst N` controls the number of online updates after a collection call; total updates remain
 `--updates`. Warmup excludes whole bursts until at least `--warmup-updates` updates have completed.
-Evaluation timings include reset and initial calls; short episodes do not bound late-episode memory.
+Evaluation timings separate reset, first-call, and warm-step costs. The compact summary shows
+`batch:warm,reset,first` seconds; JSON also separates policy/bookkeeping from environment stepping.
+At least two evaluation steps are needed for a warm estimate. Short episodes do not bound late-episode memory.
 
 Generate an ordered phase breakdown from a complete report (later reports replace matching cases):
 
@@ -245,6 +247,8 @@ python -m scripts.estimate_runtime --report runs/scenario_concurrency/report.jso
 `runs/runtime_estimate/schedule.md` and `schedule.json` group concurrent training jobs, keep final
 evaluations serial, and separate pretraining, online updates, collection, and evaluation estimates.
 For TS, the estimator selects the measured gradient-batch case matching the production setting.
+Evaluation projections count startup/reset once per batch and extrapolate only warm steps.
+Older reports without this split use the labelled collection-rate fallback, not reset-inclusive averages.
 Unmeasured state-prediction evaluation and checkpoint I/O are explicitly excluded. Existing timings
 do not establish a speedup for newer code; only new measurements can update those estimates.
 

@@ -11,7 +11,8 @@ try:
     from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import (
         mamba3_step_fn as _mamba3_step_fn,
     )
-except Exception as exc:  # pragma: no cover - depends on the optional CUDA stack
+    from mamba_ssm.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
+except Exception as exc:  # noqa: BLE001 - optional CUDA stack can fail during import
     Mamba3 = None
     MAMBA3_IMPORT_ERROR = exc
 else:
@@ -163,10 +164,9 @@ class Mamba3Layer(nn.Module):
     def forward(self, token):
         return self.mamba(token)
 
-    def _project(self, token):
-        projection = self.mamba.in_proj(token)
-        z, x, b, c, delta, a, trap, angles = torch.split(
-            projection,
+    def _split_projection(self, token):
+        return torch.split(
+            self.mamba.in_proj(token),
             [
                 self.mamba.d_inner,
                 self.mamba.d_inner,
@@ -180,6 +180,8 @@ class Mamba3Layer(nn.Module):
             dim=-1,
         )
 
+    def _project(self, token):
+        z, x, b, c, delta, a, trap, angles = self._split_projection(token)
         batch_size = token.shape[0]
         # Match the forward and step paths in the pinned Mamba3 commit.
         a = -F.softplus(a.float())
@@ -194,6 +196,49 @@ class Mamba3Layer(nn.Module):
         z = z.reshape(batch_size, self.mamba.nheads, self.mamba.headdim)
         angles = angles.unsqueeze(1).expand(-1, self.mamba.nheads, -1)
         return z, x, b, c, delta, a, trap, angles
+
+    def scan(self, token, angle_state, ssm_state, k_state, v_state):
+        """Parallel SISO sequence with an explicit, out-of-place cache boundary."""
+        z, x, b, c, delta, a, trap, angles = self._split_projection(token)
+        batch, length = token.shape[:2]
+        groups, heads, width = self.mamba.num_bc_heads, self.mamba.nheads, self.mamba.d_state
+        b = _rms_norm(b.reshape(batch, length, groups, width), self.mamba.B_norm)
+        c = _rms_norm(c.reshape(batch, length, groups, width), self.mamba.C_norm)
+        x = x.reshape(batch, length, heads, self.mamba.headdim)
+        z = z.reshape_as(x)
+        dt = F.softplus(delta.float() + self.mamba.dt_bias)
+        a = (-F.softplus(a.float())).clamp(max=-self.mamba.A_floor)
+        q_bias, k_bias, d = self.mamba.C_bias.squeeze(1), self.mamba.B_bias.squeeze(1), self.mamba.D
+        states = (angle_state, ssm_state, k_state.squeeze(1), v_state)
+        if not torch.is_grad_enabled():
+            # The kernel uses needs_input_grad to allocate backward buffers, even inside no_grad.
+            q_bias, k_bias, d = (value.detach() for value in (q_bias, k_bias, d))
+            states = tuple(value.detach() for value in states)
+        # The combined kernel applies sigmoid to Trap and tanh to Angles internally.
+        output, angle, ssm, k, v = mamba3_siso_combined(
+            Q=c,
+            K=b,
+            V=x,
+            ADT=(a * dt).transpose(1, 2),
+            DT=dt.transpose(1, 2),
+            Trap=trap.transpose(1, 2),
+            Q_bias=q_bias,
+            K_bias=k_bias,
+            Angles=angles.unsqueeze(2).expand(-1, -1, heads, -1).float(),
+            D=d,
+            Z=z,
+            Input_States=states,
+            chunk_size=self.mamba.chunk_size,
+            return_final_states=True,
+        )
+        output = self.mamba.out_proj(output.flatten(-2).to(x.dtype))
+        return (
+            output,
+            angle.float().contiguous(),
+            ssm.float().contiguous(),
+            k.unsqueeze(1).to(x.dtype).contiguous(),
+            v.to(x.dtype).contiguous(),
+        )
 
     def recurrent_step(self, token, angle_state, ssm_state, k_state, v_state):
         """Out-of-place PyTorch step used whenever gradients are enabled."""

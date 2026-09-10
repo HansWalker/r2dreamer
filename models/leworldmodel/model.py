@@ -54,7 +54,7 @@ class ConditionalBlock(nn.Module):
         nn.init.zeros_(self.modulation[-1].bias)
 
     def forward(self, value, condition):
-        shift1, scale1, gate1, shift2, scale2, gate2 = self.modulation(condition).chunk(6, -1)
+        shift1, scale1, gate1, shift2, scale2, gate2 = condition.chunk(6, -1)
         value = value + gate1 * self.attention(self.norm1(value) * (1 + scale1) + shift1)
         return value + gate2 * self.feed_forward(self.norm2(value) * (1 + scale2) + shift2)
 
@@ -77,10 +77,24 @@ class Predictor(nn.Module):
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, state, action):
+        return self._conditioned(state, tuple(block.modulation(action) for block in self.blocks))
+
+    def _conditioned(self, state, conditioning):
         value = self.dropout(state + self.position[:, : state.shape[1]])
-        for block in self.blocks:
-            value = block(value, action)
+        for block, condition in zip(self.blocks, conditioning, strict=True):
+            value = block(value, condition)
         return self.norm(value)
+
+    def rollout_step(self, state, action, previous):
+        # Only action-dependent terms survive the sliding history; latent states still change.
+        if previous is None:
+            conditioning = tuple(block.modulation(action) for block in self.blocks)
+        else:
+            conditioning = tuple(
+                torch.cat((condition[:, 1:], block.modulation(action[:, -1:])), dim=1)
+                for block, condition in zip(self.blocks, previous, strict=True)
+            )
+        return self._conditioned(state, conditioning), conditioning
 
 
 class SIGReg(nn.Module):
@@ -163,6 +177,9 @@ class VisionEncoder(nn.Module):
 
 
 class LeWorldModel(LatentPlanner):
+    def _predict_rollout(self, state, action, conditioning):
+        return self.predictor.rollout_step(state, action, conditioning)
+
     def __init__(self, config, model_io):
         settings = config.jepa_model
         encoder = VisionEncoder(model_io, settings.encoder)
