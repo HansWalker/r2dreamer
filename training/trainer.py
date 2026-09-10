@@ -15,6 +15,7 @@ import tools
 from dmc_expert.storage import dataset_identity
 from envs import close_envs, make_envs, make_eval_envs
 from training import load_model_family
+from training.progress import Progress
 from training.protocol import (
     checkpoint_compatibility,
     dynamics_targets_per_update,
@@ -57,6 +58,15 @@ class TrainingRun:
     model: torch.nn.Module
     dataset_identity: dict | None = None
     resumed_from: dict | None = None
+
+
+def progress_metrics(metrics, names):
+    selected = [(label, key) for label, key in names.items() if key in metrics]
+    # Two objective metrics and the physical readout; full metrics remain in JSONL/TensorBoard.
+    selected = [item for item in selected if item[0] != "state"][:2] + [
+        item for item in selected if item[0] == "state"
+    ]
+    return " ".join(f"{label}={tools.format_scalar(metrics[key], 3)}" for label, key in selected)
 
 
 def save_checkpoint(run, path, phase, state, replay_state=None, expert_updates=0):
@@ -171,6 +181,8 @@ def pretrain(run, replay, checkpoint=None):
     )
 
     replay_state = replay.state_dict()
+    progress = Progress("Expert", updates, state.updates)
+    progress.update(state.updates)
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="expert-replay") as executor:
         future = executor.submit(load_batch) if state.updates < updates else None
         for update in range(state.updates + 1, updates + 1):
@@ -179,6 +191,8 @@ def pretrain(run, replay, checkpoint=None):
             future = executor.submit(load_batch) if update < updates else None
             metrics = run.family.expert_update(run.model, batch)
             state.updates = update
+            if progress.due() or update == updates:
+                progress.update(update, progress_metrics(metrics, run.family.EXPERT_METRICS), force=True)
 
             if (log_every and update % log_every == 0) or update == updates:
                 sec_per_update = (time.perf_counter() - started) / (update - start_update)
@@ -310,6 +324,8 @@ def train_online(run, session, checkpoint=None, expert_updates=0):
     last_log_step = state.env_steps
     last_log_time = time.perf_counter()
     metrics = {}
+    progress = Progress("Online", total_steps, state.env_steps)
+    progress.update(state.env_steps, f"updates={state.world_model_updates}/{total_updates}")
 
     while state.env_steps < total_steps:
         step_delta, episodes = session.collect()
@@ -327,7 +343,8 @@ def train_online(run, session, checkpoint=None, expert_updates=0):
                 metrics.update(session.update(update_count))
                 state.world_model_updates += update_count
 
-        if eval_enabled and state.env_steps >= next_eval:
+        evaluated = eval_enabled and state.env_steps >= next_eval
+        if evaluated:
             run_evaluation()
             last_saved_step = state.env_steps
             while next_eval <= state.env_steps:
@@ -377,6 +394,15 @@ def train_online(run, session, checkpoint=None, expert_updates=0):
             )
             while next_log <= state.env_steps:
                 next_log += log_every
+
+        if progress.due() or evaluated or state.env_steps >= total_steps:
+            detail = progress_metrics(metrics, run.family.ONLINE_METRICS)
+            progress.update(
+                state.env_steps,
+                f"updates={state.world_model_updates}/{total_updates} {detail} "
+                f"eval={tools.format_scalar(state.last_eval_score, 1)}",
+                force=True,
+            )
 
     if eval_enabled and state.last_eval_step != state.env_steps:
         run_evaluation()

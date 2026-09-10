@@ -14,12 +14,9 @@ if [[ ! -x $CUDA_HOME/bin/nvcc ]]; then
     echo "CUDA toolkit not found at $CUDA_HOME. Set CUDA_HOME to the directory containing bin/nvcc." >&2
     exit 2
 fi
-if [[ -z ${TDMPC2_DIR:-} || ! -f $TDMPC2_DIR/tdmpc2/config.yaml ]]; then
-    echo "Set TDMPC2_DIR to a TD-MPC2 checkout containing tdmpc2/config.yaml." >&2
-    exit 2
-fi
 
 export CUDA_HOME
+# The external expert checkout is only needed if collection is enabled.
 export TDMPC2_DIR
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

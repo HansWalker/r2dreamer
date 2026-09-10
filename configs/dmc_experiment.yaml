@@ -73,7 +73,7 @@ training:
     enabled: false
     data_path: ${env.dataset_root}/${scenario.dataset}
     batch_size: ${replay.batch_size}
-    updates: 5000
+    updates: 10000
     shuffle: true
     log_every: 50
     eval_every: 0

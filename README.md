@@ -165,8 +165,8 @@ to inspect the commands without using the GPU. Summaries and JSON are saved unde
 Worker failures are reported and later sections still run. Use an otherwise idle GPU and compare
 warm update/collection rates, not just startup-inclusive speedups. Process-wide utilization averages
 and sums of independent memory peaks do not establish available concurrent throughput.
-Production still uses three Dreamer scenarios per variant and keeps other families and final
-evaluations serial; these new trials do not automatically enable further concurrency.
+Production uses the measured schedule described below; benchmark trials never automatically
+change it. Final evaluations remain serial.
 
 To test **the same model/variant across all three scenarios**, compare a serial baseline with two-
 and three-worker queues:
@@ -287,16 +287,37 @@ configs can also be invoked directly as `dmc_smoke`, `dmc_preflight`, or `dmc_be
 The orchestrator keeps the terminal focused on stage progress, timing, training metrics, and final
 results. Full commands, dependency warnings, and raw tracebacks remain in each collection or run log;
 on failure, the useful end of the traceback and the exact log path are printed automatically.
+In a terminal (including GNU Screen), each active worker has an in-place progress bar with counters,
+ETA, and a small selection of losses. Expert, online, policy-evaluation, and held-out prediction
+progress updates arrive at most every 30 seconds, plus stage completion. The parent owns the display,
+so parallel workers cannot overwrite each other's rows. Redirected output uses ordinary lines without
+terminal escape codes. Full scalar metrics remain in each run's `metrics.jsonl` and TensorBoard;
+raw worker output remains in `stdout.log` / evaluation logs. The parent also appends a plain-text
+`orchestrator.log` under the experiment output directory, without requiring `tee`.
 
 The production matrix runs all thirteen image-model variants on all three scenarios with seed 0.
 It collects each scenario dataset once, concurrently (`collection.parallelism=1` selects serial
 collection). Dreamer then trains the three scenarios of each variant together, controlled by
 `training.scenario_parallelism.dreamer=3`. Variants and seeds do not overlap. These triples fitted the
 40 GiB A100 benchmark with little memory headroom; set the value to 2 or 1 for a more conservative run.
-Other families remain serial, scenario by scenario (`training.parallelism=1`). Final evaluations run
+TD-MPC2 uses two scenario workers (`training.scenario_parallelism.tdmpc2=2`). The ball-in-cup
+LeWorldModel and STORM/Mamba3 runs form the one explicit `training.concurrent_runs` pair; TS and
+LeWorldModel never overlap. Remaining families run serially (`training.parallelism=1`). Scenario
+groups launch first, followed by the explicit pair and the remaining runs. Final evaluations run
 serially after each concurrent training group has finished; periodic checkpoint-selection evaluations
 still execute inside their respective training workers. Failures stop active workers, and the existing
 resume behavior applies separately to each run.
+
+For the completed datasets, launch the 10,000-expert-update recipe in a fresh output directory:
+
+```bash
+export DMC_EXPERT_VISION_DATA_DIR=/home/ubuntu/DMC/data/dmc_expert_vision
+bash scripts/run_full.sh --override stages.collect=false --override output_dir=runs/dmc_vision_10k
+```
+
+Run directly inside Screen to retain the live display. Do not pipe through `tee` to
+`orchestrator.log`: the orchestrator already writes that file. Checkpoints from a different
+training budget cannot resume this recipe.
 
 The shared launcher defaults `OMP_NUM_THREADS` and `MKL_NUM_THREADS` to 1 so concurrent GPU workers
 do not create competing large CPU thread pools during replay sampling. Existing environment settings
@@ -479,7 +500,7 @@ python3 -m scripts.evaluate_dmc \
 
 ## Training Budget
 
-Every family receives 5,000 expert updates and 10,000 online
+Every family receives 10,000 expert updates and 10,000 online
 updates, sampling from 16 source episodes in each world-model or representation update. Dreamer and
 STORM use one 64-frame sequence per source episode (batch 16); TD-MPC2, LeWorldModel, and Temporal
 Straightening use twenty-one native four-frame clips per source episode (batch 336). Online

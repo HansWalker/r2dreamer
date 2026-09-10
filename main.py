@@ -26,6 +26,7 @@ from omegaconf import OmegaConf
 
 from dmc_expert.storage import dataset_identity, validate_dataset
 from models.shared.physical_state import PhysicalStateTargets
+from training.progress import PREFIX as PROGRESS_PREFIX, console
 from training.protocol import (
     comparison_signature,
     completion_checkpoint,
@@ -43,6 +44,7 @@ ACTIVE_PROCESSES = set()
 ACTIVE_PROCESSES_LOCK = threading.Lock()
 STOP_REQUESTED = threading.Event()
 CONSOLE_PREFIXES = (
+    PROGRESS_PREFIX,
     "Run |",
     "Model |",
     "Data |",
@@ -114,18 +116,29 @@ def build_runs(config, scenario_name, scenario):
 
 
 def model_run_groups(config, scenario_runs):
-    """Group opted-in families by variant/seed; retain scenario order for the rest."""
+    """Launch scenario groups, explicit pairs, then the remaining serial runs."""
     workers = config["training"].get("scenario_parallelism", {})
+    pairs = config["training"].get("concurrent_runs", ())
+    paired_names = {name for pair in pairs for name in pair}
     grouped = {}
     remaining = {}
+    paired = {}
     for scenario, runs in scenario_runs.items():
         for run in runs:
-            if int(workers.get(run.family, 1)) > 1:
+            key = f"{run.scenario}/{run.family}/{run.variant}"
+            if key in paired_names:
+                paired[(key, run.seed)] = run
+            elif int(workers.get(run.family, 1)) > 1:
                 grouped.setdefault((run.family, run.variant, run.seed), []).append(run)
             else:
                 remaining.setdefault(scenario, []).append(run)
     for (family, variant, seed), runs in grouped.items():
         yield f"{family}/{variant}/seed_{seed} across scenarios", runs, int(workers[family])
+    for pair in pairs:
+        for seed in config["seeds"]:
+            runs = [paired[(name, int(seed))] for name in pair if (name, int(seed)) in paired]
+            if runs:
+                yield " + ".join(run.name for run in runs), runs, len(runs)
     for scenario, runs in remaining.items():
         yield scenario, runs, int(config["training"]["parallelism"])
 
@@ -144,6 +157,21 @@ def validate_matrix(config, scenario_runs, stages):
         raise ValueError("Training parallelism must be positive.")
     if any(int(workers) < 1 for workers in config["training"].get("scenario_parallelism", {}).values()):
         raise ValueError("Scenario training parallelism must be positive.")
+    pair_names = set()
+    for pair in config["training"].get("concurrent_runs", ()):
+        if len(pair) != 2:
+            raise ValueError("Each concurrent_runs entry must contain exactly two runs.")
+        for name in pair:
+            parts = str(name).split("/")
+            if (
+                len(parts) != 3
+                or parts[0] not in config["scenario_configs"]
+                or parts[2] not in config["models"].get(parts[1], {})
+            ):
+                raise ValueError(f"Unknown concurrent run: {name}")
+            if name in pair_names:
+                raise ValueError(f"Concurrent run appears more than once: {name}")
+            pair_names.add(name)
 
     resolved = {}
     signatures = {}
@@ -262,7 +290,7 @@ def validate_datasets(config, scenario_runs, resolved):
         path = root / run.dataset
         metadata = validate_dataset(path, run_config)
         identities[run.dataset] = dataset_identity(metadata)
-        print(f"Data | validated={path} | episodes={metadata['num_episodes']}", flush=True)
+        console.message(f"Data | validated={path} | episodes={metadata['num_episodes']}")
     return identities
 
 
@@ -290,16 +318,17 @@ def stop_active_processes():
 def execute(label, command, log_path, *, dry_run=False, input_text=None, quiet=False):
     rendered = shlex.join(map(str, command))
     if dry_run:
-        print(f"PLAN | {label}", flush=True)
+        console.message(f"PLAN | {label}")
         return
 
     if not quiet:
-        print(f"START | {label}", flush=True)
+        console.start(label)
     started = time.perf_counter()
     output_tail = deque(maxlen=120)
     # GPU workers prepare many small CPU tensors; independent large thread pools
     # contend during replay sampling. Explicit user settings still take precedence.
     environment = dict(os.environ)
+    environment["DMC_PROGRESS_PIPE"] = "1"
     environment.setdefault("OMP_NUM_THREADS", "1")
     environment.setdefault("MKL_NUM_THREADS", environment["OMP_NUM_THREADS"])
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -333,29 +362,33 @@ def execute(label, command, log_path, *, dry_run=False, input_text=None, quiet=F
                 message = line.rstrip()
                 output_tail.append(message)
                 if not quiet and message.startswith(CONSOLE_PREFIXES):
-                    print(f"  [{label}] {message}", flush=True)
+                    console.update(label, message)
             returncode = process.wait()
         except BaseException:
             stop_process(process)
+            if not quiet:
+                console.finish(label, "CANCELLED")
             raise
         finally:
             with ACTIVE_PROCESSES_LOCK:
                 ACTIVE_PROCESSES.discard(process)
     if returncode:
         elapsed = timedelta(seconds=round(time.perf_counter() - started))
-        print(f"FAILED | {label} | elapsed={elapsed}", flush=True)
+        if quiet:
+            console.message(f"FAILED | {label} | elapsed={elapsed}")
+        else:
+            console.finish(label, "FAILED")
         lines = list(output_tail)
         starts = [index for index, line in enumerate(lines) if line.startswith("Traceback (most recent call last):")]
         lines = lines[starts[-1] :] if starts else lines[-20:]
         if len(lines) > 30:
             lines = [lines[0], "    ...", *lines[-28:]]
         for line in lines:
-            print(line, flush=True)
-        print(f"LOG | {log_path}", flush=True)
+            console.message(line)
+        console.message(f"LOG | {log_path}")
         raise SystemExit(returncode)
-    elapsed = timedelta(seconds=round(time.perf_counter() - started))
     if not quiet:
-        print(f"DONE | {label} | elapsed={elapsed}", flush=True)
+        console.finish(label, "DONE")
 
 
 def run_jobs(function, jobs, parallelism):
@@ -405,12 +438,12 @@ def collect_scenarios(config, scenarios, *, dry_run=False):
         for name, scenario in scenarios.items()
     ]
     parallelism = min(int(config["collection"]["parallelism"]), len(jobs))
-    print(f"\nCollection | scenarios={len(jobs)} | parallelism={parallelism}", flush=True)
+    console.message(f"\nCollection | scenarios={len(jobs)} | parallelism={parallelism}")
     started = time.perf_counter()
     run_jobs(lambda job: execute(*job, dry_run=dry_run), jobs, 1 if dry_run else parallelism)
     if not dry_run:
         elapsed = timedelta(seconds=round(time.perf_counter() - started))
-        print(f"Collection | complete | scenarios={len(jobs)} | elapsed={elapsed}", flush=True)
+        console.message(f"Collection | complete | scenarios={len(jobs)} | elapsed={elapsed}")
 
 
 def current_evaluation(output, spec, config, dataset_path, expected_dataset, checkpoint_path):
@@ -511,7 +544,7 @@ def run_models(config, runs, resolved, dataset_identities, *, dry_run=False, par
         dataset_path = None if dataset_root is None else dataset_root / run.dataset
         reset = bool(train and overwrite and run.logdir.exists())
         if reset:
-            print(f"Overwrite | {run_label}", flush=True)
+            console.message(f"Overwrite | {run_label}")
             if not dry_run:
                 shutil.rmtree(run.logdir)
 
@@ -525,7 +558,7 @@ def run_models(config, runs, resolved, dataset_identities, *, dry_run=False, par
                 if not training_complete(saved, run_config):
                     raise ValueError(f"Incomplete completion checkpoint: {completed_checkpoint}")
                 train_run = False
-                print(f"Resume | {run_label} | training complete", flush=True)
+                console.message(f"Resume | {run_label} | training complete")
             else:
                 checkpoint = next(
                     (
@@ -536,13 +569,13 @@ def run_models(config, runs, resolved, dataset_identities, *, dry_run=False, par
                     None,
                 )
                 if checkpoint is None:
-                    print(f"Restart | {run_label} | no usable checkpoint", flush=True)
+                    console.message(f"Restart | {run_label} | no usable checkpoint")
                     if not dry_run:
                         shutil.rmtree(run.logdir)
                 else:
                     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
                     validate_checkpoint(saved, run_config)
-                    print(f"Resume | {run_label} | checkpoint={checkpoint.name}", flush=True)
+                    console.message(f"Resume | {run_label} | checkpoint={checkpoint.name}")
 
         if train_run:
             resume_override = (f"resume_from={checkpoint}",) if checkpoint else ()
@@ -582,7 +615,7 @@ def run_models(config, runs, resolved, dataset_identities, *, dry_run=False, par
                         checkpoint_path,
                     )
                 ):
-                    print(f"Skip | {run_label} | evaluation={spec['name']} complete", flush=True)
+                    console.message(f"Skip | {run_label} | evaluation={spec['name']} complete")
                     continue
                 command = [
                     sys.executable,
@@ -617,7 +650,7 @@ def run_models(config, runs, resolved, dataset_identities, *, dry_run=False, par
                 )
 
     parallelism = min(int(training["parallelism"] if parallelism is None else parallelism), len(runs))
-    print(f"\nModels | runs={len(runs)} | parallelism={parallelism} | device={device}", flush=True)
+    console.message(f"\nModels | runs={len(runs)} | parallelism={parallelism} | device={device}")
     items = list(enumerate(runs, 1))
     if parallelism == 1:
         run_jobs(lambda item: run_one(item, train=bool(stages["train"]), evaluate=bool(stages["evaluate"])), items, 1)
@@ -627,7 +660,7 @@ def run_models(config, runs, resolved, dataset_identities, *, dry_run=False, par
     if stages["evaluate"]:
         # Final evaluation uses larger batches than collection. Do not overlap it
         # with the tightly packed training workers or other final evaluations.
-        print("Evaluation | parallelism=1 | training group complete", flush=True)
+        console.message("Evaluation | parallelism=1 | training group complete")
         run_jobs(lambda item: run_one(item, train=False, evaluate=True), items, 1)
 
 
@@ -644,10 +677,19 @@ def main():
     stages = config["stages"]
     scenario_runs = {name: build_runs(config, name, scenario) for name, scenario in scenarios.items()}
     resolved = validate_matrix(config, scenario_runs, stages)
+    capture = (
+        contextlib.nullcontext() if args.dry_run
+        else console.capture(resolve_path(config.output_dir) / "orchestrator.log")
+    )
+    with capture:
+        run_experiment(config, scenarios, stages, scenario_runs, resolved, args.dry_run, implementation)
+
+
+def run_experiment(config, scenarios, stages, scenario_runs, resolved, dry_run, implementation):
     runs_per_scenario = sum(len(variants) for variants in config["models"].values()) * len(config["seeds"])
     active_stages = ",".join(name for name, enabled in stages.items() if enabled)
     started = time.perf_counter()
-    print(
+    console.message(
         f"Experiment | scenarios={len(scenarios)} | runs={len(scenarios) * runs_per_scenario} | "
         f"stages={active_stages} | device={config['device']} | implementation={implementation[:12]} | "
         f"output={resolve_path(config['output_dir'])}",
@@ -655,17 +697,17 @@ def main():
     )
 
     if stages["collect"]:
-        collect_scenarios(config, scenarios, dry_run=args.dry_run)
+        collect_scenarios(config, scenarios, dry_run=dry_run)
 
     if stages["train"] or stages["evaluate"]:
-        dataset_identities = {} if args.dry_run else validate_datasets(config, scenario_runs, resolved)
+        dataset_identities = {} if dry_run else validate_datasets(config, scenario_runs, resolved)
         for label, runs, parallelism in model_run_groups(config, scenario_runs):
-            print(f"\nGroup | {label} | runs={len(runs)}", flush=True)
+            console.message(f"\nGroup | {label} | runs={len(runs)}")
             run_models(
-                config, runs, resolved, dataset_identities, dry_run=args.dry_run, parallelism=parallelism
+                config, runs, resolved, dataset_identities, dry_run=dry_run, parallelism=parallelism
             )
     elapsed = timedelta(seconds=round(time.perf_counter() - started))
-    print(f"\nCOMPLETE | runs={len(scenarios) * runs_per_scenario} | elapsed={elapsed}")
+    console.message(f"\nCOMPLETE | runs={len(scenarios) * runs_per_scenario} | elapsed={elapsed}")
 
 
 if __name__ == "__main__":

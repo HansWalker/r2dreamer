@@ -19,6 +19,7 @@ collection:
   parallelism: 1
 
 training:
+  concurrent_runs: []
   resume: false
   overwrite: true
   overrides:

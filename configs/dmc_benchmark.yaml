@@ -50,6 +50,10 @@ training:
   parallelism: 1  # Other families stay serial until their online throughput improves.
   scenario_parallelism:
     dreamer: 3  # Same variant/seed across the three scenarios; final evaluations remain serial.
+    tdmpc2: 2
+  # Only this cross-family pair has been benchmarked with the current precision.
+  concurrent_runs:
+    - [ball_in_cup/leworldmodel/default, ball_in_cup/storm/mamba3]
   resume: true
   overwrite: false
   overrides: []

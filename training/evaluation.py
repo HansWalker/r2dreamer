@@ -23,6 +23,7 @@ from models.shared.utils import parse_model_io
 from models.storm import StormModel
 from models.storm.world_model import categorical_sample
 from models.tdmpc2 import TDMPC2
+from training.progress import Progress
 
 
 class EpisodeMetrics:
@@ -38,6 +39,8 @@ class EpisodeMetrics:
         self.streak = torch.zeros_like(self.lengths)
         self.success_history = []
         self.active_history = []
+        limit = int(config.env.get("time_limit", 0))
+        self.progress = Progress("Evaluation", math.ceil(limit / self.action_repeat)) if limit else None
 
     def update(self, reward, active):
         self.returns += reward[:, 0] * active
@@ -48,8 +51,12 @@ class EpisodeMetrics:
         self.sustained |= self.streak >= int(self.settings.sustained_success_steps)
         self.success_history.append(qualifies)
         self.active_history.append(active)
+        if self.progress and self.progress.due():
+            self.progress.update(int(self.lengths.max()), f"episodes={self.returns.numel()}")
 
     def result(self):
+        if self.progress:
+            self.progress.update(int(self.lengths.max()), f"episodes={self.returns.numel()}", force=True)
         active = torch.stack(self.active_history)
         qualifies = torch.stack(self.success_history)
         tail_length = (self.lengths * float(self.settings.maintenance_fraction)).ceil().long().clamp_min(1)
@@ -355,6 +362,9 @@ def evaluate_state_prediction(model, config, dataset_path, metadata):
                 float(settings.motion_fraction), int(settings.motion_candidates),
             )
             errors = {name: [] for name in ("rmse", "observed_rmse", "persistence_rmse")}
+            progress = Progress("Prediction", len(windows))
+            completed = 0
+            progress.update(completed, "held-out windows")
             horizon_indices = torch.tensor(horizons, device=device) - 1
             devices = [device.index] if device.type == "cuda" else []
             with torch.random.fork_rng(devices=devices):
@@ -393,6 +403,8 @@ def evaluate_state_prediction(model, config, dataset_path, metadata):
                     for name, estimate in estimates.items():
                         squared_error = (estimate / samples - target).square()
                         errors[name].append(squared_error.index_select(1, horizon_indices).cpu())
+                    completed += batch
+                    progress.update(completed, "held-out windows", force=completed == len(windows))
             errors = {name: torch.cat(rows) for name, rows in errors.items()}
 
             def summarize(indices):
