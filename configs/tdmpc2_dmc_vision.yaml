@@ -16,7 +16,7 @@ replay:
   sequence_length: 4
 
 tdmpc2_model:
-  use_amp: true  # BF16 neural compute; FP32 distributions, targets, and optimizer state.
+  use_amp: false  # FP32 was faster in the A100 benchmark; BF16 remains opt-in.
   frame_stack: 3
   num_channels: 32
   mlp_dim: 539

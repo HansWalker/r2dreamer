@@ -144,6 +144,30 @@ compilation; repeat the check and inspect warm rates before extrapolating. Each 
 model, replay, optimizer, seeds, and logs.
 The benchmark does not save checkpoints or automatically change the production configuration.
 
+For the current BF16 planner settings, use the focused concurrency check:
+
+```bash
+bash scripts/run_concurrency_benchmark.sh --dataset-root /absolute/path/to/data/dmc_expert_vision
+```
+
+This tests Dreamer/Mamba3 across three scenarios at once, TD-MPC2 across scenarios with two workers,
+and three ball-in-cup pairs: TS + LeWorldModel, TS + STORM/Mamba3, and LeWorldModel + STORM/Mamba3.
+It uses the production precision settings (TD-MPC2 FP32, the others BF16) and model sizes. There are
+21 worker runs, including nine serial references measured with the same workload; pair references
+are shared. It does not rerun the 117-worker matrix, precision comparisons, dependency/data audits,
+expert-data collection, or evaluation. Each worker performs 32 expert and 32 online updates;
+online updates are interleaved in bursts of four over eight collection calls. Dreamer additionally
+continues collection to 64 calls to exercise longer actor histories. Checkpoints are disabled.
+
+Use `--only dreamer`, `--only tdmpc2`, or `--only pairs` to rerun just one section, and `--dry-run`
+to inspect the commands without using the GPU. Summaries and JSON are saved under
+`runs/concurrency_bf16_check/{dreamer,tdmpc2,pairs}/`; `--output DIR` changes that root.
+Worker failures are reported and later sections still run. Use an otherwise idle GPU and compare
+warm update/collection rates, not just startup-inclusive speedups. Process-wide utilization averages
+and sums of independent memory peaks do not establish available concurrent throughput.
+Production still uses three Dreamer scenarios per variant and keeps other families and final
+evaluations serial; these new trials do not automatically enable further concurrency.
+
 To test **the same model/variant across all three scenarios**, compare a serial baseline with two-
 and three-worker queues:
 
@@ -537,8 +561,10 @@ Temporal Straightening computes action gradients in batches of at most
 without changing the number of environments, restarts, iterations, or future steps, and preserves
 the full-batch cost normalization. The batch size is an execution setting, not a checkpoint recipe.
 
-CUDA runs use BF16 mixed precision for neural computation, including the goal planners and Dreamer's
-history reconstruction and acting. Parameters and optimizer state remain FP32; curvature, SIGReg,
+Dreamer, STORM, and the goal planners use BF16 mixed precision for CUDA neural computation, including
+Dreamer's history reconstruction and acting. TD-MPC2 defaults to FP32 after BF16 slowed warm updates
+in the A100 benchmark; `tdmpc2_model.use_amp=true` remains available for experiments. Parameters and
+optimizer state remain FP32; curvature, SIGReg,
 physical readouts, goal costs, TD targets, and action optimization remain FP32. S5 retains complex64
 dynamics and Hyena retains FP32 FFTs. CPU runs use FP32. Disable AMP with `model.use_amp=false`
 (Dreamer), `jepa_model.use_amp=false` (TS/LeWorldModel), or `tdmpc2_model.use_amp=false` (TD-MPC2).
