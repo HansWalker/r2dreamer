@@ -27,4 +27,4 @@ jepa_model:
     type: gradient
     samples: 16
     iterations: 64
-    gradient_batch_size: 128  # Same candidates/objective; fewer serial autograd passes.
+    gradient_batch_size: 256  # Same candidates/objective; one pass for 16 envs x 16 candidates.

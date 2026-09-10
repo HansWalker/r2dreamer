@@ -121,7 +121,9 @@ matrix, and `--dry-run` to inspect it without loading data or models.
 
 `report.json` includes parameter counts, finite-loss/update checks, per-phase GPU allocated/reserved
 peaks, sampled process GPU memory (including compute-visible environment children), device-wide GPU
-utilization, worker host RAM/CPU usage, and estimated full-capacity replay tensor memory. It projects
+utilization, worker host RAM/CPU usage, effective CPU thread counts, and estimated full-capacity replay
+tensor memory. Per-phase CPU seconds and warm `cpu_core_equivalents` (CPU time / wall time, excluding
+environment child processes) help distinguish CPU oversubscription from GPU waits. It projects
 per-run and serial-matrix **training** time from configured update/environment-step budgets. The
 reported range reflects expert data-prefetch overlap, not a confidence interval. Evaluation,
 checkpoint I/O, and logging are unmeasured additions; longer contexts and different online trajectories
@@ -192,30 +194,59 @@ and acting. Sampling, sequence loops, and optimizers stay eager; recurrent CUDA 
 enabled. Parameter/checkpoint keys are unchanged. Production defaults remain eager until measurements
 justify enabling compilation; compile warnings and graph counts are recorded in the worker diagnostics.
 
-For a storage comparison, first copy the selected scenario to **local SSD**, not another path on the
+For a storage comparison, stage the selected scenario on **local SSD**, not another path on the
 same network mount. Keep the original dataset and persistent run outputs:
 
 ```bash
-mkdir -p /tmp/dmc_expert_vision
-rsync -a /absolute/path/to/data/dmc_expert_vision/ball_in_cup_catch /tmp/dmc_expert_vision/
 bash scripts/run_training_smoke.sh --dataset-root /absolute/path/to/data/dmc_expert_vision \
-  --scenarios ball_in_cup --models tdmpc2/default dreamer/gru \
-  --updates 10 --warmup-updates 3 --rollout-steps 0 \
-  --compare-storage /tmp/dmc_expert_vision --output runs/storage_check
+  --scenarios ball_in_cup --models tdmpc2/default \
+  --updates 20 --warmup-updates 5 --rollout-steps 0 \
+  --stage-storage /tmp/dmc_expert_vision --output runs/storage_check
 ```
 
 Check free space and the mount with `df -h /tmp` before copying; `/tmp` is not guaranteed to be local
-SSD on every machine. No copy or deletion is performed by the benchmark. It checks matching metadata,
-file sizes, and hashes of the actual sampled batches (not every byte of the dataset). Storage,
+SSD on every machine. Staging copies only the selected HDF5 and metadata files, verifies SHA-256,
+reuses unchanged verified copies, and refuses to overwrite different existing data. It records copy
+time separately in `staging.json`; interrupted copies are restarted. No source files are changed.
+Use `--compare-storage` instead for an existing copy. The benchmark also checks matching sampled batches. Storage,
 compilation, and pair comparisons can be combined in one invocation. Each alternative is compared
 separately to the same original-storage, eager, serial baseline. Baselines run first; OS/compiler
 caches are not flushed, so these are warm-workload comparisons, not controlled cold-disk benchmarks.
 With collection skipped, the projected hours omit collection and are only a training subtotal.
 
-Temporal Straightening uses 128 candidate trajectories per planning autograd pass (previously 32).
-This changes memory/work scheduling, not candidate count, iterations, horizon, or the globally averaged
-action gradient. Check its memory on the target GPU; compare 128 with 256 using
-`--models temporal_straightening/default --model-override jepa_model.planner.gradient_batch_size=256`.
+To stage all scenarios for production, run `python -m scripts.stage_dmc_data --source ORIGINAL_ROOT
+--target LOCAL_ROOT`, then set `DMC_EXPERT_VISION_DATA_DIR=LOCAL_ROOT` and launch the full run with
+`--override stages.collect=false`. Run outputs/checkpoints remain at the configured persistent location.
+The local copy must fit on disk; staging all three image datasets can require substantial space.
+
+Temporal Straightening now uses 256 candidate trajectories per planning autograd pass. Model weights
+are temporarily frozen during action optimization; action gradients, candidates, iterations, and
+horizons are unchanged. Action embeddings and masks are reused, and the goal readout only decodes
+the required trajectory tail. One larger pass is not a guaranteed 2x speedup.
+
+```bash
+bash scripts/run_planner_benchmark.sh --dataset-root /absolute/path/to/data/dmc_expert_vision
+```
+
+This targets TS and LeWorldModel on ball-in-cup, compares TS gradient batches 128 and 256, interleaves
+online updates with real collection, and profiles short deterministic evaluations at batch sizes 5
+and 50. It uses production-sized models and saves no checkpoints. Options can be overridden, including
+`--scenarios cartpole_balance_sparse reacher ball_in_cup`. The test is not a task-performance evaluation.
+`--online-burst N` controls the number of online updates after a collection call; total updates remain
+`--updates`. Warmup excludes whole bursts until at least `--warmup-updates` updates have completed.
+Evaluation timings include reset and initial calls; short episodes do not bound late-episode memory.
+
+Generate an ordered phase breakdown from a complete report (later reports replace matching cases):
+
+```bash
+python -m scripts.estimate_runtime --report runs/scenario_concurrency/report.json runs/planner_check/report.json
+```
+
+`runs/runtime_estimate/schedule.md` and `schedule.json` group concurrent training jobs, keep final
+evaluations serial, and separate pretraining, online updates, collection, and evaluation estimates.
+For TS, the estimator selects the measured gradient-batch case matching the production setting.
+Unmeasured state-prediction evaluation and checkpoint I/O are explicitly excluded. Existing timings
+do not establish a speedup for newer code; only new measurements can update those estimates.
 
 The wrappers use the `environment/` created by `scripts/setup_dmc.sh`. Set `PYTHON` to use another
 interpreter. The smoke and full-run wrappers forward additional arguments to `main.py`; all three
@@ -225,14 +256,24 @@ The orchestrator keeps the terminal focused on stage progress, timing, training 
 results. Full commands, dependency warnings, and raw tracebacks remain in each collection or run log;
 on failure, the useful end of the traceback and the exact log path are printed automatically.
 
-The default production matrix first runs all thirteen image-model variants on all three scenarios with
-seed 0. It collects the three independent scenario datasets concurrently on the shared GPU, then trains
-and evaluates every model one at a time, scenario by scenario. Set `collection.parallelism=1` to collect
-serially. After a successful paired benchmark, use
-`./scripts/run_full.sh --override stages.collect=false --override training.parallelism=2`
-to run two independent model jobs on the same GPU. Each job trains then evaluates before freeing its
-slot; the next scenario starts only after all jobs in the current scenario finish. Failures stop active
-workers, and the existing resume behavior applies separately to each run. Training writes each run under
+The production matrix runs all thirteen image-model variants on all three scenarios with seed 0.
+It collects each scenario dataset once, concurrently (`collection.parallelism=1` selects serial
+collection). Dreamer then trains the three scenarios of each variant together, controlled by
+`training.scenario_parallelism.dreamer=3`. Variants and seeds do not overlap. These triples fitted the
+40 GiB A100 benchmark with little memory headroom; set the value to 2 or 1 for a more conservative run.
+Other families remain serial, scenario by scenario (`training.parallelism=1`). Final evaluations run
+serially after each concurrent training group has finished; periodic checkpoint-selection evaluations
+still execute inside their respective training workers. Failures stop active workers, and the existing
+resume behavior applies separately to each run.
+
+The shared launcher defaults `OMP_NUM_THREADS` and `MKL_NUM_THREADS` to 1 so concurrent GPU workers
+do not create competing large CPU thread pools during replay sampling. Existing environment settings
+override these defaults. This applies to both the benchmark and production subprocesses; set these
+variables explicitly when invoking `train.py` directly. Unfinished replay episodes are stacked once
+per collection step and reused during the following update burst, without caching model states or
+changing sampled windows.
+
+Training writes each run under
 `runs/dmc_vision/<scenario>/<family>/<variant>/seed_<seed>`, and evaluation writes
 `evaluation.json` for `final.pt` and `evaluation_best.json` for `best.pt` in that run directory. Set
 the booleans under `stages` to run only part of the lifecycle, add seeds after the initial matrix

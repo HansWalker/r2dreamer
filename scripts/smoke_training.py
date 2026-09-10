@@ -193,7 +193,7 @@ def run_worker(job):
     import torch
 
     import tools
-    from envs import close_envs, make_envs
+    from envs import close_envs, make_envs, make_eval_envs
     from training import load_model_family
     from training.protocol import validate_training_recipe
 
@@ -207,6 +207,7 @@ def run_worker(job):
         "seed_runs": job.get("seed_runs", 1),
         "warmup_updates": job.get("warmup_updates", 1),
         "sample_sha256": [],
+        "online_mode": "interleaved" if job.get("online_burst") else "isolated",
     }
     device = torch.device(config.device)
     monitor = None
@@ -227,6 +228,7 @@ def run_worker(job):
             torch.cuda.synchronize(device)
             torch.cuda.reset_peak_memory_stats(device)
         start = time.perf_counter()
+        cpu_start = time.process_time()
         try:
             value = operation()
             if device.type == "cuda":
@@ -235,6 +237,7 @@ def run_worker(job):
             return value
         finally:
             stage["seconds"] = time.perf_counter() - start
+            stage["cpu_seconds"] = time.process_time() - cpu_start
             stage.setdefault("status", "FAIL")
             if compilation_counters is not None:
                 stage["compiled_graphs"] = compilation_counters["stats"]["unique_graphs"] - graphs_before
@@ -268,6 +271,12 @@ def run_worker(job):
             monitor = threading.Thread(target=collect_gpu_samples, args=(stop, result["resources"]), daemon=True)
             monitor.start()
         tools.configure_randomness(config.seed, bool(config.deterministic_run))
+        result["resources"].update(
+            torch_threads=torch.get_num_threads(),
+            torch_interop_threads=torch.get_num_interop_threads(),
+            omp_num_threads=os.environ.get("OMP_NUM_THREADS"),
+            mkl_num_threads=os.environ.get("MKL_NUM_THREADS"),
+        )
         family = load_model_family(config.model_family)
         model = measure("build", lambda: family.build_model(config))
         result["parameters"] = {
@@ -279,16 +288,17 @@ def run_worker(job):
             if hasattr(model, "configure_pretraining"):
                 model.configure_pretraining(int(config.training.expert.updates))
 
-            def update(name, operation):
+            def update(name, operation, count=1):
                 before = int(model.state_head.updates.item())
                 model.train()
                 metrics = measure(name, operation)
-                if int(model.state_head.updates.item()) != before + 1:
-                    raise RuntimeError(f"{name} did not complete one physical-state optimizer update.")
+                if int(model.state_head.updates.item()) != before + count:
+                    raise RuntimeError(f"{name} did not complete {count} physical-state optimizer updates.")
                 values = {key: float(torch.as_tensor(value).detach()) for key, value in metrics.items()}
                 if not values or not all(math.isfinite(value) for value in values.values()):
                     raise RuntimeError(f"{name} returned missing/non-finite training metrics.")
                 result["phases"][-1]["metrics"] = values
+                result["phases"][-1]["updates"] = count
 
             def sample():
                 batch = dataset.sample_episode_batch()
@@ -319,14 +329,17 @@ def run_worker(job):
             }
             if hasattr(model, "configure_online"):
                 model.configure_online(int(config.training.online.updates), resumed=False)
-            for step in range(job["updates"]):
-                update(f"online/{step + 1}", lambda: session.update(1))
+            burst = job.get("online_burst", 0)
+            if not burst:
+                for step in range(job["updates"]):
+                    update(f"online/{step + 1}", lambda: session.update(1))
             if job["rollout_steps"]:
                 envs = measure("env_build", lambda: make_envs(config.env))
                 session.envs = envs
                 measure("env_reset", session.start)
                 if config.model_family == "dreamer":
                     measure("env_prime", session.collect)  # Dreamer's first collect only resets the environments.
+                online_updates = 0
                 for step in range(job["rollout_steps"]):
                     delta, _ = measure(f"collect/{step + 1}", session.collect)
                     result["phases"][-1]["environment_steps"] = delta
@@ -337,6 +350,22 @@ def run_worker(job):
                         for value in rows[-1].values()
                     ):
                         raise RuntimeError("Non-finite transition after collection.")
+                    if burst and online_updates < job["updates"]:
+                        count = min(burst, job["updates"] - online_updates)
+                        update(f"online/{online_updates + 1}", lambda count=count: session.update(count), count)
+                        online_updates += count
+            close_envs(envs)
+            envs = None
+            for batch_size in job.get("eval_batches", []):
+                eval_config = copy.deepcopy(config)
+                eval_config.env.eval_episode_num = batch_size
+                eval_config.env.time_limit = job["eval_steps"] * int(config.env.action_repeat)
+                eval_config.env.eval_seed = int(config.evaluation.final.seed)
+                envs = measure(f"eval_build/{batch_size}", lambda cfg=eval_config: make_eval_envs(cfg.env))
+                measure(f"evaluation/{batch_size}", lambda cfg=eval_config, group=envs: family.evaluate(cfg, model, group))
+                result["phases"][-1].update(batch_size=batch_size, vector_steps=job["eval_steps"])
+                close_envs(envs)
+                envs = None
             if not all(torch.isfinite(parameter).all() for parameter in model.parameters()):
                 raise RuntimeError("Non-finite parameters after training.")
         result["status"] = "PASS"
@@ -375,9 +404,16 @@ def project_time(result):
     cold_overhead = 0.0
     for name in ("sample", "expert", "online", "collect"):
         phases = [phase for phase in result["phases"] if phase["name"].startswith(name + "/")]
-        times = [phase["seconds"] for phase in phases]
+        times = [phase["seconds"] / phase.get("updates", 1) for phase in phases]
         if times:
             discard = 1 if name == "collect" else result.get("warmup_updates", 1)
+            if name == "online":
+                completed, discard = 0, 0
+                for phase in phases:
+                    if completed >= result.get("warmup_updates", 1):
+                        break
+                    completed += phase.get("updates", 1)
+                    discard += 1
             warm = times[discard:] or times[-1:]
             rates[name] = {
                 "samples": len(times),
@@ -391,7 +427,15 @@ def project_time(result):
                 "max_seconds": max(warm),
                 "basis": f"after {discard} warmup calls" if len(times) > discard else "insufficient warmup",
             }
-            cold_overhead += sum(max(0, seconds - statistics.mean(warm)) for seconds in times[:discard])
+            warm_phases = phases[discard:] or phases[-1:]
+            if all("cpu_seconds" in phase for phase in warm_phases):
+                cpu = statistics.mean(phase["cpu_seconds"] / phase.get("updates", 1) for phase in warm_phases)
+                rates[name]["cpu_seconds_per_call"] = cpu
+                rates[name]["cpu_core_equivalents"] = cpu / statistics.mean(warm)
+            cold_overhead += sum(
+                max(0, seconds - statistics.mean(warm)) * phase.get("updates", 1)
+                for phase, seconds in zip(phases[:discard], times[:discard], strict=True)
+            )
     expert = config["training"]["expert"]
     online = config["training"]["online"]
     expert_updates = int(expert["updates"]) if expert["enabled"] else 0
@@ -423,6 +467,10 @@ def project_time(result):
     )
     return {
         "rates": rates,
+        "evaluation_seconds_per_vector_step": {
+            str(phase["batch_size"]): phase["seconds"] / phase["vector_steps"]
+            for phase in result["phases"] if phase["name"].startswith("evaluation/")
+        },
         "expert_updates": expert_updates,
         "online_updates": online_updates,
         "online_environment_steps": int(online["steps"]),
@@ -555,7 +603,8 @@ def write_summary(results, output, comparisons=()):
     lines = [
         "Training smoke summary | no checkpoints",
         "Seconds/call: sample/expert/online/collect (warm). Memory: process GPU / PyTorch reserved / host RAM, GiB.",
-        "Case | Run | BxT | Trainable/frozen M | Seconds/call | Memory GiB | GPU avg/max % | Hours/seed",
+        ("Case | Run | BxT | Trainable/frozen M | Seconds/call | Memory GiB | GPU avg/max % | Hours/seed"
+         " | Threads/online CPU cores | Eval s/step(batch)"),
     ]
     for row in results:
         label = f"{row.get('case', 'serial')} | {row['name']}"
@@ -581,10 +630,16 @@ def write_summary(results, output, comparisons=()):
         )
         params = row["parameters"]
         hours = "-".join(number(value) for value in projection["training_hours_range"])
+        cpu = number(rates.get("online", {}).get("cpu_core_equivalents"))
+        evaluation = "/".join(
+            f"{batch}:{seconds:.3f}"
+            for batch, seconds in projection.get("evaluation_seconds_per_vector_step", {}).items()
+        ) or "-"
         lines.append(
             f"{label} | {config.replay.batch_size}x{config.replay.sequence_length}"
             f" | {params['trainable'] / 1e6:.3f}/{params['frozen'] / 1e6:.3f}"
             f" | {seconds} | {memory} | {utilization} | {hours}"
+            f" | {resources.get('torch_threads', '-')}/{cpu} | {evaluation}"
         )
         if "compilation" in row:
             compilation = row["compilation"]
@@ -593,7 +648,7 @@ def write_summary(results, output, comparisons=()):
                 f" | graph_breaks={sum(compilation['graph_breaks'].values())}"
             )
     if comparisons:
-        lines.append("Comparison | Wall speedup | Estimated warm speedup: sample/expert/online/collect")
+        lines.append("Comparison | Wall speedup | Estimated warm speedup: sample/expert/online/collect | Eval speedup(batch)")
         for case in comparisons:
             if not case["passed"]:
                 lines.append(f"FAIL | {case['name']} | {case.get('error', 'worker failure')}")
@@ -601,7 +656,10 @@ def write_summary(results, output, comparisons=()):
             ratios = "/".join(
                 number(case["warm_speedup"].get(name)) for name in ("sample", "expert", "online", "collect")
             )
-            lines.append(f"{case['name']} | {case['wall_speedup']:.2f}x | {ratios}")
+            eval_ratios = "/".join(
+                f"{batch}:{ratio:.2f}x" for batch, ratio in case.get("evaluation_speedup", {}).items()
+            ) or "-"
+            lines.append(f"{case['name']} | {case['wall_speedup']:.2f}x | {ratios} | {eval_ratios}")
     passed = sum(row["status"] == "PASS" for row in results)
     lines.append(f"Workers: {passed}/{len(results)} passed. Full diagnostics: {output / 'report.json'}")
     if not comparisons:
@@ -631,6 +689,10 @@ def write_summary(results, output, comparisons=()):
     ):
         lines.append("Collection was skipped for some runs; their projected hours omit environment interaction.")
     lines.append("Short rollouts do not bound late-episode memory; GPU utilization is device-wide.")
+    if any(row.get("online_mode") == "interleaved" for row in results):
+        lines.append("Online burst times are normalized per optimizer update; replay includes newly collected prefixes.")
+    if any(row.get("timing_projection", {}).get("evaluation_seconds_per_vector_step") for row in results if row.get("timing_projection")):
+        lines.append("Evaluation timings use short episodes at the requested batch sizes, include reset, and are not quality metrics.")
     text = "\n".join(lines) + "\n"
     output.mkdir(parents=True, exist_ok=True)
     (output / "summary.txt").write_text(text, encoding="utf-8")
@@ -694,7 +756,7 @@ def queue_seconds(durations, workers):
     return max(slots, default=0.0)
 
 
-def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None, scenario_workers=()):
+def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None, scenario_workers=(), gradient_batches=()):
     """Reuse serial baselines, then change only concurrency, compilation, or storage."""
     from main import run_jobs
 
@@ -705,6 +767,8 @@ def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None,
                 job["config"]["model"]["compile"] = False
     for job in jobs:
         job["verify_samples"] = True
+        if gradient_batches and job["config"]["model_family"] == "temporal_straightening":
+            job["config"]["jepa_model"]["planner"]["gradient_batch_size"] = gradient_batches[0]
     report = {"runs": [], "comparisons": []}
 
     def run_case(name, selected, parallelism=1):
@@ -739,6 +803,11 @@ def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None,
             selected.sort(key=lambda job: references[job["name"]]["wall_seconds"], reverse=True)
             cases.extend((f"scenarios_{workers}", selected, workers) for workers in scenario_workers)
     for job in jobs:
+        if gradient_batches and job["config"]["model_family"] == "temporal_straightening":
+            for batch_size in gradient_batches[1:]:
+                candidate = copy.deepcopy(job)
+                candidate["config"]["jepa_model"]["planner"]["gradient_batch_size"] = batch_size
+                cases.append((f"gradient_{batch_size}", [candidate], 1))
         if compile_dreamer and job["config"]["model_family"] == "dreamer":
             compiled = copy.deepcopy(job)
             compiled["config"]["model"]["compile"] = True
@@ -795,6 +864,13 @@ def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None,
                 )
                 for phase in rates[0]
             }
+            evaluation = [row["timing_projection"].get("evaluation_seconds_per_vector_step", {}) for row in before + after]
+            batches = set.intersection(*(set(rate) for rate in evaluation))
+            case["evaluation_speedup"] = {
+                batch: sum(rate[batch] for rate in evaluation[:len(before)])
+                / queue_seconds([rate[batch] for rate in evaluation[len(before):]], parallelism)
+                for batch in sorted(batches, key=int)
+            }
         report["comparisons"].append(case)
         (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     report["passed"] = all(row["status"] == "PASS" for row in report["runs"]) and all(
@@ -821,6 +897,22 @@ def main():
     )
     parser.add_argument(
         "--rollout-steps", type=int, help="Real batched collection steps (default: --updates); 0 skips DMC."
+    )
+    parser.add_argument(
+        "--online-burst", type=int, default=0,
+        help="Interleave online updates after collection in bursts of this size; 0 measures isolated phases.",
+    )
+    parser.add_argument(
+        "--eval-steps", type=int, default=0,
+        help="Profile short deterministic evaluation episodes, without saving checkpoints or accuracy metrics.",
+    )
+    parser.add_argument(
+        "--eval-batches", type=int, nargs="+", default=[5, 50],
+        help="Evaluation batch sizes profiled when --eval-steps is positive.",
+    )
+    parser.add_argument(
+        "--compare-gradient-batch", type=int, nargs="+", default=[],
+        help="Compare TS planner microbatches, e.g. 128 256; the first is the serial baseline.",
     )
     parser.add_argument("--override", action="append", default=[], help="Hydra matrix override.")
     parser.add_argument("--model-override", action="append", default=[], help="Hydra override for each selected model.")
@@ -849,6 +941,10 @@ def main():
         type=Path,
         help="Compare with an existing copy of the same datasets at this root (no automatic copy).",
     )
+    parser.add_argument(
+        "--stage-storage", type=Path,
+        help="Copy selected datasets here with SHA-256 verification, then compare source/local reads. Requires enough local disk space.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -860,6 +956,19 @@ def main():
         parser.error("--warmup-updates cannot be negative")
     if args.rollout_steps is not None and args.rollout_steps < 0:
         parser.error("--rollout-steps cannot be negative")
+    rollout_steps = args.updates if args.rollout_steps is None else args.rollout_steps
+    if args.online_burst < 0 or (args.online_burst and rollout_steps * args.online_burst < args.updates):
+        parser.error("--online-burst must be nonnegative and collection must provide enough bursts for --updates")
+    if args.eval_steps < 0 or any(batch < 1 for batch in args.eval_batches):
+        parser.error("Evaluation steps must be nonnegative and batch sizes positive")
+    if args.compare_gradient_batch and (
+        len(args.compare_gradient_batch) < 2
+        or min(args.compare_gradient_batch) < 1
+        or len(set(args.compare_gradient_batch)) != len(args.compare_gradient_batch)
+    ):
+        parser.error("--compare-gradient-batch needs at least two distinct positive sizes")
+    if args.stage_storage and args.compare_storage:
+        parser.error("Use --stage-storage to copy, or --compare-storage for existing copies")
     output = args.output.expanduser().resolve()
     jobs = []
     with initialize_config_dir(config_dir=str(ROOT / "configs"), version_base=None):
@@ -902,7 +1011,10 @@ def main():
                         "config": OmegaConf.to_container(config),
                         "updates": args.updates,
                         "warmup_updates": args.warmup_updates,
-                        "rollout_steps": args.updates if args.rollout_steps is None else args.rollout_steps,
+                        "rollout_steps": rollout_steps,
+                        "online_burst": args.online_burst,
+                        "eval_steps": args.eval_steps,
+                        "eval_batches": list(dict.fromkeys(args.eval_batches)) if args.eval_steps else [],
                         "seed_runs": len(matrix.seeds),
                         "result_path": str(output / scenario / name / "resources.json"),
                     }
@@ -912,7 +1024,8 @@ def main():
     if len({job["name"] for job in jobs}) != len(jobs):
         parser.error("Duplicate scenarios/models would write the same diagnostic files")
     if args.scenario_workers:
-        if args.pair or args.compare_parallel or args.compare_compile or args.compare_storage:
+        if any((args.pair, args.compare_parallel, args.compare_compile, args.compare_storage,
+                args.stage_storage, args.compare_gradient_batch)):
             parser.error("--scenario-workers is separate from pair/compile/storage comparisons")
         if len(set(args.scenario_workers)) != len(args.scenario_workers):
             parser.error("Duplicate scenario worker limits would overwrite reports")
@@ -927,6 +1040,10 @@ def main():
         parser.error("Pairs require one scenario and two distinct selected models per pair")
     if args.compare_compile and not any(job["config"]["model_family"] == "dreamer" for job in jobs):
         parser.error("--compare-compile requires at least one Dreamer model")
+    if args.compare_gradient_batch and "temporal_straightening/default" not in models:
+        parser.error("--compare-gradient-batch requires Temporal Straightening")
+    if args.compare_gradient_batch and not rollout_steps and not args.eval_steps:
+        parser.error("--compare-gradient-batch needs collection or evaluation to exercise the planner")
     if not args.dry_run and any(
         job["config"]["model_family"] == "dreamer"
         and (args.compare_compile or job["config"]["model"]["compile"])
@@ -937,7 +1054,16 @@ def main():
             check_cuda_compile_dependencies()
         except RuntimeError as error:
             parser.exit(2, f"Compile preflight | {error}\n")
-    storage = args.compare_storage.expanduser().resolve() if args.compare_storage else None
+    storage = args.stage_storage or args.compare_storage
+    storage = storage.expanduser().resolve() if storage else None
+    staging = []
+    if args.stage_storage and not args.dry_run:
+        from scripts.stage_dmc_data import stage_dataset
+
+        for dataset in sorted({job["config"]["scenario"]["dataset"] for job in jobs}):
+            staging.append(stage_dataset(root / dataset, storage / dataset))
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "staging.json").write_text(json.dumps(staging, indent=2) + "\n", encoding="utf-8")
     if storage is not None and not args.dry_run:
         # Validate before spending GPU time; measured sample hashes also check the data actually consumed.
         for dataset in {job["config"]["scenario"]["dataset"] for job in jobs}:
@@ -951,26 +1077,29 @@ def main():
                 parser.error(f"Dataset metadata differs between storage locations: {dataset}")
             if (source / "data.hdf5").stat().st_size != (target / "data.hdf5").stat().st_size:
                 parser.error(f"Dataset file size differs between storage locations: {dataset}")
-        print("Storage | existing copies; no cache flushing; equality checked on sampled batches", flush=True)
+        print("Storage | no cache flushing; sampled batch equality checked; staging time is separate from worker timing", flush=True)
     print(
         f"Training smoke | runs={len(jobs)} | updates={args.updates} expert + {args.updates} online"
         f" | collection_steps={jobs[0]['rollout_steps']}"
-        " | checkpoints=disabled",
+        f" | online_burst={args.online_burst} | eval_steps={args.eval_steps} | checkpoints=disabled",
         flush=True,
     )
     results = []
+    if args.compare_gradient_batch:
+        print(f"Planning | gradient_batches={args.compare_gradient_batch} | serial baseline={args.compare_gradient_batch[0]}", flush=True)
     if args.scenario_workers:
         print(
             f"Scenario concurrency | variants={len(models)} | levels={[1, *args.scenario_workers]}"
             f" | worker_runs={len(jobs) * (1 + len(args.scenario_workers))} | no memory prefilter",
             flush=True,
         )
-    if pairs or args.compare_compile or storage is not None or args.scenario_workers:
+    if pairs or args.compare_compile or storage is not None or args.scenario_workers or args.compare_gradient_batch:
         if args.dry_run:
             print(
                 f"Comparison plan | serial={len(jobs)} | pairs={pairs}"
                 f" | compile_dreamer={args.compare_compile} | storage={storage}"
                 f" | scenario_workers={args.scenario_workers}"
+                f" | gradient_batches={args.compare_gradient_batch} | stage_storage={bool(args.stage_storage)}"
             )
         else:
             raise SystemExit(
@@ -982,6 +1111,7 @@ def main():
                     compile_dreamer=args.compare_compile,
                     storage=storage,
                     scenario_workers=args.scenario_workers,
+                    gradient_batches=args.compare_gradient_batch,
                 )
                 else 1
             )

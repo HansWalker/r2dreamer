@@ -22,13 +22,16 @@ class EpisodeReplay:
         self.episodes_per_batch = int(config.episodes_per_batch)
         self.completed = deque()
         self.current = None
+        self._current_episodes = None
         self._completed_size = 0
         self._generator = torch.Generator().manual_seed(int(config.seed))
 
     def start(self, env_num):
         self.current = [[] for _ in range(int(env_num))]
+        self._current_episodes = None
 
     def append(self, data, episode_end):
+        self._current_episodes = None
         if self.current is None:
             self.start(data.shape[0])
         data = data.detach().to(self.storage_device)
@@ -73,6 +76,7 @@ class EpisodeReplay:
         )
         self._completed_size = sum(len(episode) for episode in self.completed)
         self.current = None
+        self._current_episodes = None
         if "generator_state" in state:
             self._generator.set_state(state["generator_state"].cpu())
         self._trim()
@@ -84,7 +88,11 @@ class EpisodeReplay:
 
     def episodes(self, min_length=1):
         episodes = [episode for episode in self.completed if len(episode) >= min_length]
-        episodes.extend(torch.stack(episode, dim=0) for episode in self.current or () if len(episode) >= min_length)
+        # An update burst samples unchanged raw prefixes repeatedly. Cache only
+        # their stacked tensors, never model states; collection invalidates them.
+        if self._current_episodes is None:
+            self._current_episodes = [torch.stack(rows, dim=0) for rows in self.current or () if rows]
+        episodes.extend(episode for episode in self._current_episodes if len(episode) >= min_length)
         return episodes
 
     def sample_groups(self, batch_size, sequence_length, episodes_per_batch):

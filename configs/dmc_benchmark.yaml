@@ -47,7 +47,9 @@ collection:
   parallelism: 3
 
 training:
-  parallelism: 1  # Set to 2 after measuring paired throughput and memory on the target GPU.
+  parallelism: 1  # Other families stay serial until their online throughput improves.
+  scenario_parallelism:
+    dreamer: 3  # Same variant/seed across the three scenarios; final evaluations remain serial.
   resume: true
   overwrite: false
   overrides: []

@@ -50,6 +50,9 @@ class Predictor(nn.Module):
             for _ in range(int(config.layers))
         )
         self.norm = nn.LayerNorm(dim)
+        self._mask_patches = int(tokens_per_frame)
+        frame = torch.arange(history).repeat_interleave(self._mask_patches)
+        self.register_buffer("_causal_mask", (frame[:, None] >= frame[None, :])[None, None], persistent=False)
 
     def forward(self, state, action):
         single_token = state.ndim == 3
@@ -68,8 +71,11 @@ class Predictor(nn.Module):
         else:
             position = self.position[:, : tokens.shape[1]]
         tokens = self.dropout(tokens + position)
-        frame = torch.arange(frames, device=state.device).repeat_interleave(patches)
-        mask = (frame[:, None] >= frame[None, :])[None, None]
+        if patches != self._mask_patches or tokens.shape[1] > self._causal_mask.shape[-1]:
+            frame = torch.arange(frames, device=state.device).repeat_interleave(patches)
+            self._causal_mask = (frame[:, None] >= frame[None, :])[None, None]
+            self._mask_patches = patches
+        mask = self._causal_mask[..., : tokens.shape[1], : tokens.shape[1]]
         for block in self.blocks:
             tokens = block(tokens, mask)
         output = self.norm(tokens).reshape(batch, frames, patches, -1)[..., : self.state_dim]

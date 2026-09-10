@@ -113,6 +113,23 @@ def build_runs(config, scenario_name, scenario):
     return runs
 
 
+def model_run_groups(config, scenario_runs):
+    """Group opted-in families by variant/seed; retain scenario order for the rest."""
+    workers = config["training"].get("scenario_parallelism", {})
+    grouped = {}
+    remaining = {}
+    for scenario, runs in scenario_runs.items():
+        for run in runs:
+            if int(workers.get(run.family, 1)) > 1:
+                grouped.setdefault((run.family, run.variant, run.seed), []).append(run)
+            else:
+                remaining.setdefault(scenario, []).append(run)
+    for (family, variant, seed), runs in grouped.items():
+        yield f"{family}/{variant}/seed_{seed} across scenarios", runs, int(workers[family])
+    for scenario, runs in remaining.items():
+        yield scenario, runs, int(config["training"]["parallelism"])
+
+
 def validate_matrix(config, scenario_runs, stages):
     """Validate every child config before collection or model construction starts."""
     if not scenario_runs:
@@ -125,6 +142,8 @@ def validate_matrix(config, scenario_runs, stages):
         raise ValueError("Collection parallelism must be positive.")
     if int(config["training"]["parallelism"]) < 1:
         raise ValueError("Training parallelism must be positive.")
+    if any(int(workers) < 1 for workers in config["training"].get("scenario_parallelism", {}).values()):
+        raise ValueError("Scenario training parallelism must be positive.")
 
     resolved = {}
     signatures = {}
@@ -278,9 +297,18 @@ def execute(label, command, log_path, *, dry_run=False, input_text=None, quiet=F
         print(f"START | {label}", flush=True)
     started = time.perf_counter()
     output_tail = deque(maxlen=120)
+    # GPU workers prepare many small CPU tensors; independent large thread pools
+    # contend during replay sampling. Explicit user settings still take precedence.
+    environment = dict(os.environ)
+    environment.setdefault("OMP_NUM_THREADS", "1")
+    environment.setdefault("MKL_NUM_THREADS", environment["OMP_NUM_THREADS"])
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8", buffering=1) as log:
         log.write(f"$ {rendered}\n\n")
+        log.write(
+            f"Worker threads | OMP_NUM_THREADS={environment['OMP_NUM_THREADS']}"
+            f" | MKL_NUM_THREADS={environment['MKL_NUM_THREADS']}\n"
+        )
         with ACTIVE_PROCESSES_LOCK:
             if STOP_REQUESTED.is_set():
                 raise RuntimeError("Experiment cancelled; no further workers will be started.")
@@ -293,6 +321,7 @@ def execute(label, command, log_path, *, dry_run=False, input_text=None, quiet=F
                 text=True,
                 bufsize=1,
                 start_new_session=True,
+                env=environment,
             )
             ACTIVE_PROCESSES.add(process)
         try:
@@ -464,7 +493,7 @@ def current_evaluation(output, spec, config, dataset_path, expected_dataset, che
         return False
 
 
-def run_models(config, runs, resolved, dataset_identities, *, dry_run=False):
+def run_models(config, runs, resolved, dataset_identities, *, dry_run=False, parallelism=None):
     stages = config["stages"]
     training = config["training"]
     device = config["device"]
@@ -474,19 +503,19 @@ def run_models(config, runs, resolved, dataset_identities, *, dry_run=False):
     dataset_root = resolve_path(evaluation["dataset_root"]) if stages["evaluate"] else None
     evaluation_specs = tuple(evaluation.get("checkpoints", ()))
 
-    def run_one(item):
+    def run_one(item, *, train, evaluate):
         index, run = item
         run_label = f"{index}/{len(runs)} | {run.name}"
         run_config = resolved[run.name]
         completed_checkpoint = run.logdir / completion_checkpoint(run_config)
         dataset_path = None if dataset_root is None else dataset_root / run.dataset
-        reset = bool(stages["train"] and overwrite and run.logdir.exists())
+        reset = bool(train and overwrite and run.logdir.exists())
         if reset:
             print(f"Overwrite | {run_label}", flush=True)
             if not dry_run:
                 shutil.rmtree(run.logdir)
 
-        train_run = bool(stages["train"])
+        train_run = train
         checkpoint = None
         if train_run and run.logdir.exists() and not reset:
             if not resume:
@@ -536,7 +565,7 @@ def run_models(config, runs, resolved, dataset_identities, *, dry_run=False):
                 if not training_complete(saved, run_config):
                     raise RuntimeError(f"Training did not produce a complete checkpoint: {completed_checkpoint}")
 
-        if stages["evaluate"]:
+        if evaluate:
             for spec in evaluation_specs:
                 output = run.logdir / str(spec["output"])
                 checkpoint_path = run.logdir / str(spec["checkpoint"])
@@ -587,9 +616,19 @@ def run_models(config, runs, resolved, dataset_identities, *, dry_run=False):
                     dry_run=dry_run,
                 )
 
-    parallelism = min(int(training["parallelism"]), len(runs))
+    parallelism = min(int(training["parallelism"] if parallelism is None else parallelism), len(runs))
     print(f"\nModels | runs={len(runs)} | parallelism={parallelism} | device={device}", flush=True)
-    run_jobs(run_one, list(enumerate(runs, 1)), 1 if dry_run else parallelism)
+    items = list(enumerate(runs, 1))
+    if parallelism == 1:
+        run_jobs(lambda item: run_one(item, train=bool(stages["train"]), evaluate=bool(stages["evaluate"])), items, 1)
+        return
+    if stages["train"]:
+        run_jobs(lambda item: run_one(item, train=True, evaluate=False), items, 1 if dry_run else parallelism)
+    if stages["evaluate"]:
+        # Final evaluation uses larger batches than collection. Do not overlap it
+        # with the tightly packed training workers or other final evaluations.
+        print("Evaluation | parallelism=1 | training group complete", flush=True)
+        run_jobs(lambda item: run_one(item, train=False, evaluate=True), items, 1)
 
 
 def main():
@@ -620,9 +659,11 @@ def main():
 
     if stages["train"] or stages["evaluate"]:
         dataset_identities = {} if args.dry_run else validate_datasets(config, scenario_runs, resolved)
-        for index, scenario_name in enumerate(scenarios, 1):
-            print(f"\nScenario {index}/{len(scenarios)} | {scenario_name} | runs={runs_per_scenario}", flush=True)
-            run_models(config, scenario_runs[scenario_name], resolved, dataset_identities, dry_run=args.dry_run)
+        for label, runs, parallelism in model_run_groups(config, scenario_runs):
+            print(f"\nGroup | {label} | runs={len(runs)}", flush=True)
+            run_models(
+                config, runs, resolved, dataset_identities, dry_run=args.dry_run, parallelism=parallelism
+            )
     elapsed = timedelta(seconds=round(time.perf_counter() - started))
     print(f"\nCOMPLETE | runs={len(scenarios) * runs_per_scenario} | elapsed={elapsed}")
 

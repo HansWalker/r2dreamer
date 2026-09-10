@@ -131,22 +131,24 @@ class LatentPlanner(nn.Module):
             .reshape(batch * samples, self.history_size - 1, self.action_dim)
         )
         candidates = candidates.reshape(batch * samples, horizon, self.action_dim)
+        # Actions are known for the entire rollout; only latent states are recursive.
+        encoded_action = self.action_encoder(torch.cat((action_history, candidates), dim=1))
         prediction = []
-        for action in candidates.unbind(1):
-            conditioned_action = torch.cat((action_history, action[:, None]), dim=1)
-            next_state = self.predict(state, conditioned_action)[:, -1]
+        for step in range(horizon):
+            conditioned_action = encoded_action[:, step : step + self.history_size]
+            next_state = self.pred_projector(self.predictor(state, conditioned_action))[:, -1]
             prediction.append(next_state)
             state = torch.cat((state[:, 1:], next_state[:, None]), dim=1)
-            action_history = conditioned_action[:, 1:]
         return torch.stack(prediction, dim=1).reshape(batch, samples, horizon, *latent_shape)
 
     def _goal_cost(self, history, past_action, candidates):
         prediction = self.rollout(history, past_action, candidates)
-        batch, samples, horizon = prediction.shape[:3]
+        batch, samples = prediction.shape[:2]
         prefix = history[:, None, 1:].expand(-1, samples, -1, *history.shape[2:])
         trajectory = torch.cat((prefix, prediction), dim=2)
-        physical = self.state_head(trajectory.flatten(0, 1)).reshape(batch, samples, horizon, -1)
-        relation = self.state_head.targets.goal_relation(physical[:, :, -self.goal_stable_steps :])
+        tail = trajectory[:, :, -(self.history_size + self.goal_stable_steps - 1) :]
+        physical = self.state_head(tail.flatten(0, 1)).reshape(batch, samples, self.goal_stable_steps, -1)
+        relation = self.state_head.targets.goal_relation(physical)
         relation = relation / self.goal_tolerance
         if self.goal_geometry == "radial":
             outside = F.relu(relation.norm(dim=-1) - 1)
@@ -211,15 +213,18 @@ class LatentPlanner(nn.Module):
         action_noise = float(self.planner.action_noise)
         candidates = batch * restarts
         batch_size = int(self.planner.gradient_batch_size)
+        chunks = []
+        for start in range(0, candidates, batch_size):
+            stop = min(start + batch_size, candidates)
+            indices = torch.arange(start, stop, device=self.device) // restarts
+            chunks.append((start, stop, latent[indices], past_action[indices]))
         with torch.enable_grad():
             for _ in range(iterations):
                 optimizer.zero_grad(set_to_none=True)
                 gradient = torch.empty_like(logits).flatten(0, 1)
-                for start in range(0, candidates, batch_size):
-                    stop = min(start + batch_size, candidates)
-                    indices = torch.arange(start, stop, device=self.device) // restarts
+                for start, stop, chunk_latent, chunk_past in chunks:
                     chunk = logits.flatten(0, 1)[start:stop].detach().requires_grad_()
-                    cost = self._goal_cost(latent[indices], past_action[indices], chunk.tanh()[:, None])
+                    cost = self._goal_cost(chunk_latent, chunk_past, chunk.tanh()[:, None])
                     # Preserve the original global mean, including a smaller final batch.
                     gradient[start:stop] = torch.autograd.grad(cost.sum() / candidates, chunk)[0]
                 logits.grad = gradient.view_as(logits)
@@ -242,11 +247,18 @@ class LatentPlanner(nn.Module):
     def act(self, history, past_action, deterministic=False, first=None):
         was_training = self.training
         self.eval()
+        gradient_planner = str(self.planner.type) == "gradient"
+        trainable = [parameter for parameter in self.parameters() if parameter.requires_grad] if gradient_planner else []
+        # Retain action gradients without saving tensors for unused weight gradients.
+        for parameter in trainable:
+            parameter.requires_grad_(False)
         try:
             history = {key: history[key].to(self.device) for key in self.encoder.keys}
             past_action = past_action.to(self.device)
-            if str(self.planner.type) == "gradient":
+            if gradient_planner:
                 return self._gradient_plan(history, past_action, deterministic, first)
             return self._cem(history, past_action, deterministic, first)
         finally:
+            for parameter in trainable:
+                parameter.requires_grad_(True)
             self.train(was_training)
