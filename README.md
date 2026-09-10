@@ -291,7 +291,9 @@ In a terminal (including GNU Screen), each active worker has an in-place progres
 ETA, and a small selection of losses. Expert, online, policy-evaluation, and held-out prediction
 progress updates arrive at most every 30 seconds, plus stage completion. The parent owns the display,
 so parallel workers cannot overwrite each other's rows. Redirected output uses ordinary lines without
-terminal escape codes. Full scalar metrics remain in each run's `metrics.jsonl` and TensorBoard;
+terminal escape codes. Startup/model/data/checkpoint details update the live status row instead of
+scrolling; redirected output omits these details too. Run labels omit repeated config names and paths.
+Results, failures, and completion summaries remain visible. Full scalar metrics remain in each run's `metrics.jsonl` and TensorBoard;
 raw worker output remains in `stdout.log` / evaluation logs. The parent also appends a plain-text
 `orchestrator.log` under the experiment output directory, without requiring `tee`.
 

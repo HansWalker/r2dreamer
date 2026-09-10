@@ -19,6 +19,43 @@ def duration(seconds):
     return f"{seconds // 3600:d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
+def short_label(label):
+    label = label.split(" | config=", 1)[0]
+    stage, separator, name = label.partition(" | ")
+    return f"{stage.split()[0]} {name.replace('/seed_', '/s')}" if separator else label
+
+
+def worker_status(message):
+    """Startup details belong in the live row, not permanent terminal history."""
+    parts = message.split(" | ")
+    fields = dict(part.split("=", 1) for part in parts[1:] if "=" in part)
+    if parts[0] == "Run":
+        return "Starting"
+    if parts[0] == "Model":
+        count = fields.get("parameters")
+        return f"Model ready | parameters={count}" if count else "Building model"
+    if parts[0] == "Data":
+        return f"Data ready | episodes={fields.get('episodes', '-')}"
+    if parts[0] == "Checkpoint":
+        for action in ("saved", "loaded"):
+            if action in fields:
+                return f"Checkpoint {action} | {Path(fields[action]).name}"
+    if parts[0] == "Expert":
+        if "batch_size" in fields:
+            return f"Expert | batch={fields['batch_size']}x{fields.get('sequence_length', '-')}"
+        return " | ".join(parts[:2])
+    if parts[0] == "Online":
+        if "steps" in fields:
+            return f"Online | steps={fields['steps']} | updates={fields.get('model_updates', '-')}"
+        return "Starting environments" if "environment_seed" in fields else " | ".join(parts[:2])
+    if parts[0] == "Evaluation":
+        if fields.get("state_prediction") == "running":
+            return "Predicting held-out trajectories"
+        if "running" in parts or fields.get("policy_rollout") == "running":
+            return "Evaluating policy"
+    return None
+
+
 class Progress:
     def __init__(self, phase, total, initial=0, interval=30):
         self.phase, self.total, self.initial = phase, int(total), int(initial)
@@ -100,17 +137,22 @@ class Console:
         width, height = shutil.get_terminal_size((100, 24))
         lines = []
         for label, task in self.tasks.items():
-            name = label.split(" | config=", 1)[0]
+            name = short_label(label)
             lines.append(f"{name} | elapsed={duration(time.monotonic() - task['started'])}")
             event = task.get("progress")
             if event:
                 fraction = min(1, max(0, event['current'] / max(1, event['total'])))
                 bar = "#" * int(fraction * 12)
-                lines.append(
-                    f"  {event['phase']} [{bar:<12}] {fraction:4.0%} "
+                line = (
+                    f"  {event['phase']} [{bar:<12}] {fraction:5.1%} "
                     f"{event['current']}/{event['total']} | eta={duration(event['eta'])}"
                 )
-                if event['detail']:
+                detail = event['detail']
+                if detail and len(line) + len(detail) + 3 < width:
+                    lines.append(f"{line} | {detail}")
+                else:
+                    lines.append(line)
+                if detail and len(line) + len(detail) + 3 >= width:
                     lines.append("  " + event['detail'])
             else:
                 lines.append("  " + task.get("message", "starting"))
@@ -121,24 +163,31 @@ class Console:
         self.stream.flush()
         self.rows = len(lines)
 
-    def message(self, message="", *, flush=True):
+    def _record(self, message):
+        if self.log:
+            self.log.write(str(message) + "\n")
+
+    def message(self, message="", *, flush=True, log_message=None):
         with self.lock:
             self._clear()
             print(message, file=self.stream or sys.stdout, flush=flush)
-            if self.log:
-                self.log.write(str(message) + "\n")
+            self._record(message if log_message is None else log_message)
             self._render()
 
     def start(self, label):
         with self.lock:
             self.tasks[label] = {"started": time.monotonic()}
-            self.message(f"START | {label}")
+            if self.live:
+                self._record(f"START | {label}")
+                self._clear()
+                self._render()
+            else:
+                self.message(f"START | {short_label(label)}", log_message=f"START | {label}")
 
     def update(self, label, message):
         with self.lock:
             if message.startswith(("Expert | update=", "Online | env_step=")):
-                if self.log:
-                    self.log.write(f"[{label}] {message}\n")
+                self._record(f"[{label}] {message}")
                 return
             task = self.tasks.get(label)
             if message.startswith(PREFIX):
@@ -150,25 +199,33 @@ class Console:
                     f"eta={duration(event['eta'])} | {event['detail']}"
                 )
                 if self.live:
-                    if self.log:
-                        self.log.write(f"[{label}] {text}\n")
+                    self._record(f"[{label}] {text}")
                     self._clear()
                     self._render()
                     return
             else:
                 text = message
+                status = worker_status(message)
                 if task is not None:
-                    task['message'] = message
+                    task['message'] = status or message
                     # Stage transitions must not leave an old completed bar visible.
-                    if message.startswith(("Evaluation |", "Checkpoint |", "Online | steps=", "Expert | updates=")):
+                    if status is not None or message.startswith("Evaluation |"):
                         task.pop('progress', None)
-            self.message(f"  [{label}] {text}")
+                if status is not None:
+                    self._record(f"[{label}] {message}")
+                    self._clear()
+                    self._render()
+                    return
+            self.message(f"  [{short_label(label)}] {text}", log_message=f"[{label}] {text}")
 
     def finish(self, label, status):
         with self.lock:
             task = self.tasks.pop(label, None)
             elapsed = duration(time.monotonic() - task['started']) if task else "-"
-            self.message(f"{status} | {label} | elapsed={elapsed}")
+            self.message(
+                f"{status} | {short_label(label)} | elapsed={elapsed}",
+                log_message=f"{status} | {label} | elapsed={elapsed}",
+            )
 
 
 console = Console()
