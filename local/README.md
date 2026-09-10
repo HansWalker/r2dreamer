@@ -7,6 +7,8 @@ README is ignored by Git and must not be imported by repository code.
 The current local archive is organized as follows:
 
 - `cache/`: generated Python and pytest caches retained instead of deleted.
+- `reports/`: downloaded runtime and planner benchmark reports, kept out of Git history.
+- `backups/`: local recovery bundles for repository maintenance; never pushed.
 - `ablations/state_observations/`: the retired vector-observation configs and implementation snapshots.
 - `legacy/`: superseded notebook helpers, CLI entrypoints, configs, Docker setup, replaced implementations,
   and archived environments.

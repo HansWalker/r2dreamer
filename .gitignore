@@ -71,7 +71,7 @@ dist/
 /checkpoints/
 /wandb/
 /runs/*/
-/scenario_concurrency_report.json
+/*_report.json
 .hydra/
 torch_compile_debug/
 events.out.tfevents.*
