@@ -91,13 +91,13 @@ def latent_rollout(model, observation, action, context_length):
 @torch.no_grad()
 def _tdmpc2_rollout(model: TDMPC2, observation, action, context_length):
     stacked = model.stack_sequence(observation)
-    latent = model.encoder({key: value[:, :context_length] for key, value in stacked.items()})
+    latent = model._forward(model.encoder, {key: value[:, :context_length] for key, value in stacked.items()})
     state = latent[:, context_length - 1]
     predictions = []
     for current_action in action[:, context_length - 1 :].unbind(1):
-        state = model.dynamics(torch.cat((state, current_action), dim=-1))
+        state = model._forward(model.dynamics, torch.cat((state, current_action), dim=-1))
         predictions.append(state)
-    future = model.encoder({key: value[:, context_length:] for key, value in stacked.items()})
+    future = model._forward(model.encoder, {key: value[:, context_length:] for key, value in stacked.items()})
     return torch.cat((latent, future), dim=1).float(), torch.stack(predictions, dim=1).float()
 
 
@@ -120,6 +120,11 @@ def _planning_rollout(model: LatentPlanner, observation, action, context_length)
 @latent_rollout.register
 @torch.no_grad()
 def _dreamer_rollout(model: Dreamer, observation, action, context_length):
+    with model.amp_context():
+        return _dreamer_predictions(model, observation, action, context_length)
+
+
+def _dreamer_predictions(model, observation, action, context_length):
     observation = model.preprocess(dict(observation))
     embed = model.encoder({key: value[:, :context_length] for key, value in observation.items()})
     batch, length = next(iter(observation.values())).shape[:2]

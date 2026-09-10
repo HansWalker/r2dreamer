@@ -5,8 +5,24 @@ import json
 import math
 from pathlib import Path
 
+from omegaconf import OmegaConf
+
 from main import build_runs, load_config, model_run_groups
 from scripts.smoke_training import queue_seconds
+
+
+def precision_signature(config):
+    family = config.model_family
+    keys = {
+        "dreamer": ("model",), "storm": ("storm_model", "actor_critic"),
+        "tdmpc2": ("tdmpc2_model",), "leworldmodel": ("jepa_model",),
+        "temporal_straightening": ("jepa_model",),
+    }[family]
+    return tuple(
+        str(config[key].get("amp_dtype", "float16" if family == "dreamer" else "bfloat16"))
+        if config[key].get("use_amp", family == "dreamer") else "float32"
+        for key in keys
+    )
 
 
 def run_seconds(config, training_row, serial_row, checkpoints):
@@ -77,12 +93,27 @@ def estimate(matrix, reports):
             for run in group:
                 key = f"{run.scenario}/{run.family}/{run.variant}"
                 config = load_config(run.config, run.overrides)
-                training = measured.get((f"scenarios_{workers}" if workers > 1 else "serial", key))
-                serial = measured.get(("serial", key))
-                if workers == 1 and run.family == "temporal_straightening":
-                    planner_case = f"gradient_{config.jepa_model.planner.gradient_batch_size}", key
-                    if planner_case in measured:
-                        training = serial = measured[planner_case]
+
+                def matching(case):
+                    row = measured.get((case, key))
+                    if row is None or not row.get("config_yaml"):
+                        return None
+                    recorded = OmegaConf.create(row["config_yaml"])
+                    if precision_signature(recorded) != precision_signature(config):
+                        return None
+                    if "jepa_model" in config and any(
+                        recorded.jepa_model.planner[field] != config.jepa_model.planner[field]
+                        for field in ("iterations", "samples", "horizon", "gradient_batch_size")
+                    ):
+                        return None
+                    return row
+
+                cases = ["bf16"]
+                if run.family == "temporal_straightening":
+                    cases.append(f"gradient_{config.jepa_model.planner.gradient_batch_size}")
+                cases.append("serial")
+                serial = next((row for case in cases if (row := matching(case)) is not None), None)
+                training = matching(f"scenarios_{workers}") if workers > 1 else serial
                 if (
                     training is None
                     or serial is None

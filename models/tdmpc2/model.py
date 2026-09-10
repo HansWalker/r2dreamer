@@ -23,7 +23,7 @@ class SimNorm(nn.Module):
 
     def forward(self, value):
         shape = value.shape
-        value = value.reshape(*shape[:-1], -1, self.group_dim)
+        value = value.float().reshape(*shape[:-1], -1, self.group_dim)
         return value.softmax(dim=-1).reshape(shape)
 
 
@@ -146,6 +146,7 @@ class TDMPC2(nn.Module):
         self.reward_coef = float(settings.reward_coef)
         self.value_coef = float(settings.value_coef)
         self.planner = settings.planner
+        self.use_amp = bool(settings.use_amp)
 
         hidden = [int(settings.mlp_dim)] * 2
         latent_action = self.latent_dim + self.action_dim
@@ -200,6 +201,11 @@ class TDMPC2(nn.Module):
         super().train(mode)
         self.target_qs.eval()
         return self
+
+    def _forward(self, network, *args):
+        # Leave distribution arithmetic, TD targets, and optimization outside autocast.
+        with torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.use_amp and self.device.type == "cuda"):
+            return network(*args).float()
 
     def optimizer_state_dict(self):
         return {
@@ -263,7 +269,7 @@ class TDMPC2(nn.Module):
         return symexp((prediction.softmax(dim=-1) * bins).sum(dim=-1, keepdim=True))
 
     def _policy(self, latent, deterministic=False):
-        mean, log_std = self.policy(latent).chunk(2, dim=-1)
+        mean, log_std = self._forward(self.policy, latent).chunk(2, dim=-1)
         log_std = self.log_std_min + 0.5 * self.log_std_range * (log_std.tanh() + 1)
         noise = torch.zeros_like(mean) if deterministic else torch.randn_like(mean)
         raw_action = mean + noise * log_std.exp()
@@ -280,7 +286,7 @@ class TDMPC2(nn.Module):
     def _q_logits(self, latent, action, *, target=False):
         value = torch.cat((latent, action), dim=-1)
         networks = self.target_qs if target else self.qs
-        return torch.stack([network(value) for network in networks], dim=0)
+        return torch.stack([self._forward(network, value) for network in networks], dim=0)
 
     def _q_value(self, latent, action, *, target=False, average=False):
         values = self._decode(self._q_logits(latent, action, target=target))
@@ -323,19 +329,19 @@ class TDMPC2(nn.Module):
         weight = self.rho ** torch.arange(horizon, device=self.device)
 
         with torch.no_grad():
-            next_latent = self.encoder({key: value[:, 1:] for key, value in obs.items()})
+            next_latent = self._forward(self.encoder, {key: value[:, 1:] for key, value in obs.items()})
             target = self._td_target(next_latent, reward, terminal)
 
-        latent = self.encoder({key: value[:, 0] for key, value in obs.items()})
+        latent = self._forward(self.encoder, {key: value[:, 0] for key, value in obs.items()})
         rollout = [latent]
         consistency = []
         for step in range(horizon):
-            latent = self.dynamics(torch.cat((latent, action[:, step]), dim=-1))
+            latent = self._forward(self.dynamics, torch.cat((latent, action[:, step]), dim=-1))
             consistency.append(F.mse_loss(latent, next_latent[:, step]))
             rollout.append(latent)
         rollout = torch.stack(rollout, dim=1)
         current = rollout[:, :-1]
-        reward_logits = self.reward(torch.cat((current, action), dim=-1))
+        reward_logits = self._forward(self.reward, torch.cat((current, action), dim=-1))
         q_logits = self._q_logits(current, action)
         consistency_loss = (torch.stack(consistency) * weight).sum() / horizon
         reward_loss = (self._soft_ce(reward_logits, reward) * weight).mean()
@@ -376,8 +382,8 @@ class TDMPC2(nn.Module):
         discount = 1.0
         for step in range(horizon):
             action = actions[:, step]
-            value += discount * self._decode(self.reward(torch.cat((state, action), dim=-1)))
-            state = self.dynamics(torch.cat((state, action), dim=-1))
+            value += discount * self._decode(self._forward(self.reward, torch.cat((state, action), dim=-1)))
+            state = self._forward(self.dynamics, torch.cat((state, action), dim=-1))
             discount *= self.gamma
         action, _ = self._policy(state)
         value += discount * self._q_value(state, action, average=True)
@@ -389,7 +395,7 @@ class TDMPC2(nn.Module):
         self.eval()
         try:
             history = {key: value.to(self.device) for key, value in history.items()}
-            latent = self.encoder(self.replay_observation(history))
+            latent = self._forward(self.encoder, self.replay_observation(history))
             batch = latent.shape[0]
             horizon = int(self.planner.horizon)
             samples = int(self.planner.samples)
@@ -408,7 +414,7 @@ class TDMPC2(nn.Module):
             for step in range(horizon):
                 action, _ = self._policy(state)
                 policy_actions[:, :, step] = action.reshape(batch, policy_samples, self.action_dim)
-                state = self.dynamics(torch.cat((state, action), dim=-1))
+                state = self._forward(self.dynamics, torch.cat((state, action), dim=-1))
 
             for _ in range(int(self.planner.iterations)):
                 noise = torch.randn(batch, samples, horizon, self.action_dim, device=self.device)

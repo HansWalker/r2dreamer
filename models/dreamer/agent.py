@@ -54,6 +54,8 @@ class Dreamer(DreamerModel):
             eps=config.eps,
         )
         self._scaler = GradScaler("cuda", enabled=self.device.type == "cuda")
+        self.use_amp = bool(config.use_amp)
+        self.amp_dtype = getattr(torch, str(config.amp_dtype))
 
         warmup = int(config.warmup)
         self._scheduler = LambdaLR(
@@ -125,12 +127,19 @@ class Dreamer(DreamerModel):
     def act(self, obs, state, eval=False):
         """Policy inference step."""
         p_obs = self.preprocess(obs)
-        embed = self.encoder(p_obs)
-        feat, state_update = self.rssm.actor_step(embed, state, obs["is_first"])
-        action_dist = self.actor(feat)
+        with self.amp_context():
+            embed = self.encoder(p_obs)
+            feat, state_update = self.rssm.actor_step(embed, state, obs["is_first"])
+            action_dist = self.actor(feat)
         action = action_dist.mode if eval else action_dist.rsample()
         next_state = self.rssm.actor_state_after_action(state_update, action)
         return action, TensorDict(next_state, batch_size=state.batch_size)
+
+    def amp_context(self, *, cache_enabled=True):
+        return autocast(
+            self.device.type, dtype=self.amp_dtype,
+            enabled=self.use_amp and self.device.type == "cuda", cache_enabled=cache_enabled,
+        )
 
     @torch.no_grad()
     def get_initial_state(self, B):
@@ -143,13 +152,10 @@ class Dreamer(DreamerModel):
         data = data.exclude(STATE_KEY)
         p_data = self.preprocess(data)
         for skipped in range(32):
-            initial = self._replay_initial(contexts)
             return_ema = self.return_ema.ema_vals.clone()
-            with autocast(
-                device_type=self.device.type,
-                dtype=torch.float16,
-                enabled=self.device.type == "cuda",
-            ):
+            with self.amp_context():
+                initial = self._replay_initial(contexts)
+            with self.amp_context():
                 metrics, feature = self._cal_grad(p_data, initial)
             if self._optimizer_step(metrics):
                 break
@@ -166,12 +172,9 @@ class Dreamer(DreamerModel):
         data = data.exclude(STATE_KEY)
         p_data = self.preprocess(data)
         for skipped in range(32):
-            initial = self._replay_initial(contexts) if contexts is not None else self._initial_tuple(data.shape[0])
-            with autocast(
-                device_type=self.device.type,
-                dtype=torch.float16,
-                enabled=self.device.type == "cuda",
-            ):
+            with self.amp_context():
+                initial = self._replay_initial(contexts) if contexts is not None else self._initial_tuple(data.shape[0])
+            with self.amp_context():
                 metrics, feature = self._cal_expert_pretrain_grad(p_data, initial)
             if self._optimizer_step(metrics):
                 break
@@ -296,7 +299,8 @@ class Dreamer(DreamerModel):
             post_deter[:, -start_length:],
             post_cache=post_cache,
         )
-        with torch.no_grad():
+        # Do not cache detached weight casts for later actor/value training forwards.
+        with torch.no_grad(), self.amp_context(cache_enabled=False):
             imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
 
             # (B*K, T_imag, 1)
@@ -334,7 +338,7 @@ class Dreamer(DreamerModel):
         replay_term = data["is_terminal"][:, -start_length:].float()
         replay_reward = data["reward"][:, -start_length:].float()
         replay_boot = ret[:, 0].reshape(batch_size, start_length, 1)
-        with torch.no_grad():
+        with torch.no_grad(), self.amp_context(cache_enabled=False):
             replay_value = self.value(replay_feat).mode()
             replay_slow_value = self._slow_value(replay_feat).mode()
             replay_return = self._lambda_return(
@@ -385,7 +389,7 @@ class Dreamer(DreamerModel):
             data["is_terminal"].float(),
             data["reward"].float(),
         )
-        with torch.no_grad():
+        with torch.no_grad(), self.amp_context(cache_enabled=False):
             value = self.value(feat).mode()
             slow_value = self._slow_value(feat).mode()
         disc = self.gamma

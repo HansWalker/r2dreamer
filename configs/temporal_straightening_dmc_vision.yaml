@@ -26,5 +26,5 @@ jepa_model:
   planner:
     type: gradient
     samples: 16
-    iterations: 64
+    iterations: 32
     gradient_batch_size: 256  # Same candidates/objective; one pass for 16 envs x 16 candidates.

@@ -837,7 +837,22 @@ def queue_seconds(durations, workers):
     return max(slots, default=0.0)
 
 
-def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None, scenario_workers=(), gradient_batches=()):
+def set_bf16(config, enabled):
+    family = config["model_family"]
+    keys = {
+        "dreamer": ("model",),
+        "storm": ("storm_model", "actor_critic"),
+        "tdmpc2": ("tdmpc2_model",),
+        "leworldmodel": ("jepa_model",),
+        "temporal_straightening": ("jepa_model",),
+    }[family]
+    for key in keys:
+        config[key]["use_amp"] = enabled
+        if "amp_dtype" in config[key]:
+            config[key]["amp_dtype"] = "bfloat16"
+
+
+def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None, scenario_workers=(), gradient_batches=(), bf16=False):
     """Reuse serial baselines, then change only concurrency, compilation, or storage."""
     from main import run_jobs
 
@@ -848,6 +863,8 @@ def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None,
                 job["config"]["model"]["compile"] = False
     for job in jobs:
         job["verify_samples"] = True
+        if bf16:
+            set_bf16(job["config"], False)
         if gradient_batches and job["config"]["model_family"] == "temporal_straightening":
             job["config"]["jepa_model"]["planner"]["gradient_batch_size"] = gradient_batches[0]
     report = {"runs": [], "comparisons": []}
@@ -884,6 +901,10 @@ def compare_runs(jobs, output, *, pairs=(), compile_dreamer=False, storage=None,
             selected.sort(key=lambda job: references[job["name"]]["wall_seconds"], reverse=True)
             cases.extend((f"scenarios_{workers}", selected, workers) for workers in scenario_workers)
     for job in jobs:
+        if bf16:
+            candidate = copy.deepcopy(job)
+            set_bf16(candidate["config"], True)
+            cases.append(("bf16", [candidate], 1))
         if gradient_batches and job["config"]["model_family"] == "temporal_straightening":
             for batch_size in gradient_batches[1:]:
                 candidate = copy.deepcopy(job)
@@ -1017,6 +1038,7 @@ def main():
         help="Repeat for specific concurrent pairs; serial baselines are shared.",
     )
     parser.add_argument("--compare-compile", action="store_true", help="Compare eager and compiled Dreamer modules.")
+    parser.add_argument("--compare-bf16", action="store_true", help="Compare FP32 and BF16 mixed precision for selected models only.")
     parser.add_argument(
         "--compare-storage",
         type=Path,
@@ -1106,7 +1128,7 @@ def main():
         parser.error("Duplicate scenarios/models would write the same diagnostic files")
     if args.scenario_workers:
         if any((args.pair, args.compare_parallel, args.compare_compile, args.compare_storage,
-                args.stage_storage, args.compare_gradient_batch)):
+                args.stage_storage, args.compare_gradient_batch, args.compare_bf16)):
             parser.error("--scenario-workers is separate from pair/compile/storage comparisons")
         if len(set(args.scenario_workers)) != len(args.scenario_workers):
             parser.error("Duplicate scenario worker limits would overwrite reports")
@@ -1166,6 +1188,8 @@ def main():
         flush=True,
     )
     results = []
+    if args.compare_bf16:
+        print("Precision | serial baseline=FP32 | candidate=BF16 mixed | same batches and planner budget", flush=True)
     if args.compare_gradient_batch:
         print(f"Planning | gradient_batches={args.compare_gradient_batch} | serial baseline={args.compare_gradient_batch[0]}", flush=True)
     if args.scenario_workers:
@@ -1174,13 +1198,14 @@ def main():
             f" | worker_runs={len(jobs) * (1 + len(args.scenario_workers))} | no memory prefilter",
             flush=True,
         )
-    if pairs or args.compare_compile or storage is not None or args.scenario_workers or args.compare_gradient_batch:
+    if pairs or args.compare_compile or storage is not None or args.scenario_workers or args.compare_gradient_batch or args.compare_bf16:
         if args.dry_run:
             print(
                 f"Comparison plan | serial={len(jobs)} | pairs={pairs}"
                 f" | compile_dreamer={args.compare_compile} | storage={storage}"
                 f" | scenario_workers={args.scenario_workers}"
                 f" | gradient_batches={args.compare_gradient_batch} | stage_storage={bool(args.stage_storage)}"
+                f" | bf16={args.compare_bf16}"
             )
         else:
             raise SystemExit(
@@ -1193,6 +1218,7 @@ def main():
                     storage=storage,
                     scenario_workers=args.scenario_workers,
                     gradient_batches=args.compare_gradient_batch,
+                    bf16=args.compare_bf16,
                 )
                 else 1
             )

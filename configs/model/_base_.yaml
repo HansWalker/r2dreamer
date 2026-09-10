@@ -6,6 +6,8 @@ imag_batch_size: ${actor_critic.imagine_batch_size}
 gamma: ${reward_discount}
 lamb: 0.95
 compile: False
+use_amp: true
+amp_dtype: bfloat16
 device: ${device}
 
 lr: 4e-5

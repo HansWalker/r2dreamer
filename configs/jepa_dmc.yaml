@@ -13,6 +13,7 @@ replay:
   sequence_length: 4
 
 jepa_model:
+  use_amp: true  # BF16 neural compute; FP32 losses, physical readout, and action optimization.
   history_size: 3
   goal:
     geometry: ${scenario.goal.geometry}

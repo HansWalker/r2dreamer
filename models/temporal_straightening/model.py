@@ -260,8 +260,11 @@ class TemporalStraightening(LatentPlanner):
         }
         if self.decoder is not None:
             image = self.encoder.target(obs)
-            reconstruction_loss = F.mse_loss(self.decoder(latent.detach()), image)
-            predicted_reconstruction_loss = F.mse_loss(self.decoder(prediction.detach()), image[:, 1:])
+            with self.amp_context():
+                reconstruction = self.decoder(latent.detach()).float()
+                predicted_reconstruction = self.decoder(prediction.detach()).float()
+            reconstruction_loss = F.mse_loss(reconstruction, image)
+            predicted_reconstruction_loss = F.mse_loss(predicted_reconstruction, image[:, 1:])
             decoder_loss = reconstruction_loss + predicted_reconstruction_loss
             loss = loss + self.decoder_weight * decoder_loss
             metrics.update(

@@ -184,7 +184,7 @@ def check_mamba3():
         storm = compose(config_name="storm_dmc_mamba_vision")
 
     configs = (
-        ("Dreamer", dreamer.model.deter, dreamer.model.rssm.mamba3, torch.float16, dreamer.replay.batch_size),
+        ("Dreamer", dreamer.model.deter, dreamer.model.rssm.mamba3, getattr(torch, dreamer.model.amp_dtype), dreamer.replay.batch_size),
         (
             "STORM",
             storm.storm_model.hidden_dim,

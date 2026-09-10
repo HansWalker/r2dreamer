@@ -219,16 +219,16 @@ To stage all scenarios for production, run `python -m scripts.stage_dmc_data --s
 `--override stages.collect=false`. Run outputs/checkpoints remain at the configured persistent location.
 The local copy must fit on disk; staging all three image datasets can require substantial space.
 
-Temporal Straightening now uses 256 candidate trajectories per planning autograd pass. Model weights
-are temporarily frozen during action optimization; action gradients, candidates, iterations, and
-horizons are unchanged. Action embeddings and masks are reused, and the goal readout only decodes
+Temporal Straightening uses 256 candidate trajectories per planning autograd pass and 32 planning
+iterations. Model weights are temporarily frozen during action optimization; action gradients,
+candidate counts, and horizons are preserved. Action embeddings and masks are reused, and the goal readout only decodes
 the required trajectory tail. One larger pass is not a guaranteed 2x speedup.
 
 ```bash
 bash scripts/run_planner_benchmark.sh --dataset-root /absolute/path/to/data/dmc_expert_vision
 ```
 
-This targets TS and LeWorldModel on ball-in-cup, compares TS gradient batches 128 and 256, interleaves
+This targets TS and LeWorldModel on ball-in-cup, compares FP32 against BF16 mixed precision, interleaves
 online updates with real collection, and profiles short deterministic evaluations at batch sizes 5
 and 50. It uses production-sized models and saves no checkpoints. Options can be overridden, including
 `--scenarios cartpole_balance_sparse reacher ball_in_cup`. The test is not a task-performance evaluation.
@@ -237,16 +237,20 @@ and 50. It uses production-sized models and saves no checkpoints. Options can be
 Evaluation timings separate reset, first-call, and warm-step costs. The compact summary shows
 `batch:warm,reset,first` seconds; JSON also separates policy/bookkeeping from environment stepping.
 At least two evaluation steps are needed for a warm estimate. Short episodes do not bound late-episode memory.
+Both precision cases use the same current planner iterations and candidate batches. The report measures
+speed and memory, not equivalent task performance. There is no expert-data collection, dataset audit,
+or dependency check. Use `--compare-bf16` with `run_training_smoke.sh` to select other models.
 
 Generate an ordered phase breakdown from a complete report (later reports replace matching cases):
 
 ```bash
-python -m scripts.estimate_runtime --report runs/scenario_concurrency/report.json runs/planner_check/report.json
+python -m scripts.estimate_runtime --report runs/scenario_concurrency/report.json runs/planner_bf16_check/report.json
 ```
 
 `runs/runtime_estimate/schedule.md` and `schedule.json` group concurrent training jobs, keep final
 evaluations serial, and separate pretraining, online updates, collection, and evaluation estimates.
 For TS, the estimator selects the measured gradient-batch case matching the production setting.
+Rows with outdated precision or planner budgets are marked missing rather than used for new estimates.
 Evaluation projections count startup/reset once per batch and extrapolate only warm steps.
 Older reports without this split use the labelled collection-rate fallback, not reset-inclusive averages.
 Unmeasured state-prediction evaluation and checkpoint I/O are explicitly excluded. Existing timings
@@ -529,9 +533,17 @@ The goal planners use task-relation outputs of the detached physical readout. Du
 optimization its weights are fixed, but gradients can pass through it and the dynamics to candidate
 actions. Planning and evaluation share the same autoregressive rollout implementation.
 Temporal Straightening computes action gradients in batches of at most
-`jepa_model.planner.gradient_batch_size=32` candidate trajectories. This bounds planning memory
+`jepa_model.planner.gradient_batch_size=256` candidate trajectories. This bounds planning memory
 without changing the number of environments, restarts, iterations, or future steps, and preserves
 the full-batch cost normalization. The batch size is an execution setting, not a checkpoint recipe.
+
+CUDA runs use BF16 mixed precision for neural computation, including the goal planners and Dreamer's
+history reconstruction and acting. Parameters and optimizer state remain FP32; curvature, SIGReg,
+physical readouts, goal costs, TD targets, and action optimization remain FP32. S5 retains complex64
+dynamics and Hyena retains FP32 FFTs. CPU runs use FP32. Disable AMP with `model.use_amp=false`
+(Dreamer), `jepa_model.use_amp=false` (TS/LeWorldModel), or `tdmpc2_model.use_amp=false` (TD-MPC2).
+STORM retains its existing `storm_model.use_amp` and `actor_critic.use_amp` switches. Precision is part
+of the run identity; these settings are not intended to silently resume an older-precision experiment.
 
 The shared trainer does not impose one optimizer or update rule on every family. Dreamer keeps its
 joint world-model/actor-critic update; STORM keeps one separate world-model and imagined actor-critic

@@ -34,6 +34,7 @@ class LatentPlanner(nn.Module):
         self.sequence_length = self.history_size + 1
         self.grad_clip = float(settings.optim.grad_clip)
         self.planner = settings.planner
+        self.use_amp = bool(settings.use_amp)
         goal = settings.goal
         self.goal_geometry = str(goal.geometry)
         if self.goal_geometry not in {"radial", "box"}:
@@ -66,10 +67,15 @@ class LatentPlanner(nn.Module):
         return next(self.parameters()).device
 
     def encode(self, obs):
-        return self.projector(self.encoder(obs))
+        with self.amp_context():
+            return self.projector(self.encoder(obs)).float()
 
     def predict(self, state, action):
-        return self.pred_projector(self.predictor(state, self.action_encoder(action)))
+        with self.amp_context():
+            return self.pred_projector(self.predictor(state, self.action_encoder(action))).float()
+
+    def amp_context(self):
+        return torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.use_amp and self.device.type == "cuda")
 
     @staticmethod
     def replay_observation(history):
@@ -121,6 +127,11 @@ class LatentPlanner(nn.Module):
 
     def rollout(self, history, past_action, candidates):
         """Predict action candidates [batch, samples, horizon, action] from encoded history."""
+        # Autocast only the neural rollout, not goal costs or the action optimizer.
+        with self.amp_context():
+            return self._rollout(history, past_action, candidates).float()
+
+    def _rollout(self, history, past_action, candidates):
         batch, samples, horizon, _ = candidates.shape
         latent_shape = history.shape[2:]
         state = (

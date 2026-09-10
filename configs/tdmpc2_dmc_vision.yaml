@@ -16,6 +16,7 @@ replay:
   sequence_length: 4
 
 tdmpc2_model:
+  use_amp: true  # BF16 neural compute; FP32 distributions, targets, and optimizer state.
   frame_stack: 3
   num_channels: 32
   mlp_dim: 539
