@@ -248,6 +248,7 @@ class OnlineSession:
             metrics.update(agent.update(
                 imagined["feat"],
                 imagined["action"],
+                raw_action=imagined["raw_action"],
                 reward=imagined["reward"],
                 termination=imagined["terminal"],
             ))

@@ -500,6 +500,52 @@ python3 -m scripts.evaluate_dmc \
   --dataset "$DMC_EXPERT_VISION_DATA_DIR/cartpole_balance_sparse"
 ```
 
+### Readout And Representation Diagnostics
+
+Compare LeWorldModel and Temporal Straightening's `pretrained.pt` and `final.pt`
+on identical held-out expert windows, across all three scenarios:
+
+```bash
+bash scripts/run_readout_diagnostics.sh \
+  --run-root runs/dmc_vision_10k \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision
+cat runs/readout_diagnostics/summary.txt
+```
+
+No training, checkpoint writes, simulator episodes, or planner optimization run.
+The script reads the saved training configurations, checks checkpoint/dataset identities,
+and samples 64 common windows per scenario, half uniform and half motion-selected.
+Use `--scenarios ball_in_cup` or `--models temporal_straightening` to narrow the run.
+`--device cpu` is supported; CUDA is the default.
+
+- **Readout:** Compare physical errors from real-image latents against open-loop
+  predicted latents at horizons 1, 5, 10, 25, 50, and 100. The CSV includes original-unit
+  RMSE, expert normalization scales, and each coordinate's contribution to normalized
+  error. Both true-state and decoded-state persistence baselines are included.
+- **Representation:** Compare centered latent variance, effective covariance rank,
+  temporal change, latent forecast errors, and response to zero/random future actions.
+  TS patches retain their ordering rather than being averaged away.
+
+The compact `summary.txt`, detailed `report.json` (including exact windows and cohort
+breakdowns), and `physical_errors.csv` are saved under `runs/readout_diagnostics`.
+Increasing real-image decoding error points to a readout/representation problem;
+good decoding but poor forecasting points toward dynamics. Tiny expert scales can
+inflate normalized errors, so inspect original-unit RMSE too. Falling variance/rank
+and weak action sensitivity are warning signs, not proof of collapse. Sensitivity is
+not counterfactual accuracy, and successful expert trajectories do not establish
+accuracy on failed online-policy states. Compare latent statistics within each model,
+not absolute values across architectures.
+
+Run the CPU regression tests independently:
+
+```bash
+../environment/bin/python -m scripts.check_planning_diagnostics
+```
+
+These cover analytically known errors/ranks, action-blind predictors, held-out-only
+sampling, batch invariance, report serialization, and both real model implementations
+without fitting, future-image leakage, or mutation of weights/normalization buffers.
+
 ## Training Budget
 
 Every family receives 10,000 expert updates and 10,000 online
@@ -523,6 +569,19 @@ record both observation and dynamics-target counts. Use a fresh training output 
 recipe; existing collected datasets remain compatible.
 
 ## Models
+
+### Actor Objective Regression Checks
+
+Run `python -m scripts.check_policy_objectives` for CPU checks of saturated-action
+scores/gradients, STORM return targets, expert-to-online updates, and checkpoint compatibility.
+No dataset, environment rollout, or checkpoint writes are required.
+
+Dreamer and STORM training recipe 3 retains pre-tanh samples for online actor scoring;
+STORM also bootstraps transition returns from the next-state value. Old online checkpoints
+from these families must not resume corrected training. Dreamer recipe-2 expert checkpoints
+remain compatible because expert BC is unchanged; STORM needs fresh expert and online
+training. Other families' recipes are unchanged. Old checkpoints remain evaluable with
+their original provenance. Keep corrected results in a separate output directory.
 
 The five Dreamer variants share their convolutional encoder/decoder, posterior, prior, and losses;
 only the deterministic sequence core changes. The five STORM variants share their

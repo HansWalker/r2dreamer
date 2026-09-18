@@ -123,6 +123,12 @@ class ActorCriticAgent(nn.Module):
             return dist.sample()
 
     @torch.no_grad()
+    def sample_with_raw(self, feature: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        self.eval()
+        with self._amp():
+            return self.dist(feature).sample_with_raw()
+
+    @torch.no_grad()
     def update_slow_critic(self, decay: float | None = None):
         decay = float(decay if decay is not None else self.slow_critic_decay)
         for slow, parameter in zip(self.slow_critic.parameters(), self.critic.parameters(), strict=True):
@@ -136,7 +142,10 @@ class ActorCriticAgent(nn.Module):
         termination: torch.Tensor,
         *,
         expert: bool = False,
+        raw_action: torch.Tensor | None = None,
     ) -> Mapping[str, torch.Tensor]:
+        if not expert and raw_action is None:
+            raise ValueError("STORM online actor updates require pre-squash action samples.")
         self.train()
         latent = latent.detach()
         for skipped in range(32):
@@ -144,7 +153,9 @@ class ActorCriticAgent(nn.Module):
             with self._amp():
                 dist = self.dist(latent[:, :-1])
                 raw_value = self.critic(latent)
-                log_prob = dist.log_prob(action.to(torch.float32))
+                log_prob = dist.log_prob(
+                    action.to(torch.float32), raw=None if expert else raw_action.detach().float()
+                )
                 value = self.twohot.decode(raw_value)
                 slow_value = self.slow_value(latent)
                 returns = lambda_return(reward, value, termination, self.gamma, self.lambd)

@@ -73,9 +73,13 @@ class TanhNormal:
         self.normal = Normal(mean, std)
 
     def sample(self) -> tuple[torch.Tensor, torch.Tensor]:
+        action, raw = self.sample_with_raw()
+        return action, self.log_prob(action, raw)
+
+    def sample_with_raw(self) -> tuple[torch.Tensor, torch.Tensor]:
         raw = self.normal.rsample()
         action = torch.tanh(raw)
-        return action, self.log_prob(action, raw)
+        return action, raw
 
     def mode(self) -> torch.Tensor:
         return torch.tanh(self.mean)
@@ -101,15 +105,16 @@ def percentile(x: torch.Tensor, percentage: float) -> torch.Tensor:
 
 
 def lambda_return(reward, value, termination, gamma: float, lambd: float) -> torch.Tensor:
-    termination = termination.squeeze(-1) if termination.shape[-1] == 1 else termination
-    reward = reward.squeeze(-1) if reward.shape[-1] == 1 else reward
-    value = value.squeeze(-1) if value.shape[-1] == 1 else value
+    """Transition t uses reward[t], termination[t], and the next-state value[t + 1]."""
+    termination = termination.squeeze(-1) if termination.ndim == 3 else termination
+    reward = reward.squeeze(-1) if reward.ndim == 3 else reward
+    value = value.squeeze(-1) if value.ndim == 3 else value
     cont = 1.0 - termination.to(value.dtype)
     returns = torch.zeros_like(value)
     returns[:, -1] = value[:, -1]
     for idx in reversed(range(reward.shape[1])):
         returns[:, idx] = reward[:, idx] + gamma * cont[:, idx] * (
-            (1 - lambd) * value[:, idx] + lambd * returns[:, idx + 1]
+            (1 - lambd) * value[:, idx + 1] + lambd * returns[:, idx + 1]
         )
     return returns[:, :-1].unsqueeze(-1)
 

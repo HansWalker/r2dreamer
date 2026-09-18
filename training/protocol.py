@@ -167,7 +167,9 @@ def checkpoint_compatibility(config):
         "temporal_straightening": ("jepa_model",),
     }[str(config.model_family)]
     model = {key: training[key] for key in ("model_io", "state_head", *components)}
-    result = {"schema": CHECKPOINT_SCHEMA, "recipe_version": TRAINING_RECIPE_VERSION}
+    # Actor scoring changed for both families; STORM's expert value targets changed too.
+    recipe_version = 3 if str(config.model_family) in {"dreamer", "storm"} else TRAINING_RECIPE_VERSION
+    result = {"schema": CHECKPOINT_SCHEMA, "recipe_version": recipe_version}
     for name, settings in (("model", model), ("training", training)):
         encoded = json.dumps(settings, sort_keys=True, separators=(",", ":")).encode()
         result[f"{name}_sha256"] = hashlib.sha256(encoded).hexdigest()
@@ -419,6 +421,8 @@ def validate_checkpoint(checkpoint, config, *, training=True):
         raise ValueError(f"Checkpoint belongs to a different experiment: {details}.")
     compatibility = checkpoint.get("compatibility")
     if compatibility is None:
+        if training and str(config.model_family) in {"dreamer", "storm"}:
+            raise ValueError("Legacy checkpoint cannot verify the corrected actor-training recipe.")
         # Older checkpoints have only a recipe hash. Keep that conservative check, but not a source-file lock.
         if actual.get("training_config_sha256") != expected["training_config_sha256"]:
             raise ValueError(
@@ -429,6 +433,15 @@ def validate_checkpoint(checkpoint, config, *, training=True):
         if training:
             required += ("recipe_version", "training_sha256")
         expected_compatibility = checkpoint_compatibility(config)
+        if (
+            training
+            and str(config.model_family) == "dreamer"
+            and checkpoint.get("phase") == "expert"
+            and compatibility.get("recipe_version") == 2
+            and expected_compatibility["recipe_version"] == 3
+        ):
+            # Expert BC is unchanged; only the subsequent online actor scoring was corrected.
+            required = tuple(key for key in required if key != "recipe_version")
         mismatches = [key for key in required if compatibility.get(key) != expected_compatibility[key]]
         if mismatches:
             purpose = "training" if training else "evaluation"

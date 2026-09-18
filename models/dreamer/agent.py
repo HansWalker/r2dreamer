@@ -301,7 +301,7 @@ class Dreamer(DreamerModel):
         )
         # Do not cache detached weight casts for later actor/value training forwards.
         with torch.no_grad(), self.amp_context(cache_enabled=False):
-            imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
+            imag_feat, imag_raw_action = self._imagine(start, self.imag_horizon + 1)
 
             # (B*K, T_imag, 1)
             imag_reward = self.reward(imag_feat).mode()
@@ -318,7 +318,7 @@ class Dreamer(DreamerModel):
             adv = (ret - imag_value[:, :-1]) / ret_scale
 
         policy = self.actor(imag_feat.detach())
-        logpi = policy.log_prob(imag_action.detach())[:, :-1].unsqueeze(-1)
+        logpi = policy.log_prob_from_raw(imag_raw_action.detach())[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
         losses["policy"] = torch.mean(weight[:, :-1] * -(logpi * adv.detach() + self.act_entropy * entropy))
         losses["value"] = self._value_loss(
@@ -401,10 +401,10 @@ class Dreamer(DreamerModel):
         return self._backward_losses(losses, metrics), feat.detach()
 
     def _imagine(self, start, imag_horizon):
-        """Roll out the policy in latent space."""
+        """Return imagined features and pre-squash samples for actor scoring."""
         # (B, S, K), (B, D), optional recurrent/context tensors
         feats = []
-        actions = []
+        raw_actions = []
         stoch, deter, *cache = start
         cache = tuple(value.clone() for value in cache)
         with self.rssm.sequence_context(stoch):
@@ -412,15 +412,15 @@ class Dreamer(DreamerModel):
                 # (B, F)
                 feat = self.rssm.get_feat(stoch, deter)
                 # (B, A)
-                action = self.actor(feat).rsample()
+                action, raw_action = self.actor(feat).rsample_with_raw()
                 # Append feat and its corresponding sampled action at the same time step.
                 feats.append(feat)
-                actions.append(action)
+                raw_actions.append(raw_action)
                 stoch, deter, cache = self.rssm.imagine_step(stoch, deter, action, cache)
 
         # Stack along sequence dim T_imag.
         # (B, T_imag, F), (B, T_imag, A)
-        return torch.stack(feats, dim=1), torch.stack(actions, dim=1)
+        return torch.stack(feats, dim=1), torch.stack(raw_actions, dim=1)
 
     def _lambda_return(self, last, term, reward, value, boot, disc, lamb):
         """

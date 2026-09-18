@@ -301,9 +301,9 @@ class WorldModel(nn.Module):
             stoch = categorical_sample(prior_logits).flatten(-2)
             deter = deter[:, 0]
             feats = [torch.cat([stoch, deter], dim=-1)]
-            actions, rewards, terminals = [], [], []
+            actions, raw_actions, rewards, terminals = [], [], [], []
             for _ in range(int(horizon)):
-                action, _ = actor_critic.sample(feats[-1], deterministic=False)
+                action, raw_action = actor_critic.sample_with_raw(feats[-1])
                 next_deter, cache = self.sequence_core.step(stoch.unsqueeze(1), action.unsqueeze(1), cache)
                 next_deter = next_deter[:, 0]
                 reward = self.reward.decode(self.reward(next_deter))
@@ -313,12 +313,14 @@ class WorldModel(nn.Module):
                 stoch = categorical_sample(prior_logits).flatten(-2)
                 deter = next_deter
                 actions.append(action)
+                raw_actions.append(raw_action)
                 rewards.append(reward)
                 terminals.append(terminal)
                 feats.append(torch.cat([stoch, deter], dim=-1))
             return {
                 "feat": torch.stack(feats, dim=1),
                 "action": torch.stack(actions, dim=1),
+                "raw_action": torch.stack(raw_actions, dim=1),
                 "reward": torch.stack(rewards, dim=1),
                 "terminal": torch.stack(terminals, dim=1),
             }

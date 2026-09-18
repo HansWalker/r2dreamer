@@ -141,6 +141,16 @@ class TanhNormal(torchd.TransformedDistribution):
         # Expert actions and float32 tanh can reach +/-1, where atanh is infinite.
         return super().log_prob(action.float().clamp(-1.0 + 1e-6, 1.0 - 1e-6))
 
+    def rsample_with_raw(self):
+        raw = self.base_dist.rsample()
+        return raw.tanh(), raw
+
+    def log_prob_from_raw(self, raw):
+        # Online score-function updates retain the sample before tanh loses precision.
+        raw = raw.float()
+        correction = self.transforms[0].log_abs_det_jacobian(raw, raw.tanh()).sum(-1)
+        return self.base_dist.log_prob(raw) - correction
+
     def entropy(self):
         # Reparameterized estimate: H(tanh(X)) = H(X) + E[log |tanh'(X)|].
         raw = self.base_dist.rsample()
