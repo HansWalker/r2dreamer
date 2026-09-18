@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import traceback
+from contextlib import ExitStack
 from pathlib import Path
 
 from hydra import compose, initialize_config_dir
@@ -255,6 +256,7 @@ def run_worker(job):
     from envs import close_envs, make_envs, make_eval_envs
     from training import load_model_family
     from training.protocol import validate_training_recipe
+    from training.readout import online_readout
 
     config = OmegaConf.create(job["config"])
     result = {
@@ -271,6 +273,7 @@ def run_worker(job):
     device = torch.device(config.device)
     monitor = None
     envs = None
+    resources = ExitStack()
     stop = threading.Event()
     started = time.perf_counter()
     compilation_counters = None
@@ -388,6 +391,7 @@ def run_worker(job):
             }
             if hasattr(model, "configure_online"):
                 model.configure_online(int(config.training.online.updates), resumed=False)
+            measure("readout_dataset_open", lambda: resources.enter_context(online_readout(config, family, model)))
             burst = job.get("online_burst", 0)
             if not burst:
                 for step in range(job["updates"]):
@@ -442,6 +446,7 @@ def run_worker(job):
         traceback.print_exc()
     finally:
         close_envs(envs)
+        resources.close()
         stop.set()
         if monitor is not None:
             monitor.join()

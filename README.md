@@ -428,12 +428,18 @@ already supplies cosine/sine. Velocities remain useful history-dependent targets
 can be uniquely recovered from one frame. Pixel resolution and occlusion still limit observability.
 Existing HDF5 observations and collection metadata are unchanged; no recollection is needed.
 
-Its own Adam optimizer minimizes scaled state MSE on detached observed features, using 256
-targets per model update. The training/output scale is **1 for sine/cosine coordinates** and the
-expert standard deviation (floored at 1e-3) for other coordinates. This prevents nearly constant
-expert angles from dominating the online head loss. Expert means and standard deviations stay
-fixed and separate for evaluation: nMSE keeps its original meaning, including sensitivity to small
-expert variance. Both scales are saved with the head. Online-only runs use zero mean and unit scale.
+Its own Adam optimizer minimizes Smooth L1 state error (beta=1, unit physical-coordinate scales)
+on detached observed features, using 256 targets per model update. Features are recomputed in
+inference mode after the native update, without changing native RNG or BatchNorm statistics.
+The output affine is preserved on checkpoint load, independently of loss scaling. Expert means
+and standard deviations remain fixed for evaluation: nMSE keeps its original meaning, including
+sensitivity to small expert variance. Online readout updates use LR 3e-5, a 100-update linear
+warmup, and fresh Adam moments. Half of the existing 256 labels come from training-split expert
+windows encoded by the current model; the other half come from online replay. This is **only an
+auxiliary readout change**, not expert replay for the native representation or control losses.
+The separate expert sampler and online head counter are checkpointed for resumption. Its dataset
+statistics are not rescanned. Online-only runs without a dataset must explicitly set
+`state_head.online.expert_fraction=0`; they use zero mean and unit output scale.
 No physical-state, reward, or planning loss from this head updates the native representation or dynamics. Online replay
 computes identical labels from the simulator. The held-out range supplies prediction evaluation data.
 Dataset metadata fingerprints the expert checkpoint, collector, external TD-MPC2 source, and collection
@@ -568,11 +574,17 @@ is preserved, not shortened to the smoke budget. `--env-steps` changes only the 
 matching held-out datasets are required; incompatible or online checkpoints are rejected.
 
 Prediction-preserving migration is checked before training. The same 16 held-out windows are
-scored before and after, with context 64 and horizons 1/100, without fitting. Reports include
+scored before, every 64 updates, and after, with context 64 and horizons 1/100, without fitting. Reports include
 original-unit RMSE, unchanged expert-normalized nMSE, representation diagnostics, online losses,
 and the source checkpoint identity. A timestamped `runs/online_checkpoint_smoke_*` directory holds
 `summary.txt`, `report.json`, and per-worker logs/metrics; `--output` must name a new directory.
-PASS means the migration and finite optimizer updates ran, not that long-run degradation is solved.
+PASS includes an observed-state regression guard, not proof that long-run degradation is solved.
+REGRESSION distinguishes finite execution with degraded predictions from an execution failure.
+By default each observed-state RMSE must stay below `3 * max(initial RMSE, 0.01)` in original units,
+and mean nMSE below `9 * max(initial nMSE, 1)`, at every diagnostic snapshot. These are explicit
+smoke alarms, not significance tests or model-selection criteria; forecast errors remain reported.
+Only training-split expert labels are used by the head. Diagnostic windows never supply gradients,
+and the declared online schedule runs to its stopping point even if a diagnostic flags regression.
 There is no repeated serial/concurrent benchmark or full dataset quality audit.
 
 Run `python -m scripts.check_online_checkpoint_smoke` for CPU regression checks using tiny models
@@ -611,11 +623,10 @@ No dataset, environment rollout, or checkpoint writes are required.
 Dreamer and STORM retain pre-tanh samples for online actor scoring; STORM also bootstraps
 transition returns from the next-state value (recipe 3 corrections).
 
-Training recipe 4 adds the shared physical-head scaling above. Old checkpoints remain evaluable
+Training recipe 5 adds the auxiliary readout stabilization above. Old checkpoints remain evaluable
 with exactly their original predictions and evaluation statistics. For training, Dreamer expert
-recipes 2/3, STORM expert recipe 3, and planning-family expert recipe 2 can be reused with otherwise
-identical settings. Loading their optimizer state upgrades the head's final affine layer while
-preserving physical predictions and resets only its Adam moments when the scale changes. Native
+recipes 2/3/4, STORM expert recipes 3/4, and planning-family expert recipes 2/4 can be reused with otherwise
+identical settings. Loading them preserves the head's affine layer and resets only its old Adam moments. Native
 weights, native optimizer state, and update counters are retained. This migration is not refitting
 or a repair of already degraded predictions. STORM recipe-2 expert weights still require fresh
 pretraining because of the return-target bug. Older online recipes cannot resume corrected training;

@@ -7,12 +7,13 @@ import copy
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
-from models.shared.physical_state import TARGET_VERSION, PhysicalStateHead
+from models.shared.physical_state import TARGET_VERSION, PhysicalStateHead, readout_mode
 from scripts.smoke_models import synthetic_batch
 from training import load_model_family
 
@@ -40,11 +41,21 @@ def tiny_config(family, scenario):
         ])
 
 
+def legacy_weights(weights, prefix="", version=1):
+    weights = copy.deepcopy(weights)
+    scale = weights.pop(prefix + "output_scale")
+    if version == 2:
+        weights[prefix + "training_scale"] = scale
+    del weights[prefix + "loss_scale"], weights[prefix + "online_updates"]
+    weights._metadata[prefix.rstrip(".")]["version"] = version
+    return weights
+
+
 class StateNormalizationTest(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(7)
 
-    def test_training_scales_are_coordinate_specific_and_eval_stats_are_unchanged(self):
+    def test_output_loss_and_evaluation_scales_have_distinct_roles(self):
         for scenario, angular in (
             ("cartpole_balance_sparse", [1, 2]), ("reacher", [0, 1, 2, 3]),
             ("ball_in_cup", []), ("point_mass", []),
@@ -58,9 +69,8 @@ class StateNormalizationTest(unittest.TestCase):
                 self.assertEqual(head.targets.trigonometric, angular)
                 torch.testing.assert_close(head.mean, mean, rtol=0, atol=0)
                 torch.testing.assert_close(head.std, std.clamp_min(1e-3), rtol=0, atol=0)
-                expected = std.clamp_min(1e-3)
-                expected[angular] = 1
-                torch.testing.assert_close(head.training_scale, expected, rtol=0, atol=0)
+                torch.testing.assert_close(head.output_scale, std.clamp_min(1e-3), rtol=0, atol=0)
+                torch.testing.assert_close(head.loss_scale, torch.ones(count), rtol=0, atol=0)
                 # Field order must not change which coordinates receive unit scale.
                 config.fields = dict(reversed(list(config.fields.items())))
                 reordered = PhysicalStateHead(8, config)
@@ -74,7 +84,8 @@ class StateNormalizationTest(unittest.TestCase):
         head.prepare_training()
         torch.testing.assert_close(head.mean, torch.zeros(5), rtol=0, atol=0)
         torch.testing.assert_close(head.std, torch.ones(5), rtol=0, atol=0)
-        torch.testing.assert_close(head.training_scale, torch.ones(5), rtol=0, atol=0)
+        torch.testing.assert_close(head.output_scale, torch.ones(5), rtol=0, atol=0)
+        torch.testing.assert_close(head.loss_scale, torch.ones(5), rtol=0, atol=0)
 
     def test_horizontal_pole_does_not_overwhelm_loss_and_features_stay_detached(self):
         head = PhysicalStateHead(8, settings())
@@ -85,10 +96,10 @@ class StateNormalizationTest(unittest.TestCase):
         features = torch.randn(2, 2, 8, requires_grad=True)
         labels = torch.tensor([.036, 0, 1, 0, 0]).expand(2, 2, -1)
         prediction = head(features)
-        expected = ((prediction - labels) / head.training_scale).square().mean()
+        expected = torch.nn.functional.smooth_l1_loss(prediction, labels)
         old_loss = ((prediction - labels) / head.std).square().mean()
         self.assertGreater(old_loss.item(), 200_000)
-        self.assertAlmostEqual(expected.item(), .6, places=6)
+        self.assertLess(expected.item(), 1)
         bias_gradients = []
         hook = head.readout[-1].bias.register_hook(lambda gradient: bias_gradients.append(gradient.clone()))
         metrics = head.fit(features, labels)
@@ -105,13 +116,10 @@ class StateNormalizationTest(unittest.TestCase):
             with self.subTest(history=history, tokens=tokens):
                 old = PhysicalStateHead(8, settings(), history=history, tokens=tokens)
                 old.set_stats([.06, 1, 0, .008, 0], [.036, .001, .01, .15, .21])
-                old.training_scale.copy_(old.std)
                 features = torch.randn(2, 5, tokens, 8, requires_grad=True)
                 labels = torch.randn(2, 5, 5)
                 old.fit(features, labels)
-                weights = copy.deepcopy(old.state_dict())
-                del weights["training_scale"]
-                weights._metadata[""]["version"] = 1
+                weights = legacy_weights(old.state_dict())
                 original = copy.deepcopy(weights)
                 optimizer = copy.deepcopy(old.optimizer.state_dict())
                 head = PhysicalStateHead(8, settings(), history=history, tokens=tokens)
@@ -127,8 +135,7 @@ class StateNormalizationTest(unittest.TestCase):
                 torch.testing.assert_close(after, before, rtol=2e-5, atol=1e-7)
                 for name, value in original.items():
                     torch.testing.assert_close(weights[name], value, rtol=0, atol=0)
-                    if not name.startswith("readout.2."):
-                        torch.testing.assert_close(head.state_dict()[name], value, rtol=0, atol=0)
+                    torch.testing.assert_close(head.state_dict()[name], value, rtol=0, atol=0)
                 migrated = copy.deepcopy(head.state_dict())
                 head.set_stats(old.mean, old.std)
                 head.prepare_training()
@@ -142,10 +149,12 @@ class StateNormalizationTest(unittest.TestCase):
         head = PhysicalStateHead(8, settings(), history=3, tokens=2)
         head.set_stats([0, 1, 0, 0, 0], [.03, .001, .01, .15, .21])
         features, labels = torch.randn(2, 5, 2, 8), torch.randn(2, 5, 5)
+        head.configure_online(lambda: (features, labels))
         head.fit(features, labels)
         restored = PhysicalStateHead(8, settings(), history=3, tokens=2)
         restored.load_state_dict(copy.deepcopy(head.state_dict()))
         restored.load_optimizer_state_dict(copy.deepcopy(head.optimizer.state_dict()))
+        restored.configure_online(lambda: (features, labels), resumed=True)
         self.assertTrue(restored.optimizer.state)
         restored.set_stats(head.mean, head.std)
         for instance in (head, restored):
@@ -153,34 +162,82 @@ class StateNormalizationTest(unittest.TestCase):
         for name, value in head.state_dict().items():
             torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
 
-    def test_unchanged_legacy_scale_keeps_optimizer(self):
+    def test_v2_affine_is_preserved_but_old_loss_moments_are_reset(self):
         head = PhysicalStateHead(8, settings("ball_in_cup"))
         head.set_stats(torch.zeros(8), torch.linspace(.01, .2, 8))
         head.fit(torch.randn(2, 3, 8), torch.randn(2, 3, 8))
-        weights = copy.deepcopy(head.state_dict())
-        del weights["training_scale"]
-        weights._metadata[""]["version"] = 1
+        head.output_scale.fill_(1)
+        weights = legacy_weights(head.state_dict(), version=2)
         restored = PhysicalStateHead(8, settings("ball_in_cup"))
         restored.load_state_dict(weights)
         restored.load_optimizer_state_dict(copy.deepcopy(head.optimizer.state_dict()))
-        self.assertTrue(restored.optimizer.state)
+        self.assertFalse(restored.optimizer.state)
         for name, value in head.state_dict().items():
             torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
 
     def test_missing_unrelated_weights_are_still_rejected(self):
         head = PhysicalStateHead(8, settings())
-        weights = copy.deepcopy(head.state_dict())
-        del weights["training_scale"], weights["project.0.weight"]
-        weights._metadata[""]["version"] = 1
+        weights = legacy_weights(head.state_dict())
+        del weights["project.0.weight"]
         with self.assertRaisesRegex(RuntimeError, "project.0.weight"):
             head.load_state_dict(weights)
 
-    def test_modern_checkpoint_requires_its_training_scale(self):
+    def test_modern_checkpoint_requires_its_scales(self):
         head = PhysicalStateHead(8, settings())
         weights = copy.deepcopy(head.state_dict())
-        del weights["training_scale"]
-        with self.assertRaisesRegex(RuntimeError, "training_scale"):
+        del weights["output_scale"]
+        with self.assertRaisesRegex(RuntimeError, "output_scale"):
             head.load_state_dict(weights)
+
+    def test_online_budget_warmup_and_detachment(self):
+        head = PhysicalStateHead(8, settings())
+        x, y = torch.randn(2, 3, 8, requires_grad=True), torch.randn(2, 3, 5)
+        expert = torch.randn(2, 3, 8, requires_grad=True)
+        with self.assertRaisesRegex(ValueError, "expert source"):
+            head.configure_online(None)
+        head.configure_online(lambda: (expert, y))
+        metrics = head.fit(x, y)
+        self.assertEqual(metrics["state/expert_examples"], 2)
+        self.assertEqual(metrics["state/examples"], 4)
+        self.assertAlmostEqual(metrics["state/lr"], 3e-7)
+        self.assertEqual(head.online_updates.item(), 1)
+        self.assertIsNone(x.grad)
+        self.assertIsNone(expert.grad)
+
+    def test_feature_extraction_preserves_rng_bn_and_individual_modes(self):
+        model = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.BatchNorm1d(8), torch.nn.Dropout(.5))
+        model[2].eval()
+        rng = torch.get_rng_state().clone()
+        state = copy.deepcopy(model.state_dict())
+        with readout_mode(model):
+            self.assertFalse(model.training)
+            output = model(torch.rand(4, 8))
+            self.assertFalse(output.requires_grad)
+        torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+        self.assertTrue(model[1].training)
+        self.assertFalse(model[2].training)
+        for key, value in state.items():
+            torch.testing.assert_close(model.state_dict()[key], value, rtol=0, atol=0)
+
+    def test_readout_features_do_not_change_native_expert_updates(self):
+        for name in ("dreamer", "storm", "tdmpc2", "leworldmodel", "temporal_straightening"):
+            with self.subTest(family=name):
+                config = tiny_config(name, "cartpole_balance_sparse")
+                family = load_model_family(name)
+                left, right = family.build_model(config), family.build_model(config)
+                right.load_state_dict(left.state_dict())
+                batch, _, _ = synthetic_batch(config, left)
+                rng = torch.get_rng_state().clone()
+                family.expert_update(left, batch)
+                after_rng = torch.get_rng_state().clone()
+                torch.set_rng_state(rng)
+                feature_owner = right.world_model if name == "storm" else right
+                with patch.object(feature_owner, "readout_features", return_value=(None, None)), patch.object(right.state_head, "fit", return_value={}):
+                    family.expert_update(right, batch)
+                torch.testing.assert_close(torch.get_rng_state(), after_rng, rtol=0, atol=0)
+                for key, value in left.state_dict().items():
+                    if "state_head." not in key:
+                        torch.testing.assert_close(right.state_dict()[key], value, rtol=0, atol=0)
 
     def test_all_family_checkpoint_paths_migrate_and_preserve_native_state(self):
         for family in ("dreamer", "storm", "tdmpc2", "leworldmodel", "temporal_straightening"):
@@ -192,19 +249,17 @@ class StateNormalizationTest(unittest.TestCase):
                     head = model.state_head
                     count = len(head.coordinates)
                     head.set_stats(torch.zeros(count), torch.linspace(.001, .2, count))
-                    head.training_scale.copy_(head.std)
                     batch, _, _ = synthetic_batch(config, model)
                     adapter.expert_update(model, batch)
                     payload = copy.deepcopy(adapter.checkpoint(model))
                     state_key = {"dreamer": "agent_state_dict", "storm": "world_model"}.get(family, "model_state_dict")
-                    del payload[state_key]["state_head.training_scale"]
-                    payload[state_key]._metadata["state_head"]["version"] = 1
+                    payload[state_key] = legacy_weights(payload[state_key], "state_head.")
                     restored = adapter.build_model(config)
                     adapter.load_checkpoint(restored, copy.deepcopy(payload), training=False)
                     for name, value in model.state_dict().items():
                         torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
                     adapter.load_checkpoint(restored, copy.deepcopy(payload), training=True)
-                    self.assertEqual(bool(restored.state_head.optimizer.state), scenario == "ball_in_cup")
+                    self.assertFalse(restored.state_head.optimizer.state)
                     for name, value in model.state_dict().items():
                         if "state_head." not in name:
                             torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)

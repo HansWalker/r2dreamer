@@ -31,3 +31,6 @@ class StormModel(nn.Module):
     @property
     def state_head(self):
         return self.world_model.state_head
+
+    def readout_features(self, batch):
+        return self.world_model.readout_features(batch)

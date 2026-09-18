@@ -1,6 +1,7 @@
 """Replay views over dense DMC expert datasets."""
 
 import math
+from functools import cached_property
 from pathlib import Path
 
 import h5py
@@ -62,9 +63,20 @@ class DMCExpertDataset:
         train_episodes = split_episode_indices(self.metadata, "train", len(self.lengths))
         self.episodes = train_episodes[self.lengths[train_episodes] > 0]
         self._validate_episode_count()
-        self.state_mean, self.state_std = self._state_stats()
         self._episode_order = np.array([], dtype=np.int64)
         self._episode_pos = 0
+
+    @cached_property
+    def state_stats(self):
+        return self._state_stats()
+
+    @property
+    def state_mean(self):
+        return self.state_stats[0]
+
+    @property
+    def state_std(self):
+        return self.state_stats[1]
 
     def close(self):
         self.h5.close()

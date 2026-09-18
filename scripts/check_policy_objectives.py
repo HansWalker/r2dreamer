@@ -165,7 +165,7 @@ class PolicyObjectivesTest(unittest.TestCase):
             config = config_for(name)
             family = str(config.model_family)
             compatibility = checkpoint_compatibility(config)
-            self.assertEqual(compatibility["recipe_version"], 4)
+            self.assertEqual(compatibility["recipe_version"], 5)
             identity = {
                 "protocol": "test", "model_family": family, "model_variant": "test",
                 "scenario": "test", "task": "test", "seed": 0,
@@ -173,6 +173,7 @@ class PolicyObjectivesTest(unittest.TestCase):
             checkpoint = {
                 "experiment_protocol": "test", "checkpoint_id": "test", "run_identity": identity,
                 "compatibility": {**compatibility, "recipe_version": 2},
+                "training_config": OmegaConf.to_container(config, resolve=True),
             }
             with patch("training.protocol.run_identity", return_value=identity):
                 for phase in ("expert", "online"):

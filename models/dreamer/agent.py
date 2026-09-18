@@ -7,7 +7,7 @@ from tensordict import TensorDict
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
 
-from models.shared.physical_state import STATE_KEY, PhysicalStateHead
+from models.shared.physical_state import STATE_KEY, PhysicalStateHead, readout_mode
 from optim import LaProp, clip_grad_agc_
 
 from .model import DreamerModel
@@ -148,6 +148,7 @@ class Dreamer(DreamerModel):
     def update(self, replay_buffer):
         """Sample a batch from replay and perform one optimization step."""
         contexts, data = replay_buffer.sample()
+        head_batch = (contexts, data)
         labels = data[STATE_KEY]
         data = data.exclude(STATE_KEY)
         p_data = self.preprocess(data)
@@ -163,11 +164,13 @@ class Dreamer(DreamerModel):
         else:
             raise RuntimeError("Dreamer gradients overflowed in 32 consecutive attempts.")
         metrics["opt/skipped_steps"] = skipped
+        feature, labels = self.readout_features(head_batch)
         metrics.update(self.state_head.fit(feature, labels))
         return metrics
 
     def update_expert_pretrain(self, data, contexts=None):
         """Perform one supervised expert update from a reconstructed replay state."""
+        head_batch = (contexts, data)
         labels = data[STATE_KEY]
         data = data.exclude(STATE_KEY)
         p_data = self.preprocess(data)
@@ -181,8 +184,20 @@ class Dreamer(DreamerModel):
         else:
             raise RuntimeError("Dreamer expert gradients overflowed in 32 consecutive attempts.")
         metrics["opt/skipped_steps"] = skipped
+        feature, labels = self.readout_features(head_batch)
         metrics.update(self.state_head.fit(feature, labels))
         return metrics
+
+    def readout_features(self, batch):
+        contexts, data = batch if isinstance(batch, tuple) else (None, batch)
+        data = data.to(self.device, non_blocking=True)
+        if contexts is not None:
+            contexts = [(context.to(self.device, non_blocking=True), starts) for context, starts in contexts]
+        with readout_mode(self), self.amp_context():
+            initial = self._replay_initial(contexts) if contexts is not None else self._initial_tuple(data.shape[0])
+            obs = self.preprocess(data.exclude(STATE_KEY))
+            post = self.rssm.observe(self.encoder(obs), obs["action"], initial, obs["is_first"], return_cache=False)
+            return self.rssm.get_feat(*post[:2]).float(), data[STATE_KEY]
 
     @torch.no_grad()
     def _replay_initial(self, contexts):

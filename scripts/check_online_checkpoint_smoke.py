@@ -25,11 +25,12 @@ from dmc_expert.storage import (
     dataset_identity,
     ensure_arrays,
 )
-from scripts.check_state_normalization import tiny_config
+from scripts.check_state_normalization import legacy_weights, tiny_config
 from scripts.smoke_models import synthetic_batch
-from scripts.smoke_online_checkpoints import diagnose, run_case, write_summary
+from scripts.smoke_online_checkpoints import accuracy_regression, diagnose, run_case, write_summary
 from training import load_model_family
 from training.protocol import checkpoint_compatibility, run_identity
+from training.readout import online_readout
 from training.trainer import online_update_target
 
 
@@ -70,6 +71,7 @@ def fixture(root, name):
     config.training.online.steps = 64
     config.training.online.updates = 8
     config.training.online.warmup_transitions = 8
+    config.state_head.samples_per_update = 2
     path = root / str(config.scenario.dataset)
     path.mkdir()
     metadata = {
@@ -79,6 +81,7 @@ def fixture(root, name):
         "observation_keys": ["position", "velocity"], "observation_shapes": {"position": [3], "velocity": [2]},
         "num_episodes": 3, "max_episode_steps": 128, "image_size": 64,
         "episode_splits": {"train": [0, 1], "heldout": [1, 3]},
+        "goal_relation": {**OmegaConf.to_container(config.scenario.goal, resolve=True), "shape": [2]},
     }
     (path / "metadata.json").write_text(json.dumps(metadata))
     with h5py.File(path / "data.hdf5", "w") as h5:
@@ -94,16 +97,16 @@ def fixture(root, name):
                 "actions": np.zeros((128, 1), np.float32), "rewards": np.ones((128, 1), np.float32),
                 "discounts": np.ones((128, 1), np.float32), "terminations": np.zeros((128, 1), np.uint8),
                 "truncations": truncation,
+                "goal_relations": np.stack((observations[:, 0], np.zeros(129)), axis=-1).astype(np.float32),
             }, 128)
     family = load_model_family(name)
     model = family.build_model(config)
     model.state_head.set_stats([0, 1, 0, 0, 0], [.04, .001, .01, .15, .21])
-    model.state_head.training_scale.copy_(model.state_head.std)
     batch, _, _ = synthetic_batch(config, model)
     family.expert_update(model, batch)
     checkpoint = family.checkpoint(model)
-    del checkpoint["model_state_dict"]["state_head.training_scale"]
-    checkpoint["model_state_dict"]._metadata["state_head"]["version"] = 1
+    key = {"dreamer": "agent_state_dict", "storm": "world_model"}.get(name, "model_state_dict")
+    checkpoint[key] = legacy_weights(checkpoint[key], "state_head.")
     checkpoint.update(
         phase="expert", expert_updates=1, checkpoint_id="test-expert", experiment_protocol=config.experiment_protocol,
         training_config=OmegaConf.to_container(config, resolve=True), run_identity=run_identity(config),
@@ -183,7 +186,6 @@ class OnlineCheckpointSmokeTest(unittest.TestCase):
                 with (
                     patch("scripts.smoke_online_checkpoints.make_envs", return_value=environment),
                     patch("torch.save", side_effect=AssertionError("Smoke must not save checkpoints")),
-                    patch("training.planning.build_replay", side_effect=AssertionError("No expert replay")),
                     patch("training.planning.expert_update", side_effect=AssertionError("No expert updates")),
                 ):
                     result = run_case(job)
@@ -201,7 +203,9 @@ class OnlineCheckpointSmokeTest(unittest.TestCase):
                 self.assertTrue(result["migration"]["head_optimizer_reset"])
                 self.assertLess(result["migration"]["max_prediction_difference"], 1e-6)
                 self.assertTrue(all(window["episode"] in (1, 2) for window in result["windows"]))
-                self.assertEqual(result["migration"]["training_scale"][1:3], [1, 1])
+                self.assertEqual(result["migration"]["output_scale"], result["migration"]["previous_output_scale"])
+                self.assertEqual(result["migration"]["loss_scale"], [1] * 5)
+                self.assertEqual(online["last_metrics"]["state/expert_examples"], 1)
                 before = result["before"]["all"]["physical"]["observed"]["1"]["rmse"]
                 after = result["after"]["all"]["physical"]["observed"]["1"]["rmse"]
                 self.assertNotEqual(before, after)
@@ -211,6 +215,41 @@ class OnlineCheckpointSmokeTest(unittest.TestCase):
                 report = json.loads((root / "report.json").read_text())
                 self.assertFalse(report["checkpoint_writes"])
                 self.assertFalse(report["evaluation_fitting"])
+
+    def test_large_finite_accuracy_regression_is_not_an_execution_pass(self):
+        def diagnostic(error):
+            return {"all": {"physical": {"observed": {"1": {"rmse": {"position[0]": error}, "mean_normalized_mse": error**2}}}}}
+        result = accuracy_regression(diagnostic(.002), diagnostic(.2))
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["failed_coordinates"], ["position[0]"])
+        before, after = diagnostic(.002), diagnostic(.002)
+        after["all"]["physical"]["observed"]["1"]["mean_normalized_mse"] = 10000
+        self.assertFalse(accuracy_regression(before, after)["passed"])
+
+    def test_readout_sampler_uses_only_train_split_and_resumes_exactly(self):
+        for name in ("dreamer", "storm", "tdmpc2", "leworldmodel", "temporal_straightening"):
+            with self.subTest(family=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config, _ = fixture(root, name)
+                config.training.expert.data_path = str(root / str(config.scenario.dataset))
+                original = OmegaConf.to_container(config, resolve=True)
+                family = load_model_family(name)
+                model = family.build_model(config)
+                with patch("dmc_expert.replay.DMCExpertDataset._state_stats", side_effect=AssertionError("No statistics rescan")):
+                    with online_readout(config, family, model) as replay:
+                        self.assertEqual(replay.episodes.tolist(), [0])
+                        saved = copy.deepcopy(replay.state_dict())
+                        expected = model.state_head._expert_source()
+                        model.state_head.fit(*expected)
+                        self.assertEqual(model.state_head.online_updates.item(), 1)
+                    self.assertFalse(replay.h5.id.valid)
+                    self.assertIsNone(model.state_head._expert_source)
+                    with online_readout(config, family, model, {"phase": "online", "readout_replay_state": saved}):
+                        self.assertEqual(model.state_head.online_updates.item(), 1)
+                        actual = model.state_head._expert_source()
+                        for left, right in zip(expected, actual):
+                            torch.testing.assert_close(left, right, rtol=0, atol=0)
+                self.assertEqual(OmegaConf.to_container(config, resolve=True), original)
 
     def test_online_or_incompatible_source_is_rejected_before_collection(self):
         with tempfile.TemporaryDirectory() as temporary:

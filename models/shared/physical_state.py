@@ -1,5 +1,7 @@
 """DMC physical targets and a readout trained only on detached world-model features."""
 
+from contextlib import contextmanager
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -7,6 +9,21 @@ from torch import nn
 
 STATE_KEY = "physical_state"
 TARGET_VERSION = "dmc_physical_state_v2"
+
+
+@contextmanager
+def readout_mode(model):
+    """Fresh inference features without modifying native RNG, gradients, or BN statistics."""
+    modes = [(module, module.training) for module in model.modules()]
+    device = next(model.parameters()).device
+    devices = [device.index or 0] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices), torch.no_grad():
+        model.eval()
+        try:
+            yield
+        finally:
+            for module, mode in modes:
+                module.training = mode
 
 
 class PhysicalStateTargets:
@@ -93,7 +110,7 @@ class PhysicalStateTargets:
 
 
 class PhysicalStateHead(nn.Module):
-    _version = 2
+    _version = 3
 
     def __init__(self, feature_dim, config, *, history=1, tokens=1):
         super().__init__()
@@ -104,6 +121,13 @@ class PhysicalStateHead(nn.Module):
         self.coordinates = self.targets.coordinates
         self.samples_per_update = int(config.samples_per_update)
         self.grad_clip = float(config.grad_clip)
+        online = getattr(config, "online", {})
+        self.online_lr = float(online.get("lr", 3e-5))
+        self.online_warmup = int(online.get("warmup_updates", 100))
+        self.expert_fraction = float(online.get("expert_fraction", 0.5))
+        self._expert_source = None
+        self._online = False
+        self._legacy_optimizer = False
         output_dim = len(self.coordinates)
         projection = int(config.projection_dim)
         hidden = int(config.hidden_dim)
@@ -114,51 +138,52 @@ class PhysicalStateHead(nn.Module):
                 nn.Linear(self.history * tokens * projection, hidden), nn.SiLU(), nn.Linear(hidden, output_dim)
             )
         self.register_buffer("mean", torch.zeros(output_dim))
-        # Expert statistics remain fixed for evaluation, independently of the training/output scale.
+        # Output units, training conditioning, and evaluation statistics have distinct roles.
         self.register_buffer("std", torch.ones(output_dim))
-        self.register_buffer("training_scale", torch.ones(output_dim))
+        self.register_buffer("output_scale", torch.ones(output_dim))
+        self.register_buffer("loss_scale", torch.ones(output_dim))
         self.register_buffer("updates", torch.zeros((), dtype=torch.long))
         self.register_buffer("examples", torch.zeros((), dtype=torch.long))
+        self.register_buffer("online_updates", torch.zeros((), dtype=torch.long))
         self.optimizer = torch.optim.Adam(self.parameters(), lr=float(config.lr))
 
     @torch.no_grad()
     def set_stats(self, mean, std):
         self.mean.copy_(torch.as_tensor(mean, device=self.mean.device))
         self.std.copy_(torch.as_tensor(std, device=self.std.device).clamp_min(1e-3))
-        if self.updates.item():
-            self.prepare_training()
-        else:
-            self.training_scale.copy_(self._training_scale())
-
-    def _training_scale(self):
-        scale = self.std.clone()
-        # Unit-amplitude angles must not inherit near-zero variance from successful expert poses.
-        scale[self.targets.trigonometric] = 1.0
-        return scale
+        if not self.updates.item():
+            # Preserve the expert initialization without rescaling trained readout weights.
+            self.output_scale.copy_(self.std)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, *args, **kwargs):
-        key = prefix + "training_scale"
-        if local_metadata.get("version", 1) < 2 and key not in state_dict and prefix + "std" in state_dict:
-            # Legacy inference keeps exactly its original affine output and evaluation statistics.
-            state_dict[key] = state_dict[prefix + "std"].clone()
+        self._legacy_optimizer = local_metadata.get("version", 1) < 3
+        if self._legacy_optimizer and prefix + "std" in state_dict:
+            state_dict[prefix + "output_scale"] = state_dict.pop(
+                prefix + "training_scale", state_dict[prefix + "std"].clone()
+            )
+            state_dict[prefix + "loss_scale"] = torch.ones_like(state_dict[prefix + "std"])
+            state_dict[prefix + "online_updates"] = self.online_updates.new_zeros(())
         super()._load_from_state_dict(state_dict, prefix, local_metadata, *args, **kwargs)
 
-    @torch.no_grad()
     def prepare_training(self):
-        """Upgrade a loaded head's conditioning without changing its physical predictions."""
-        scale = self._training_scale()
-        if torch.equal(scale, self.training_scale):
-            return
-        ratio = self.training_scale / scale
-        self.readout[-1].weight.mul_(ratio[:, None])
-        self.readout[-1].bias.mul_(ratio)
-        self.training_scale.copy_(scale)
-        # Adam moments belong to the old loss and parameterization; native optimizers are untouched.
-        self.optimizer.state.clear()
+        """Only old head moments change; affine outputs and native optimizers never do."""
+        if self._legacy_optimizer:
+            self.optimizer.state.clear()
+            self._legacy_optimizer = False
 
     def load_optimizer_state_dict(self, state):
         self.optimizer.load_state_dict(state)
         self.prepare_training()
+
+    def configure_online(self, expert_source, *, resumed=False):
+        if self.expert_fraction and expert_source is None:
+            raise ValueError("Online physical readout requires a training-split expert source.")
+        self.prepare_training()
+        self._online = True
+        self._expert_source = expert_source
+        if not resumed:
+            self.online_updates.zero_()
+            self.optimizer.state.clear()
 
     def forward(self, features):
         # [B,T,D] or [B,T,P,D]; preserve ordered patches and only complete causal histories.
@@ -167,21 +192,36 @@ class PhysicalStateHead(nn.Module):
         with torch.autocast(device_type=features.device.type, enabled=False):
             value = self.project(features.float()).flatten(-2)
             value = value.unfold(1, self.history, 1).transpose(-1, -2).flatten(-2)
-            return self.readout(value) * self.training_scale + self.mean
+            return self.readout(value) * self.output_scale + self.mean
 
-    def fit(self, features, targets):
-        features = features.detach()
+    def _examples(self, features, targets, count):
+        prediction = self(features.detach())
         targets = targets[:, self.history - 1 :].to(device=features.device, dtype=torch.float32)
-        prediction = self(features)
         if prediction.shape != targets.shape:
             raise ValueError(f"Physical-state prediction {prediction.shape} does not match targets {targets.shape}.")
         prediction, targets = prediction.flatten(0, 1), targets.flatten(0, 1)
-        count = min(self.samples_per_update, len(targets))
+        if count > len(targets):
+            raise ValueError(f"Readout requested {count} targets but only {len(targets)} are available.")
         indices = torch.linspace(0, len(targets) - 1, count, device=features.device).long()
-        loss = F.mse_loss(
-            (prediction[indices] - self.mean) / self.training_scale,
-            (targets[indices] - self.mean) / self.training_scale,
-        )
+        return prediction[indices], targets[indices]
+
+    def fit(self, features, targets):
+        available = features.shape[0] * (features.shape[1] - self.history + 1)
+        count = min(self.samples_per_update, available)
+        expert_count = int(count * self.expert_fraction) if self._online else 0
+        prediction, labels = self._examples(features, targets, count - expert_count)
+        if expert_count:
+            expert_features, expert_labels = self._expert_source()
+            expert_prediction, expert_labels = self._examples(expert_features, expert_labels, expert_count)
+            prediction = torch.cat((prediction, expert_prediction))
+            labels = torch.cat((labels, expert_labels))
+        # Unit physical scales plus a robust loss keep failed-policy states from dominating.
+        losses = F.smooth_l1_loss(prediction / self.loss_scale, labels / self.loss_scale, reduction="none")
+        loss = losses.mean()
+        if self._online:
+            warmup = min(1.0, (self.online_updates.item() + 1) / max(1, self.online_warmup))
+            for group in self.optimizer.param_groups:
+                group["lr"] = self.online_lr * warmup
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip, error_if_nonfinite=True)
@@ -189,8 +229,14 @@ class PhysicalStateHead(nn.Module):
         self.optimizer.zero_grad(set_to_none=True)
         self.updates.add_(1)
         self.examples.add_(count)
+        if self._online:
+            self.online_updates.add_(1)
         return {
             "state/loss": loss.detach(),
+            "state/lr": self.optimizer.param_groups[0]["lr"],
+            "state/expert_examples": expert_count,
+            "state/online_loss": losses[:count - expert_count].mean().detach() if self._online else 0.0,
+            "state/expert_loss": losses[-expert_count:].mean().detach() if expert_count else 0.0,
             "state/updates": self.updates.item(),
             "state/examples": self.examples.item(),
         }

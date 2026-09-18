@@ -16,6 +16,7 @@ from dmc_expert.storage import dataset_identity
 from envs import close_envs, make_envs, make_eval_envs
 from training import load_model_family
 from training.progress import Progress
+from training.readout import online_readout
 from training.protocol import (
     checkpoint_compatibility,
     dynamics_targets_per_update,
@@ -58,6 +59,7 @@ class TrainingRun:
     model: torch.nn.Module
     dataset_identity: dict | None = None
     resumed_from: dict | None = None
+    readout_replay: Any = None
 
 
 def progress_metrics(metrics, names):
@@ -87,6 +89,8 @@ def save_checkpoint(run, path, phase, state, replay_state=None, expert_updates=0
     }
     if replay_state is not None:
         payload["replay_state"] = replay_state
+    if phase == "online" and run.readout_replay is not None:
+        payload["readout_replay_state"] = run.readout_replay.state_dict()
     temporary = Path(f"{path}.tmp")
     torch.save(payload, temporary)
     temporary.replace(path)
@@ -477,6 +481,8 @@ def train(config, logger, logdir, checkpoint_path=None):
         print(f"Online | environment_seed={env_seed}")
         train_envs = make_envs(config.env, seed=env_seed)
         session = run.family.OnlineSession(config, run.model, train_envs)
-        return train_online(run, session, checkpoint, expert_updates)
+        with online_readout(config, family, model, checkpoint, run.dataset_identity) as replay:
+            run.readout_replay = replay
+            return train_online(run, session, checkpoint, expert_updates)
     finally:
         close_envs(train_envs)

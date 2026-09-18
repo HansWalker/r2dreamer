@@ -16,7 +16,7 @@ experiment_protocol: dmc_frozen_defaults_v20
 reward_discount: 0.99
 
 state_head:
-  # Training/output scales are 1 for sine/cosine, expert std otherwise; eval keeps expert std.
+  # Detached auxiliary readout only; native model objectives and optimizer recipes are unchanged.
   target_version: dmc_physical_state_v2
   task: ${scenario.task}
   fields: ${scenario.state_fields}
@@ -25,6 +25,10 @@ state_head:
   samples_per_update: 256
   lr: 3e-4
   grad_clip: 10.0
+  online:
+    lr: 3e-5
+    warmup_updates: 100
+    expert_fraction: 0.5  # Replaces half of the 256 labels, not extra head updates.
 
 expert_data:
   policy: tdmpc2

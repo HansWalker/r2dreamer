@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from models.shared.distributions import symexp, symlog
-from models.shared.physical_state import STATE_KEY, PhysicalStateHead
+from models.shared.physical_state import STATE_KEY, PhysicalStateHead, readout_mode
 from models.shared.utils import parse_model_io
 from models.shared.vision import channel_first, image_spec
 
@@ -361,7 +361,8 @@ class TDMPC2(nn.Module):
             for target_parameter, parameter in zip(self.target_qs.parameters(), self.qs.parameters(), strict=True):
                 target_parameter.lerp_(parameter, self.tau)
 
-        state_metrics = self.state_head.fit(torch.cat((rollout[:, :1].detach(), next_latent), dim=1), labels)
+        features, labels = self.readout_features(batch)
+        state_metrics = self.state_head.fit(features, labels)
         return {
             **state_metrics,
             "loss": float(loss.detach()),
@@ -372,6 +373,12 @@ class TDMPC2(nn.Module):
             "entropy": float(entropy),
             "grad_norm": float(grad_norm),
         }
+
+    def readout_features(self, batch):
+        obs = {key: value.to(self.device, non_blocking=True) for key, value in batch[0].items()}
+        labels = obs.pop(STATE_KEY)
+        with readout_mode(self):
+            return self._forward(self.encoder, obs).float(), labels
 
     @torch.no_grad()
     def _estimate(self, latent, actions):

@@ -9,7 +9,7 @@ from torch import nn
 from torch.distributions import OneHotCategorical
 from torch.nn.utils.rnn import pad_sequence
 
-from models.shared.physical_state import STATE_KEY
+from models.shared.physical_state import STATE_KEY, readout_mode
 
 from .cores import (
     HyenaSequenceCore,
@@ -246,6 +246,7 @@ class WorldModel(nn.Module):
 
     def update(self, obs, action, reward, termination, contexts=None):
         self.train()
+        head_batch = (contexts, (obs, action, reward, termination))
         obs = {key: value.to(self.device, non_blocking=True) for key, value in obs.items()}
         labels = obs.pop(STATE_KEY)
         action = action.to(self.device, non_blocking=True)
@@ -259,9 +260,19 @@ class WorldModel(nn.Module):
         else:
             raise RuntimeError("STORM world-model gradients overflowed in 32 consecutive attempts.")
         metrics["wm/skipped_steps"] = skipped
-        feature = torch.cat((state["stoch"][:, 1:], state["deter"][:, :-1]), dim=-1)
-        metrics.update(self.state_head.fit(feature, labels[:, 1:]))
+        feature, labels = self.readout_features(head_batch)
+        metrics.update(self.state_head.fit(feature, labels))
         return metrics, state, (obs, action, reward, termination)
+
+    def readout_features(self, batch):
+        contexts, batch = batch if len(batch) == 2 else (None, batch)
+        obs, action, *_ = batch
+        obs = {key: value.to(self.device, non_blocking=True) for key, value in obs.items()}
+        labels = obs.pop(STATE_KEY)
+        with readout_mode(self), self._amp():
+            state = self.observe(obs, action.to(self.device), self.replay_cache(contexts))
+            features = torch.cat((state["stoch"][:, 1:], state["deter"][:, :-1]), dim=-1)
+            return features.float(), labels[:, 1:]
 
     @torch.no_grad()
     def next_policy_features(self, state: dict[str, torch.Tensor]) -> torch.Tensor:

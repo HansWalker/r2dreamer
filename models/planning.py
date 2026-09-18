@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from models.shared.physical_state import STATE_KEY, PhysicalStateHead
+from models.shared.physical_state import STATE_KEY, PhysicalStateHead, readout_mode
 from models.shared.utils import parse_model_io
 
 
@@ -115,12 +115,19 @@ class LatentPlanner(nn.Module):
         for optimizer in self.optimizers.values():
             optimizer.step()
 
+        feature, labels = self.readout_features(batch)
         return {
             "loss": float(loss.detach()),
             "grad_norm": float(grad_norm),
             **{name: float(value.detach()) for name, value in metrics.items()},
-            **self.state_head.fit(latent, labels),
+            **self.state_head.fit(feature, labels),
         }
+
+    def readout_features(self, batch):
+        obs = {key: value.to(self.device, non_blocking=True) for key, value in batch[0].items()}
+        labels = obs.pop(STATE_KEY)
+        with readout_mode(self):
+            return self.encode(obs), labels
 
     def _predict_rollout(self, state, action, conditioning):
         return self.predictor(state, action), None
