@@ -32,7 +32,7 @@ def load_checkpoint(model, payload, training=True):
     model.load_state_dict(payload["agent_state_dict"])
     if training:
         model._optimizer.load_state_dict(payload["optims_state_dict"]["_optimizer"])
-        model.state_head.optimizer.load_state_dict(payload["optims_state_dict"]["state_head"])
+        model.state_head.load_optimizer_state_dict(payload["optims_state_dict"]["state_head"])
         model.load_training_state_dict(payload.get("agent_training_state"))
 
 

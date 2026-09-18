@@ -217,7 +217,7 @@ class TDMPC2(nn.Module):
     def load_optimizer_state_dict(self, state):
         self.model_optimizer.load_state_dict(state["model"])
         self.policy_optimizer.load_state_dict(state["policy"])
-        self.state_head.optimizer.load_state_dict(state["state_head"])
+        self.state_head.load_optimizer_state_dict(state["state_head"])
 
     def stack_sequence(self, observation):
         """Convert raw RGB sequences to TD-MPC2's causal frame-stack representation."""

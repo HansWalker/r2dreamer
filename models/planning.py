@@ -93,7 +93,7 @@ class LatentPlanner(nn.Module):
     def load_optimizer_state_dict(self, state):
         for name, optimizer in self.optimizers.items():
             optimizer.load_state_dict(state[name])
-        self.state_head.optimizer.load_state_dict(state["state_head"])
+        self.state_head.load_optimizer_state_dict(state["state_head"])
 
     def update(self, batch):
         obs, action, *_ = batch

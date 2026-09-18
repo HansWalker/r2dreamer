@@ -16,6 +16,7 @@ experiment_protocol: dmc_frozen_defaults_v20
 reward_discount: 0.99
 
 state_head:
+  # Training/output scales are 1 for sine/cosine, expert std otherwise; eval keeps expert std.
   target_version: dmc_physical_state_v2
   task: ${scenario.task}
   fields: ${scenario.state_fields}

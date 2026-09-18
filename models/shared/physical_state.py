@@ -31,6 +31,11 @@ class PhysicalStateTargets:
             for index, name in enumerate(self.raw_coordinates)
             for coordinate in ([f"cos({name})", f"sin({name})"] if index in self.angles else [name])
         ]
+        self.trigonometric = [
+            index for index, name in enumerate(self.coordinates)
+            if name.startswith(("cos(", "sin("))
+            or self.task == "dmc_cartpole_balance_sparse" and name in {"position[1]", "position[2]"}
+        ]
         positions = [f"position[{index}]" for index in range(position_dim)]
         if self.angles:
             positions = [coordinate for name in positions for coordinate in (f"cos({name})", f"sin({name})")]
@@ -88,6 +93,8 @@ class PhysicalStateTargets:
 
 
 class PhysicalStateHead(nn.Module):
+    _version = 2
+
     def __init__(self, feature_dim, config, *, history=1, tokens=1):
         super().__init__()
         self.history = int(history)
@@ -107,7 +114,9 @@ class PhysicalStateHead(nn.Module):
                 nn.Linear(self.history * tokens * projection, hidden), nn.SiLU(), nn.Linear(hidden, output_dim)
             )
         self.register_buffer("mean", torch.zeros(output_dim))
+        # Expert statistics remain fixed for evaluation, independently of the training/output scale.
         self.register_buffer("std", torch.ones(output_dim))
+        self.register_buffer("training_scale", torch.ones(output_dim))
         self.register_buffer("updates", torch.zeros((), dtype=torch.long))
         self.register_buffer("examples", torch.zeros((), dtype=torch.long))
         self.optimizer = torch.optim.Adam(self.parameters(), lr=float(config.lr))
@@ -116,6 +125,40 @@ class PhysicalStateHead(nn.Module):
     def set_stats(self, mean, std):
         self.mean.copy_(torch.as_tensor(mean, device=self.mean.device))
         self.std.copy_(torch.as_tensor(std, device=self.std.device).clamp_min(1e-3))
+        if self.updates.item():
+            self.prepare_training()
+        else:
+            self.training_scale.copy_(self._training_scale())
+
+    def _training_scale(self):
+        scale = self.std.clone()
+        # Unit-amplitude angles must not inherit near-zero variance from successful expert poses.
+        scale[self.targets.trigonometric] = 1.0
+        return scale
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, *args, **kwargs):
+        key = prefix + "training_scale"
+        if local_metadata.get("version", 1) < 2 and key not in state_dict and prefix + "std" in state_dict:
+            # Legacy inference keeps exactly its original affine output and evaluation statistics.
+            state_dict[key] = state_dict[prefix + "std"].clone()
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, *args, **kwargs)
+
+    @torch.no_grad()
+    def prepare_training(self):
+        """Upgrade a loaded head's conditioning without changing its physical predictions."""
+        scale = self._training_scale()
+        if torch.equal(scale, self.training_scale):
+            return
+        ratio = self.training_scale / scale
+        self.readout[-1].weight.mul_(ratio[:, None])
+        self.readout[-1].bias.mul_(ratio)
+        self.training_scale.copy_(scale)
+        # Adam moments belong to the old loss and parameterization; native optimizers are untouched.
+        self.optimizer.state.clear()
+
+    def load_optimizer_state_dict(self, state):
+        self.optimizer.load_state_dict(state)
+        self.prepare_training()
 
     def forward(self, features):
         # [B,T,D] or [B,T,P,D]; preserve ordered patches and only complete causal histories.
@@ -124,7 +167,7 @@ class PhysicalStateHead(nn.Module):
         with torch.autocast(device_type=features.device.type, enabled=False):
             value = self.project(features.float()).flatten(-2)
             value = value.unfold(1, self.history, 1).transpose(-1, -2).flatten(-2)
-            return self.readout(value) * self.std + self.mean
+            return self.readout(value) * self.training_scale + self.mean
 
     def fit(self, features, targets):
         features = features.detach()
@@ -135,7 +178,10 @@ class PhysicalStateHead(nn.Module):
         prediction, targets = prediction.flatten(0, 1), targets.flatten(0, 1)
         count = min(self.samples_per_update, len(targets))
         indices = torch.linspace(0, len(targets) - 1, count, device=features.device).long()
-        loss = F.mse_loss((prediction[indices] - self.mean) / self.std, (targets[indices] - self.mean) / self.std)
+        loss = F.mse_loss(
+            (prediction[indices] - self.mean) / self.training_scale,
+            (targets[indices] - self.mean) / self.training_scale,
+        )
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip, error_if_nonfinite=True)

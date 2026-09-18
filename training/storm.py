@@ -40,7 +40,7 @@ def load_checkpoint(model, payload, training=True):
     agent.load_state_dict(payload["actor_critic"])
     if training:
         world_model.optimizer.load_state_dict(payload["wm_optimizer"])
-        model.state_head.optimizer.load_state_dict(payload["state_optimizer"])
+        model.state_head.load_optimizer_state_dict(payload["state_optimizer"])
         agent.optimizer.load_state_dict(payload["ac_optimizer"])
         if "wm_scaler" in payload:
             world_model.scaler.load_state_dict(payload["wm_scaler"])

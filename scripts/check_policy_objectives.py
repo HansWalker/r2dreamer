@@ -165,7 +165,7 @@ class PolicyObjectivesTest(unittest.TestCase):
             config = config_for(name)
             family = str(config.model_family)
             compatibility = checkpoint_compatibility(config)
-            self.assertEqual(compatibility["recipe_version"], 3 if family in {"dreamer", "storm"} else 2)
+            self.assertEqual(compatibility["recipe_version"], 4)
             identity = {
                 "protocol": "test", "model_family": family, "model_variant": "test",
                 "scenario": "test", "task": "test", "seed": 0,
@@ -178,7 +178,7 @@ class PolicyObjectivesTest(unittest.TestCase):
                 for phase in ("expert", "online"):
                     checkpoint["phase"] = phase
                     with self.subTest(family=family, phase=phase):
-                        rejected = family == "storm" or family == "dreamer" and phase == "online"
+                        rejected = family == "storm" or phase == "online"
                         if rejected:
                             with self.assertRaisesRegex(ValueError, "recipe_version"):
                                 validate_checkpoint(checkpoint, config)
@@ -188,6 +188,12 @@ class PolicyObjectivesTest(unittest.TestCase):
                         corrected = {**checkpoint, "compatibility": compatibility}
                         validate_checkpoint(corrected, config)
                 checkpoint["phase"] = "expert"
+                if family in {"dreamer", "storm"}:
+                    recipe3 = {**checkpoint, "compatibility": {**compatibility, "recipe_version": 3}}
+                    validate_checkpoint(recipe3, config)
+                    recipe3["phase"] = "online"
+                    with self.assertRaisesRegex(ValueError, "recipe_version"):
+                        validate_checkpoint(recipe3, config)
                 bad = copy.deepcopy(checkpoint)
                 bad["compatibility"]["training_sha256"] = "different"
                 with self.assertRaisesRegex(ValueError, "training_sha256"):

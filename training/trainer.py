@@ -262,6 +262,16 @@ def pretrain(run, replay, checkpoint=None):
     return state.updates
 
 
+def online_update_target(config, env_steps):
+    """Cumulative update budget at this point in the original online schedule."""
+    settings = config.training.online
+    repeat = int(config.env.action_repeat)
+    total = int(settings.steps) // repeat
+    warmup = int(settings.warmup_transitions)
+    eligible = max(0, min(int(env_steps) // repeat, total) - warmup)
+    return int(settings.updates) * eligible // max(1, total - warmup)
+
+
 def train_online(run, session, checkpoint=None, expert_updates=0):
     settings = run.config.training.online
     checkpoint = checkpoint or {}
@@ -335,9 +345,7 @@ def train_online(run, session, checkpoint=None, expert_updates=0):
 
         collected = min(state.env_steps // action_repeat, total_transitions)
         if collected > warmup_transitions and session.replay.ready():
-            eligible = collected - warmup_transitions
-            available = max(1, total_transitions - warmup_transitions)
-            target = total_updates * eligible // available
+            target = online_update_target(run.config, state.env_steps)
             update_count = max(0, target - state.world_model_updates)
             if update_count:
                 metrics.update(session.update(update_count))
