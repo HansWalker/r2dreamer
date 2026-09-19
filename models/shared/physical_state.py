@@ -110,7 +110,7 @@ class PhysicalStateTargets:
 
 
 class PhysicalStateHead(nn.Module):
-    _version = 3
+    _version = 4
 
     def __init__(self, feature_dim, config, *, history=1, tokens=1):
         super().__init__()
@@ -149,11 +149,10 @@ class PhysicalStateHead(nn.Module):
 
     @torch.no_grad()
     def set_stats(self, mean, std):
+        # Expert variance is an evaluation denominator, not an output Jacobian.
+        # New heads keep unit physical scales; loaded heads retain their saved affine map.
         self.mean.copy_(torch.as_tensor(mean, device=self.mean.device))
         self.std.copy_(torch.as_tensor(std, device=self.std.device).clamp_min(1e-3))
-        if not self.updates.item():
-            # Preserve the expert initialization without rescaling trained readout weights.
-            self.output_scale.copy_(self.std)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, *args, **kwargs):
         self._legacy_optimizer = local_metadata.get("version", 1) < 3

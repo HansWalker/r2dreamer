@@ -165,7 +165,7 @@ class PolicyObjectivesTest(unittest.TestCase):
             config = config_for(name)
             family = str(config.model_family)
             compatibility = checkpoint_compatibility(config)
-            self.assertEqual(compatibility["recipe_version"], 6)
+            self.assertEqual(compatibility["recipe_version"], 7)
             identity = {
                 "protocol": "test", "model_family": family, "model_variant": "test",
                 "scenario": "test", "task": "test", "seed": 0,
@@ -179,11 +179,7 @@ class PolicyObjectivesTest(unittest.TestCase):
                 for phase in ("expert", "online"):
                     checkpoint["phase"] = phase
                     with self.subTest(family=family, phase=phase):
-                        rejected = family == "storm" or phase == "online"
-                        if rejected:
-                            with self.assertRaisesRegex(ValueError, "recipe_version"):
-                                validate_checkpoint(checkpoint, config)
-                        else:
+                        with self.assertRaisesRegex(ValueError, "recipe_version"):
                             validate_checkpoint(checkpoint, config)
                         validate_checkpoint(checkpoint, config, training=False)
                         corrected = {**checkpoint, "compatibility": compatibility}
@@ -191,7 +187,8 @@ class PolicyObjectivesTest(unittest.TestCase):
                 checkpoint["phase"] = "expert"
                 if family in {"dreamer", "storm"}:
                     recipe3 = {**checkpoint, "compatibility": {**compatibility, "recipe_version": 3}}
-                    validate_checkpoint(recipe3, config)
+                    with self.assertRaisesRegex(ValueError, "recipe_version"):
+                        validate_checkpoint(recipe3, config)
                     recipe3["phase"] = "online"
                     with self.assertRaisesRegex(ValueError, "recipe_version"):
                         validate_checkpoint(recipe3, config)

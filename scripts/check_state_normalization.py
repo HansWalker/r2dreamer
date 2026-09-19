@@ -69,7 +69,7 @@ class StateNormalizationTest(unittest.TestCase):
                 self.assertEqual(head.targets.trigonometric, angular)
                 torch.testing.assert_close(head.mean, mean, rtol=0, atol=0)
                 torch.testing.assert_close(head.std, std.clamp_min(1e-3), rtol=0, atol=0)
-                torch.testing.assert_close(head.output_scale, std.clamp_min(1e-3), rtol=0, atol=0)
+                torch.testing.assert_close(head.output_scale, torch.ones(count), rtol=0, atol=0)
                 torch.testing.assert_close(head.loss_scale, torch.ones(count), rtol=0, atol=0)
                 # Field order must not change which coordinates receive unit scale.
                 config.fields = dict(reversed(list(config.fields.items())))
@@ -106,6 +106,7 @@ class StateNormalizationTest(unittest.TestCase):
         hook.remove()
         torch.testing.assert_close(metrics["state/loss"], expected)
         self.assertLess(bias_gradients[0].norm().item(), 1)
+        torch.testing.assert_close(bias_gradients[0][1:3], torch.tensor([.2, -.2]))
         self.assertIsNone(features.grad)
         self.assertEqual(head.updates.item(), 1)
         self.assertEqual(head.examples.item(), 4)
@@ -116,6 +117,7 @@ class StateNormalizationTest(unittest.TestCase):
             with self.subTest(history=history, tokens=tokens):
                 old = PhysicalStateHead(8, settings(), history=history, tokens=tokens)
                 old.set_stats([.06, 1, 0, .008, 0], [.036, .001, .01, .15, .21])
+                old.output_scale.copy_(old.std)
                 features = torch.randn(2, 5, tokens, 8, requires_grad=True)
                 labels = torch.randn(2, 5, 5)
                 old.fit(features, labels)
@@ -161,6 +163,21 @@ class StateNormalizationTest(unittest.TestCase):
             instance.fit(features, labels)
         for name, value in head.state_dict().items():
             torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
+
+    def test_v3_checkpoint_keeps_its_output_scale_even_before_first_update(self):
+        head = PhysicalStateHead(8, settings())
+        head.set_stats([0, 1, 0, 0, 0], [.03, .001, .01, .15, .21])
+        head.output_scale.copy_(head.std)
+        weights = copy.deepcopy(head.state_dict())
+        weights._metadata[""]["version"] = 3
+        restored = PhysicalStateHead(8, settings())
+        restored.load_state_dict(weights)
+        restored.set_stats(head.mean, head.std)
+        features = torch.randn(2, 4, 8, requires_grad=True)
+        torch.testing.assert_close(restored(features), head(features), rtol=0, atol=0)
+        torch.testing.assert_close(torch.autograd.grad(restored(features).sum(), features)[0],
+                                   torch.autograd.grad(head(features).sum(), features)[0], rtol=0, atol=0)
+        self.assertFalse(restored._legacy_optimizer)
 
     def test_v2_affine_is_preserved_but_old_loss_moments_are_reset(self):
         head = PhysicalStateHead(8, settings("ball_in_cup"))
@@ -249,6 +266,7 @@ class StateNormalizationTest(unittest.TestCase):
                     head = model.state_head
                     count = len(head.coordinates)
                     head.set_stats(torch.zeros(count), torch.linspace(.001, .2, count))
+                    head.output_scale.copy_(head.std)
                     batch, _, _ = synthetic_batch(config, model)
                     adapter.expert_update(model, batch)
                     payload = copy.deepcopy(adapter.checkpoint(model))

@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 IMPLEMENTATION_ENV = "DMC_IMPLEMENTATION_SHA256"
 # Bump these for incompatible payload/recipe changes or changed metric semantics, not source formatting.
 CHECKPOINT_SCHEMA = 2
-TRAINING_RECIPE_VERSION = 6
+TRAINING_RECIPE_VERSION = 7
 EVALUATION_PROTOCOL = "dmc_evaluation_v9"
 
 
@@ -454,35 +454,8 @@ def validate_checkpoint(checkpoint, config, *, training=True):
         if training:
             required += ("recipe_version", "training_sha256")
         expected_compatibility = checkpoint_compatibility(config)
-        reusable_expert_recipes = {
-            "dreamer": {2, 3, 4, 5, 6},
-            "storm": {3, 4, 5, 6},
-            "tdmpc2": {2, 4, 5, 6},
-            "leworldmodel": {2, 4, 5, 6},
-            "temporal_straightening": {2, 4, 5, 6},
-        }
-        if (
-            training
-            and checkpoint.get("phase") == "expert"
-            and compatibility.get("recipe_version") in reusable_expert_recipes[str(config.model_family)]
-            and expected_compatibility["recipe_version"] == 6
-        ):
-            # Authenticate the old recipe before allowing online-only changes.
-            # STORM v2's incorrect expert return targets still require fresh pretraining.
-            saved = OmegaConf.create(checkpoint["training_config"])
-            original = checkpoint_compatibility(saved)
-            for key in ("schema", "model_sha256", "training_sha256"):
-                if compatibility.get(key) != original[key]:
-                    raise ValueError(f"Expert checkpoint has inconsistent {key} metadata.")
-            upgrade_readout_config(saved)
-            if int(checkpoint.get("expert_updates", -1)) == int(saved.training.expert.updates):
-                saved.training.online.expert_fraction = float(config.training.online.get("expert_fraction", 0.0))
-            upgraded = checkpoint_compatibility(saved)
-            for key in ("model_sha256", "training_sha256"):
-                if upgraded[key] != expected_compatibility[key]:
-                    raise ValueError(f"Expert checkpoint is incompatible with training: {key}.")
-            expected_compatibility = original
-            required = tuple(key for key in required if key != "recipe_version")
+        # v7 changes fresh head initialization, not just online training. Old expert
+        # checkpoints remain evaluable, but cannot silently resume the new recipe.
         mismatches = [key for key in required if compatibility.get(key) != expected_compatibility[key]]
         if mismatches:
             purpose = "training" if training else "evaluation"

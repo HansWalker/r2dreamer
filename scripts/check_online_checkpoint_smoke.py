@@ -27,7 +27,12 @@ from dmc_expert.storage import (
 )
 from scripts.check_state_normalization import legacy_weights, tiny_config
 from scripts.smoke_models import synthetic_batch
-from scripts.smoke_online_checkpoints import accuracy_regression, diagnose, run_case, write_summary
+from scripts.smoke_online_checkpoints import (
+    accuracy_regression,
+    diagnose,
+    run_case,
+    write_summary,
+)
 from training import load_model_family
 from training.protocol import checkpoint_compatibility, run_identity
 from training.readout import online_readout
@@ -102,6 +107,7 @@ def fixture(root, name):
     family = load_model_family(name)
     model = family.build_model(config)
     model.state_head.set_stats([0, 1, 0, 0, 0], [.04, .001, .01, .15, .21])
+    model.state_head.output_scale.copy_(model.state_head.std)
     batch, _, _ = synthetic_batch(config, model)
     family.expert_update(model, batch)
     checkpoint = family.checkpoint(model)

@@ -22,7 +22,11 @@ from envs import close_envs, make_envs
 from models.shared.physical_state import readout_mode
 from scripts.diagnose_planning_models import FAMILIES, SCENARIOS, analyze_checkpoint
 from scripts.online_validation import (
-    TrajectoryDataset, calibrate_readout, collect_episode, episode_metadata, validation_metadata,
+    TrajectoryDataset,
+    calibrate_readout,
+    collect_episode,
+    episode_metadata,
+    validation_metadata,
 )
 from training import load_model_family
 from training.evaluation import StateDataset
@@ -178,8 +182,6 @@ def run_trials(config, family, model, checkpoint, dataset, windows, args, result
         candidate = copy.deepcopy(config)
         candidate.training.online.expert_fraction = fraction
         native_mixture(candidate)
-        if fraction != float(config.training.online.expert_fraction):
-            validate_checkpoint(checkpoint, candidate, training=True)
     unknown = set(getattr(args, "rmse_floors", {})) - set(model.state_head.coordinates)
     if unknown:
         raise ValueError(f"Unknown physical coordinates in --rmse-floors: {sorted(unknown)}")
@@ -285,13 +287,17 @@ def run_case(job):
     try:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         config = OmegaConf.create(checkpoint["training_config"])
-        upgrade_readout_config(config)
         config.device = args.device
         if (str(config.scenario.name), str(config.model_family), int(config.seed)) != (args.scenario, args.model, args.seed):
             raise ValueError("Checkpoint does not belong to the requested scenario/model/seed.")
         if checkpoint.get("phase") != "expert" or int(checkpoint.get("expert_updates", -1)) != int(config.training.expert.updates):
             raise ValueError("Use a completed expert pretrained.pt checkpoint, not an online or partial checkpoint.")
-        validate_checkpoint(checkpoint, config, training=True)
+        # This read-only diagnostic deliberately retains the old head's affine map;
+        # it is not permission to resume production training under the new recipe.
+        validate_checkpoint(checkpoint, config, training=False)
+        if checkpoint.get("compatibility", {}).get("training_sha256") != checkpoint_compatibility(config)["training_sha256"]:
+            raise ValueError("Checkpoint has inconsistent training recipe metadata.")
+        upgrade_readout_config(config)
         quantum = int(config.env.env_num) * int(config.env.action_repeat)
         if args.env_steps % quantum or not 0 < args.env_steps <= int(config.training.online.steps):
             raise ValueError(f"--env-steps must be a multiple of {quantum}, within the saved online budget.")
@@ -317,6 +323,7 @@ def run_case(job):
         result.update(
             checkpoint_id=checkpoint["checkpoint_id"], run_identity=checkpoint["run_identity"],
             source_compatibility=checkpoint["compatibility"], compatibility=checkpoint_compatibility(config),
+            production_resume=False, head_initialization="saved checkpoint affine, not a newly fitted head",
             config_yaml=OmegaConf.to_yaml(config, resolve=True), dataset_identity=dataset_identity(metadata),
         )
         with h5py.File(dataset_path / "data.hdf5", "r") as h5:

@@ -37,7 +37,11 @@ from scripts.online_validation import (
 )
 from training import load_model_family
 from training.progress import Progress, duration
-from training.protocol import implementation_sha256, validate_checkpoint
+from training.protocol import (
+    checkpoint_compatibility,
+    implementation_sha256,
+    validate_checkpoint,
+)
 
 
 def tensor_digest(values):
@@ -155,18 +159,20 @@ class FeatureBank:
 
 
 def fresh_head(original, config, labels, seed):
-    """Keep architecture and evaluation stats; initialize weights and physical conditioning afresh."""
+    """Fresh weights; optional training labels retain the older calibrated diagnostic."""
     projection = original.project[0].out_features
     tokens = original.readout[0].in_features // (original.history * projection)
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(seed)
         head = PhysicalStateHead(original.project[0].in_features, config,
                                  history=original.history, tokens=tokens).to(original.mean.device)
-    floors = torch.full_like(original.std, .1)
-    floors[original.targets.velocities] = 1
-    floors[original.targets.trigonometric] = 1
-    scales = torch.maximum(labels.std(0, unbiased=False), floors)
-    scales[original.targets.trigonometric] = 1
+    scales = torch.ones_like(original.std)
+    if labels is not None:
+        floors = torch.full_like(original.std, .1)
+        floors[original.targets.velocities] = 1
+        floors[original.targets.trigonometric] = 1
+        scales = torch.maximum(labels.std(0, unbiased=False), floors)
+        scales[original.targets.trigonometric] = 1
     with torch.no_grad():
         head.mean.copy_(original.mean)
         head.std.copy_(original.std)
@@ -345,6 +351,8 @@ def load_checkpoint(path, scenario, name, args):
     if checkpoint.get("phase") != "expert" or checkpoint.get("expert_updates") != int(config.training.expert.updates):
         raise ValueError("Use a completed expert pretrained.pt checkpoint, not an online or partial checkpoint.")
     validate_checkpoint(checkpoint, config, training=False)
+    if checkpoint.get("compatibility", {}).get("training_sha256") != checkpoint_compatibility(config)["training_sha256"]:
+        raise ValueError("Checkpoint has inconsistent training recipe metadata.")
     tools.configure_randomness(int(config.seed), bool(config.deterministic_run))
     family = load_model_family(name)
     model = family.build_model(config)

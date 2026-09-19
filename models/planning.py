@@ -60,6 +60,37 @@ class LatentPlanner(nn.Module):
         self.decoder = None
         self._cem_mean = None
         self._gradient_actions = None
+        self._adaptation_mode = "native"
+        self._frozen_parameters = []
+        self._gradient_updates = 0
+        self._clipped_updates = 0
+
+    def set_adaptation_mode(self, mode):
+        """Diagnostic ablations only; production retains native parameter/statistic updates."""
+        if mode not in {"native", "frozen_bn", "frozen_encoder"}:
+            raise ValueError(f"Unknown adaptation mode: {mode}")
+        for parameter, trainable in self._frozen_parameters:
+            parameter.requires_grad_(trainable)
+        self._frozen_parameters = []
+        self._adaptation_mode = mode
+        if mode == "frozen_encoder":
+            for module in (self.encoder, self.projector):
+                for parameter in module.parameters():
+                    self._frozen_parameters.append((parameter, parameter.requires_grad))
+                    parameter.requires_grad_(False)
+                    parameter.grad = None
+        self.train(self.training)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if mode and getattr(self, "_adaptation_mode", "native") != "native":
+            if self._adaptation_mode == "frozen_encoder":
+                self.encoder.eval()
+                self.projector.eval()
+            for module in self.modules():
+                if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                    module.eval()
+        return self
 
     @property
     def device(self):
@@ -108,16 +139,22 @@ class LatentPlanner(nn.Module):
         readout_ids = {id(parameter) for parameter in [*self.state_head.parameters(), *decoder_parameters]}
         model_parameters = [parameter for parameter in self.parameters() if id(parameter) not in readout_ids]
         grad_norm = torch.nn.utils.clip_grad_norm_(model_parameters, self.grad_clip, error_if_nonfinite=True)
+        grad_norm = float(grad_norm)
+        clipped = grad_norm > self.grad_clip
         # Detached visualization losses must not rescale the representation gradients.
         if decoder_parameters:
             torch.nn.utils.clip_grad_norm_(decoder_parameters, self.grad_clip, error_if_nonfinite=True)
         for optimizer in self.optimizers.values():
             optimizer.step()
+        self._gradient_updates += 1
+        self._clipped_updates += int(clipped)
 
         feature, labels = self.readout_features(batch if readout_batch is None else readout_batch)
         return {
             "loss": float(loss.detach()),
-            "grad_norm": float(grad_norm),
+            "grad_norm": grad_norm,
+            "grad_clipped": float(clipped),
+            "grad_clip_fraction_since_load": self._clipped_updates / self._gradient_updates,
             **{name: float(value.detach()) for name, value in metrics.items()},
             **self.state_head.fit(feature, labels),
         }

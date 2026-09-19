@@ -14,12 +14,16 @@ from models.planning import LatentPlanner
 from models.shared.physical_state import PhysicalStateHead
 from scripts.check_online_checkpoint_smoke import ToyEnvironment, fixture
 from scripts.check_state_normalization import settings, tiny_config
-from scripts.online_validation import TrajectoryDataset, calibrate_readout, collect_episode
-from scripts.smoke_online_checkpoints import run_case
+from scripts.online_validation import (
+    TrajectoryDataset,
+    calibrate_readout,
+    collect_episode,
+)
 from scripts.smoke_models import synthetic_batch
+from scripts.smoke_online_checkpoints import run_case
 from training import load_model_family
 from training.planning import OnlineSession
-from training.protocol import checkpoint_compatibility, upgrade_readout_config, validate_checkpoint
+from training.protocol import checkpoint_compatibility, validate_checkpoint
 from training.readout import native_mixture, online_readout
 
 
@@ -218,22 +222,20 @@ class OnlineRepairsTest(unittest.TestCase):
         for key, value in native.items():
             torch.testing.assert_close(model.state_dict()[key], value, rtol=0, atol=0)
 
-    def test_completed_expert_reuse_allows_only_online_mixing_not_old_online_resume(self):
+    def test_old_expert_and_online_weights_are_evaluable_but_not_new_recipe_resumable(self):
         with tempfile.TemporaryDirectory() as temporary:
-            config, job = fixture(Path(temporary), "leworldmodel")
+            _, job = fixture(Path(temporary), "leworldmodel")
             checkpoint = torch.load(job["checkpoint"], weights_only=False)
             # Reproduce a v5 checkpoint written before the optional native setting existed.
             saved = OmegaConf.create(checkpoint["training_config"])
             del saved.training.online["expert_fraction"]
             checkpoint["training_config"] = OmegaConf.to_container(saved, resolve=True)
             checkpoint["compatibility"] = {**checkpoint_compatibility(saved), "recipe_version": 5}
-            upgrade_readout_config(saved)
-            saved.training.online.expert_fraction = .5
-            validate_checkpoint(checkpoint, saved, training=True)
-            checkpoint["phase"] = "online"
-            with self.assertRaisesRegex(ValueError, "incompatible"):
-                validate_checkpoint(checkpoint, saved, training=True)
-            checkpoint["phase"] = "expert"
+            for phase in ("expert", "online"):
+                checkpoint["phase"] = phase
+                validate_checkpoint(checkpoint, saved, training=False)
+                with self.assertRaisesRegex(ValueError, "recipe_version"):
+                    validate_checkpoint(checkpoint, saved, training=True)
             saved.jepa_model.planner.horizon += 1
             with self.assertRaisesRegex(ValueError, "incompatible"):
                 validate_checkpoint(checkpoint, saved, training=True)

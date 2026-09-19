@@ -431,7 +431,9 @@ Existing HDF5 observations and collection metadata are unchanged; no recollectio
 Its own Adam optimizer minimizes Smooth L1 state error (beta=1, unit physical-coordinate scales)
 on detached observed features, using 256 targets per model update. Features are recomputed in
 inference mode after the native update, without changing native RNG or BatchNorm statistics.
-The output affine is preserved on checkpoint load, independently of loss scaling. Expert means
+New heads use unit physical output scales, including unit sine/cosine scales; narrow expert
+variance no longer suppresses the output Jacobian. The output affine is preserved on checkpoint
+load, independently of loss scaling. Expert means
 and standard deviations remain fixed for evaluation: nMSE keeps its original meaning, including
 sensitivity to small expert variance. Online readout updates use LR 3e-5, a 100-update linear
 warmup, and fresh Adam moments. Half of the existing 256 labels come from training-split expert
@@ -602,6 +604,52 @@ its purpose is to choose between a readout repair and broader native training, b
 
 CPU regression checks: `python -m scripts.check_fresh_readout`.
 
+### Fixed-Replay Model Adaptation
+
+To isolate representation/statistic drift without any new collection or expensive planning:
+
+```bash
+bash scripts/run_fixed_replay_check.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision \
+  --run-root runs/dmc_vision_10k
+```
+
+Defaults cover cartpole LeWorldModel and TS. Each needs its existing `pretrained.pt` and a
+`latest.pt` containing online replay. The script partitions saved replay by episode, reads
+32 expert TRAIN episodes plus 8 development-validation episodes, and reserves 8 replay
+episodes for validation. These expert validation episodes were seen by native pretraining,
+but not by fresh-head fitting; the benchmark held-out split is untouched.
+
+A shared fresh, fixed-unit head fits for 1,000 head-only updates on cached training features,
+50% expert and 50% replay. Then three trials each start with the **same** native checkpoint,
+native optimizer moments, fitted head, and preselected replay batches:
+
+- `native`: ordinary native updates, with the corrected head and TS clipping guard.
+- `frozen_bn`: freeze all BatchNorm running statistics; affine parameters still train.
+- `frozen_encoder`: also freeze the image encoder and its output projector, including dropout;
+  the predictor, action encoder, prediction projector, and detached head still train.
+
+Each trial performs 256 native updates, retaining the original full-schedule learning-rate
+warmup, native batch size, source-episode count, and native losses. Each head update keeps
+the existing 128 online plus 128 expert labels. The fixed replay comes from the saved run,
+not the adapting model: this is an isolation experiment, **not** a new online benchmark.
+It does not establish policy quality or guarantee that 1,000 head updates are sufficient.
+The three modes share data within each model; saved replay can differ between models.
+
+Validation at updates 0/64/128/192/256 measures observed decoding and open-loop horizons 1/5,
+physical/angle errors, false and missed goals, and latent drift. Native preclip gradient norm
+and clipping frequency are recorded. The finite TS native clip is `1.0`; production JSONL
+and TensorBoard also receive `grad_norm`, `grad_clipped`, and
+`grad_clip_fraction_since_load` (a running fraction for this process, not a persisted counter).
+BN/encoder freezes remain diagnostic-only, and no multi-step loss is added.
+
+The timestamped `runs/fixed_replay_*` directory contains a compact `summary.txt`, `report.json`,
+`physical_errors.csv`, per-update JSONL, and exact batch indices in each run's `batches.json`.
+All checkpoints/datasets are read-only. `COMPLETE` means finite execution, not repaired models;
+compare original-unit errors as well as nMSE. Override `--updates`, `--head-updates`, or
+`--eval-every` to change only the diagnostic budget. No simulator, planner, dataset audit,
+or checkpoint saving is performed. CPU checks: `python -m scripts.check_fixed_replay`.
+
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening
@@ -698,16 +746,12 @@ No dataset, environment rollout, or checkpoint writes are required.
 Dreamer and STORM retain pre-tanh samples for online actor scoring; STORM also bootstraps
 transition returns from the next-state value (recipe 3 corrections).
 
-Training recipe 6 adds dense goal costs, independent TS action gradients, and optional native retention
-to recipe 5's auxiliary readout stabilization. Old checkpoints remain evaluable
-with exactly their original predictions and evaluation statistics. For training, Dreamer expert
-recipes 2/3/4/5, STORM expert recipes 3/4/5, and planning-family expert recipes 2/4/5 can be reused with otherwise
-identical settings. Loading them preserves the head's affine layer and resets only its old Adam moments. Native
-weights, native optimizer state, and update counters are retained. This migration is not refitting
-or a repair of already degraded predictions. STORM recipe-2 expert weights still require fresh
-pretraining because of the return-target bug. Older online recipes cannot resume corrected training;
-keep corrected results in a separate output directory. Completed expert checkpoints also permit an explicit
-change to the new native online-retention fraction; pretraining settings must still match.
+Training recipe 7 adds fixed-unit fresh-head initialization and finite TS native gradient clipping
+to recipe 6's planner/readout repairs. Old checkpoints remain evaluable with exactly their saved
+predictions and evaluation statistics, using their saved configuration. Neither old expert nor
+old online checkpoints silently resume production training under recipe 7. Read-only diagnostics
+can explicitly reuse native weights and fit replacement heads, but that is not a fresh recipe-7 run.
+Keep corrected training results in a separate output directory; datasets remain reusable.
 
 Run `python -m scripts.check_state_normalization` for CPU checks of loss conditioning, legacy
 prediction/gradient preservation, optimizer migration, and all five families' checkpoint paths.

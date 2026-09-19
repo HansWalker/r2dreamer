@@ -22,7 +22,7 @@ jepa_model:
       base_channels: 34
   optim:
     weight_decay: 1e-2
-    grad_clip: .inf
+    grad_clip: 1.0
   planner:
     type: gradient
     samples: 16
