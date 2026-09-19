@@ -74,6 +74,18 @@ def episode_metadata(episodes):
     return [{key: value for key, value in episode.items() if not isinstance(value, torch.Tensor)} for episode in episodes]
 
 
+def sample_trajectory_windows(episodes, count, length, seed):
+    generator = torch.Generator().manual_seed(seed)
+    windows = []
+    for index, episode in enumerate(episodes):
+        choices = len(episode["image"]) - length + 1
+        if choices < 1:
+            raise ValueError("Diagnostic episode is shorter than the requested context and forecast.")
+        starts = torch.randperm(choices, generator=generator)[:min(count, choices)].tolist()
+        windows.extend(Window(index, start, episode["policy"], 0.0) for start in starts)
+    return windows
+
+
 class TrajectoryDataset:
     def __init__(self, episodes, *, forbidden_seeds=()):
         self.episodes = episodes
@@ -82,15 +94,7 @@ class TrajectoryDataset:
             raise ValueError("Diagnostic training and validation trajectories must have disjoint episode seeds.")
 
     def sample_windows(self, count, length, seed):
-        generator = torch.Generator().manual_seed(seed)
-        windows = []
-        for index, episode in enumerate(self.episodes):
-            choices = len(episode["image"]) - length + 1
-            if choices < 1:
-                raise ValueError("Diagnostic episode is shorter than the requested context and forecast.")
-            starts = torch.randperm(choices, generator=generator)[:min(count, choices)].tolist()
-            windows.extend(Window(index, start, episode["policy"], 0.0) for start in starts)
-        return windows
+        return sample_trajectory_windows(self.episodes, count, length, seed)
 
     def read_batch(self, windows, length):
         def read(key, size):

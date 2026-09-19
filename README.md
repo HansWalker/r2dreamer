@@ -558,6 +558,50 @@ These cover analytically known errors/ranks, action-blind predictors, held-out-o
 sampling, batch invariance, report serialization, and both real model implementations
 without fitting, future-image leakage, or mutation of weights/normalization buffers.
 
+### Fresh Physical-Head Diagnostic
+
+Before another online run, isolate whether LeWorldModel/TS's frozen expert features can
+support a usable physical readout. This diagnostic trains new heads, not world models:
+
+```bash
+bash scripts/run_fresh_readout.sh \
+  --run-root runs/dmc_vision_10k \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision
+```
+
+The default checks both Cartpole models. Add `--scenarios cartpole_balance_sparse reacher ball_in_cup`
+to check all six checkpoints. Each scenario collects **one shared pool**, reused by both models:
+32 expert TRAIN episodes plus eight zero-action and eight random-action training episodes;
+validation uses eight different expert TRAIN episodes and four new episodes per simulator policy.
+Expert validation episodes were seen during native pretraining, but not during fresh-head fitting.
+The final benchmark held-out split is untouched. Episode IDs, seeds, hashes, and exact diagnostic
+windows are recorded. Zero/random actions broaden coverage but do not guarantee recovery behavior.
+
+The original encoder/dynamics and normalization statistics stay frozen. Features and fixed-action
+forecasts are cached once, with full causal histories and ordered TS patches. A fresh head first
+fits a fixed 32-example mixed batch for 1,000 updates. A **separate fresh initialization** then
+trains for 5,000 updates using the checkpoint's head batch size and pretraining head LR, without
+online warmup. Each batch contains 50% expert, 25% zero-action, and 25% random-action examples;
+episodes are sampled uniformly within each source. Only training labels determine physical output
+and loss scales (position floor 0.1, velocity floor 1, unit sine/cosine scales). Expert evaluation
+std is retained unchanged; the old head's narrow output parameterization is not inherited.
+
+Reports compare the original and fresh heads on fixed training/validation windows, with observed
+decoding, action-conditioned forecasts at 1/5/10/100 agent steps, and true/decoded persistence.
+They include coordinate RMSE, nMSE, angular/goal-relation errors, false goals, missed goals, and
+success/failure counts. `FIT` checks whether every small-batch RMSE / training scale is at most
+0.05; it is not a policy-quality threshold. `COMPLETE` only means execution succeeded.
+Training has a fixed budget, without validation-based stopping or fitting.
+
+No planner optimization, native updates, online training, checkpoint saving, or production setting
+changes occur. A timestamped `runs/fresh_readout_*` directory contains a compact `summary.txt`,
+`report.json`, `physical_errors.csv`, and per-model `metrics.jsonl` with every fitting update.
+The frozen feature cache lives only in memory. On failure, completed results and `error.log` survive.
+Use `--output` to specify a new report directory. This diagnostic does not establish online stability;
+its purpose is to choose between a readout repair and broader native training, before paying for either.
+
+CPU regression checks: `python -m scripts.check_fresh_readout`.
+
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening
