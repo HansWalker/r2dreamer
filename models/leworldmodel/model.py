@@ -249,8 +249,8 @@ class LeWorldModel(LatentPlanner):
     def configure_online(self, total_updates, resumed=False):
         self._configure_schedule(total_updates, resume=resumed)
 
-    def update(self, batch):
-        metrics = super().update(batch)
+    def update(self, batch, *, readout_batch=None):
+        metrics = super().update(batch, readout_batch=readout_batch)
         if self.scheduler is not None:
             self.scheduler.step()
             metrics["lr"] = self.optimizers["model"].param_groups[0]["lr"]

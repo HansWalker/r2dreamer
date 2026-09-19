@@ -436,7 +436,7 @@ and standard deviations remain fixed for evaluation: nMSE keeps its original mea
 sensitivity to small expert variance. Online readout updates use LR 3e-5, a 100-update linear
 warmup, and fresh Adam moments. Half of the existing 256 labels come from training-split expert
 windows encoded by the current model; the other half come from online replay. This is **only an
-auxiliary readout change**, not expert replay for the native representation or control losses.
+auxiliary readout change**, independent of the optional native expert replay below.
 The separate expert sampler and online head counter are checkpointed for resumption. Its dataset
 statistics are not rescanned. Online-only runs without a dataset must explicitly set
 `state_head.online.expert_fraction=0`; they use zero mean and unit output scale.
@@ -498,8 +498,11 @@ be resumed under the new meanings (including Reacher, whose output width stays e
 datasets remain reusable. The v8 evaluation changes do not require retraining v20 checkpoints; rerun
 evaluation to obtain the common-prefix metrics. Do not mix previous prediction scores with v8 scores.
 LeWorldModel and Temporal Straightening remain reward-free during representation training;
-validation return only selects checkpoints. Their planners minimize the fixed DMC success geometry
-predicted from latent state, with no goal image supplied at evaluation time:
+validation return only selects checkpoints. Their planners minimize squared task-relative displacement,
+scaled by the DMC goal tolerances, with no goal image supplied at evaluation time. The dense cost
+retains a restoring gradient inside the success region; actual rewards and success thresholds are unchanged.
+Evaluation v9 identifies this policy change and the corrected independent TS action gradients.
+Old policy returns must not be relabeled as v9 evaluations:
 
 ```bash
 python3 -m scripts.evaluate_dmc \
@@ -558,7 +561,7 @@ without fitting, future-image leakage, or mutation of weights/normalization buff
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening
-expert checkpoints using their original model sizes, batches, planners, precision, and schedules:
+expert checkpoints using their original model sizes, batches, planner budgets, precision, and schedules:
 
 ```bash
 bash scripts/run_online_checkpoint_smoke.sh \
@@ -566,29 +569,57 @@ bash scripts/run_online_checkpoint_smoke.sh \
   --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision
 ```
 
-This collects 4,096 environment steps per model into empty replay using the model's own policy.
-With the production warmup/update ratio this reaches 262 online updates. It skips expert training,
-policy evaluation episodes, and checkpoint writes. The original 10,000-update learning-rate schedule
+By default, each model runs three independent branches from the same expert checkpoint:
+native online-only training, 50/50 native expert/online training, and that same mixture with
+256 additional head-only calibration updates. Each branch collects 4,096 environment steps into
+empty on-policy replay and performs 262 native updates under the production schedule. It skips
+expert pretraining and checkpoint writes. The original 10,000-update learning-rate schedule
 is preserved, not shortened to the smoke budget. `--env-steps` changes only the stopping point;
 `--models` and `--scenarios` select other LeWorldModel/TS cases. Completed expert checkpoints and
 matching held-out datasets are required; incompatible or online checkpoints are rejected.
 
-Prediction-preserving migration is checked before training. The same 16 held-out windows are
+Use `--native-expert-fractions 0 0.5`, `--calibration-updates 256`, and `--policy-episodes 1`
+to set these budgets explicitly. The original checkpoint is read-only. Fixed expert windows and
+complete pretrained-policy, zero-action, and random-action validation episodes are collected once
+per model, then reused across branches. A complete policy episode on the same independent seed
+also runs after each branch. These few episodes diagnose behavior, not reliable policy rankings.
+
+Calibration uses separate zero/random training episodes and training-split expert labels, never
+validation data. Native features and BN statistics stay frozen during calibration. Physical scales
+are fixed from these training states with floors of 0.1 m for positions, 1 for velocities, and unit
+scale for trigonometric coordinates; both output and loss conditioning use those scales. The
+initial affine migration preserves predictions, while the original expert evaluation std stays fixed.
+This is an **unvalidated diagnostic candidate**, not a new production default. Extra head updates
+are reported separately; native batches, source-episode counts, losses, and optimizer counts do not grow.
+
+Prediction-preserving checkpoint migration is checked before training. Expert and fixed simulator windows are
 scored before, every 64 updates, and after, with context 64 and horizons 1/100, without fitting. Reports include
 original-unit RMSE, unchanged expert-normalized nMSE, representation diagnostics, online losses,
 and the source checkpoint identity. A timestamped `runs/online_checkpoint_smoke_*` directory holds
 `summary.txt`, `report.json`, and per-worker logs/metrics; `--output` must name a new directory.
-PASS includes an observed-state regression guard, not proof that long-run degradation is solved.
+PASS includes observed/forecast regression and false-goal guards, not proof that long-run degradation is solved.
 REGRESSION distinguishes finite execution with degraded predictions from an execution failure.
-By default each observed-state RMSE must stay below `3 * max(initial RMSE, 0.01)` in original units,
+By default each observed/forecast coordinate RMSE must stay below `3 * max(initial RMSE, 0.01)` in original units,
 and mean nMSE below `9 * max(initial nMSE, 1)`, at every diagnostic snapshot. These are explicit
-smoke alarms, not significance tests or model-selection criteria; forecast errors remain reported.
-Only training-split expert labels are used by the head. Diagnostic windows never supply gradients,
+smoke alarms, not significance tests or model-selection criteria. `--rmse-floors` accepts a JSON map
+of coordinate-specific original-unit floors. `UNVALIDATED` means no validation failure states were
+available, or the observed head falsely predicted success on more than `--max-false-success-rate`
+(default 20%) of actual failures in any sampled cohort. Goal-relation errors and failure counts are logged.
+Diagnostic windows never supply gradients,
 and the declared online schedule runs to its stopping point even if a diagnostic flags regression.
 There is no repeated serial/concurrent benchmark or full dataset quality audit.
 
 Run `python -m scripts.check_online_checkpoint_smoke` for CPU regression checks using tiny models
 and simulated observations; the full-size CUDA/environment check must run on the training server.
+`python -m scripts.check_online_repairs` checks gradient invariance, replay budgets/resumption,
+frozen-native calibration, and disjoint validation end to end. For a minimal execution-only check,
+use `--native-expert-fractions 0 --calibration-updates 0 --policy-episodes 0`; this cannot validate failure-state quality.
+
+Native retention is opt-in via `training.online.expert_fraction` (default 0). For LeWorldModel/TS,
+0.5 means 168 expert plus 168 online sequences, from eight episodes each, in one native forward
+including BatchNorm. The head independently receives its usual 128 expert plus 128 online labels,
+not an accidental 75/25 mix. Both expert sampler states are saved for exact sampling resumption.
+The comparison validator rejects silently mixing native-retention protocols within one result matrix.
 
 ## Training Budget
 
@@ -623,17 +654,25 @@ No dataset, environment rollout, or checkpoint writes are required.
 Dreamer and STORM retain pre-tanh samples for online actor scoring; STORM also bootstraps
 transition returns from the next-state value (recipe 3 corrections).
 
-Training recipe 5 adds the auxiliary readout stabilization above. Old checkpoints remain evaluable
+Training recipe 6 adds dense goal costs, independent TS action gradients, and optional native retention
+to recipe 5's auxiliary readout stabilization. Old checkpoints remain evaluable
 with exactly their original predictions and evaluation statistics. For training, Dreamer expert
-recipes 2/3/4, STORM expert recipes 3/4, and planning-family expert recipes 2/4 can be reused with otherwise
+recipes 2/3/4/5, STORM expert recipes 3/4/5, and planning-family expert recipes 2/4/5 can be reused with otherwise
 identical settings. Loading them preserves the head's affine layer and resets only its old Adam moments. Native
 weights, native optimizer state, and update counters are retained. This migration is not refitting
 or a repair of already degraded predictions. STORM recipe-2 expert weights still require fresh
 pretraining because of the return-target bug. Older online recipes cannot resume corrected training;
-keep corrected results in a separate output directory.
+keep corrected results in a separate output directory. Completed expert checkpoints also permit an explicit
+change to the new native online-retention fraction; pretraining settings must still match.
 
 Run `python -m scripts.check_state_normalization` for CPU checks of loss conditioning, legacy
 prediction/gradient preservation, optimizer migration, and all five families' checkpoint paths.
+
+Run `python -m scripts.check_training_contracts` for small-model Dreamer/STORM/TD-MPC2 checks of
+native optimizer coverage, actual component updates, target EMAs, physical-label isolation,
+checkpoint continuation, and recurrent output/gradient equivalence. Mamba3 update checks use CUDA
+when available and otherwise report skips. No data files, simulator, or checkpoint writes are needed;
+these checks are not part of the training launch path and do not establish long-run learning stability.
 
 The five Dreamer variants share their convolutional encoder/decoder, posterior, prior, and losses;
 only the deterministic sequence core changes. The five STORM variants share their
@@ -693,7 +732,8 @@ actions. Planning and evaluation share the same autoregressive rollout implement
 Temporal Straightening computes action gradients in batches of at most
 `jepa_model.planner.gradient_batch_size=256` candidate trajectories. This bounds planning memory
 without changing the number of environments, restarts, iterations, or future steps, and preserves
-the full-batch cost normalization. The batch size is an execution setting, not a checkpoint recipe.
+independent candidate gradients: sum candidate costs, never divide them by environment/restart count.
+The batch size is an execution setting, not a checkpoint recipe.
 
 Dreamer, STORM, and the goal planners use BF16 mixed precision for CUDA neural computation, including
 Dreamer's history reconstruction and acting. TD-MPC2 defaults to FP32 after BF16 slowed warm updates

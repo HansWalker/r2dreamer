@@ -87,6 +87,7 @@ training:
     steps: 80000
     updates: 10000
     warmup_transitions: 1024
+    expert_fraction: 0.0  # Native retention candidate; independent of state_head.online.expert_fraction.
     log_every: 5000
     eval_every: 20000
     save_every: 20000

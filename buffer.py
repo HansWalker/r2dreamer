@@ -193,10 +193,13 @@ class SequenceBuffer(EpisodeReplay):
         self._obs_keys = tuple(state["obs_keys"]) if state.get("obs_keys") else None
         super().load_state_dict(state["replay"])
 
-    def sample(self, batch_size=None, sequence_length=None, with_context=False):
+    def sample(self, batch_size=None, sequence_length=None, with_context=False, episodes_per_batch=None):
         batch_size = int(batch_size or self.batch_size)
         sequence_length = int(sequence_length or self.sequence_length)
-        groups = self.sample_groups(batch_size, sequence_length, self.episodes_per_batch)
+        sources = self.episodes_per_batch if episodes_per_batch is None else int(episodes_per_batch)
+        if sources < 1 or batch_size % sources:
+            raise ValueError("Sequence batches must divide evenly across positive source episode counts.")
+        groups = self.sample_groups(batch_size, sequence_length, sources)
         windows = [episode[start : start + sequence_length] for episode, starts in groups for start in starts]
         batch = _to_device(torch.stack(windows, dim=0), self.device)
         obs = {key: batch[key] for key in self._obs_keys}

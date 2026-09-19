@@ -3,7 +3,6 @@
 import math
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from models.shared.physical_state import STATE_KEY, PhysicalStateHead, readout_mode
@@ -95,7 +94,7 @@ class LatentPlanner(nn.Module):
             optimizer.load_state_dict(state[name])
         self.state_head.load_optimizer_state_dict(state["state_head"])
 
-    def update(self, batch):
+    def update(self, batch, *, readout_batch=None):
         obs, action, *_ = batch
         obs = {key: value.to(self.device, non_blocking=True) for key, value in obs.items()}
         labels = obs.pop(STATE_KEY)
@@ -115,7 +114,7 @@ class LatentPlanner(nn.Module):
         for optimizer in self.optimizers.values():
             optimizer.step()
 
-        feature, labels = self.readout_features(batch)
+        feature, labels = self.readout_features(batch if readout_batch is None else readout_batch)
         return {
             "loss": float(loss.detach()),
             "grad_norm": float(grad_norm),
@@ -173,12 +172,9 @@ class LatentPlanner(nn.Module):
         physical = self.state_head(tail.flatten(0, 1)).reshape(batch, samples, self.goal_stable_steps, -1)
         relation = self.state_head.targets.goal_relation(physical)
         relation = relation / self.goal_tolerance
-        if self.goal_geometry == "radial":
-            outside = F.relu(relation.norm(dim=-1) - 1)
-            cost = outside.square()
-        else:
-            outside = F.relu(relation.abs() - 1)
-            cost = outside.square().sum(dim=-1)
+        # Keep a restoring signal inside the success region as well as outside it.
+        # Success thresholds belong to evaluation, not to a flat planning objective.
+        cost = relation.square().sum(dim=-1)
         action_cost = candidates.square().mean(dim=(-1, -2))
         return cost.mean(dim=-1) + self.goal_action_weight * action_cost
 
@@ -248,8 +244,9 @@ class LatentPlanner(nn.Module):
                 for start, stop, chunk_latent, chunk_past in chunks:
                     chunk = logits.flatten(0, 1)[start:stop].detach().requires_grad_()
                     cost = self._goal_cost(chunk_latent, chunk_past, chunk.tanh()[:, None])
-                    # Preserve the original global mean, including a smaller final batch.
-                    gradient[start:stop] = torch.autograd.grad(cost.sum() / candidates, chunk)[0]
+                    # Each candidate has independent action variables. Averaging across
+                    # environments/restarts changes Adam's effective epsilon and step.
+                    gradient[start:stop] = torch.autograd.grad(cost.sum(), chunk)[0]
                 logits.grad = gradient.view_as(logits)
                 optimizer.step()
                 scheduler.step()

@@ -81,8 +81,28 @@ def analyze_batch(model, observation, actions, targets, context, horizons, rando
             "physical_squared_delta": (alternative_physical - forecast).square()[:, indices].cpu(),
             "action_squared_delta": (alternative - actual).square().mean((1, 2)).cpu(),
         }
+    goals = {}
+    if hasattr(model, "goal_tolerance"):
+        true_relation = head.targets.goal_relation(truth)[:, indices]
+
+        def inside(relation):
+            scaled = relation / model.goal_tolerance
+            return scaled.norm(dim=-1) <= 1 if model.goal_geometry == "radial" else (scaled.abs() <= 1).all(-1)
+
+        actual_success = inside(true_relation)
+        for name in ("observed", "forecast"):
+            relation = head.targets.goal_relation(estimates[name])[:, indices]
+            difference = relation - true_relation
+            if head.targets.task == "dmc_cartpole_balance_sparse":
+                difference[..., 1] = torch.atan2(difference[..., 1].sin(), difference[..., 1].cos())
+            goals[name] = {
+                "squared_error": difference.square().cpu(),
+                "false_success": (inside(relation) & ~actual_success).cpu(),
+                "failure": (~actual_success).cpu(),
+                "predicted_success": inside(relation).cpu(),
+            }
     return {"errors": errors, "latent_error": latent_error, "temporal": temporal,
-            "physical_motion": physical_motion, "frames": frames, "responses": responses}
+            "physical_motion": physical_motion, "frames": frames, "responses": responses, "goals": goals}
 
 
 def summarize_batches(batches, windows, head, horizons):
@@ -98,7 +118,7 @@ def summarize_batches(batches, windows, head, horizons):
     result = {}
     selections = {"all": list(range(len(windows)))}
     selections.update({name: [i for i, window in enumerate(windows) if window.cohort == name]
-                       for name in ("uniform", "motion")})
+                       for name in dict.fromkeys(window.cohort for window in windows) if name != "all"})
     for cohort, indices in selections.items():
         if not indices:
             continue
@@ -137,6 +157,22 @@ def summarize_batches(batches, windows, head, horizons):
             "action_sensitivity": responses,
             "physical_temporal_rms_delta": dict(zip(coordinates, motion[indices].mean(0).sqrt().tolist(), strict=True)),
         }
+        goals = {}
+        for source in batches[0].get("goals", {}):
+            values = {key: torch.cat([batch["goals"][source][key] for batch in batches])[indices]
+                      for key in batches[0]["goals"][source]}
+            goals[source] = {
+                str(horizon): {
+                    "relation_rmse": values["squared_error"][:, i].mean(0).sqrt().tolist(),
+                    "failure_states": int(values["failure"][:, i].sum()),
+                    "false_success_rate": (values["false_success"][:, i].sum().item()
+                                           / values["failure"][:, i].sum().item())
+                        if values["failure"][:, i].any() else None,
+                    "predicted_success_fraction": values["predicted_success"][:, i].float().mean().item(),
+                } for i, horizon in enumerate(horizons)
+            }
+        if goals:
+            result[cohort]["goals"] = goals
     return result
 
 
@@ -145,7 +181,7 @@ def analyze_checkpoint(model, dataset, windows, args):
     context, horizons = args.context_length, args.horizons
     length = context + max(horizons)
     random = torch.Generator().manual_seed(args.window_seed + 1)
-    action_dim = dataset.h5["actions"].shape[-1]
+    action_dim = model.action_dim
     alternatives = torch.rand(len(windows), max(horizons), action_dim, generator=random) * 2 - 1
     batches = []
     for offset in range(0, len(windows), args.batch_size):

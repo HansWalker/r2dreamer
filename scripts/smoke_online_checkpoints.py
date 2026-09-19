@@ -1,6 +1,7 @@
 """Short online-only LeWorldModel/TS checks from expert checkpoints; never save weights."""
 
 import argparse
+import copy
 import json
 import math
 import sys
@@ -18,7 +19,11 @@ from omegaconf import OmegaConf
 import tools
 from dmc_expert.storage import dataset_identity, validate_dataset
 from envs import close_envs, make_envs
+from models.shared.physical_state import readout_mode
 from scripts.diagnose_planning_models import FAMILIES, SCENARIOS, analyze_checkpoint
+from scripts.online_validation import (
+    TrajectoryDataset, calibrate_readout, collect_episode, episode_metadata, validation_metadata,
+)
 from training import load_model_family
 from training.evaluation import StateDataset
 from training.progress import Progress, console, duration
@@ -28,27 +33,24 @@ from training.protocol import (
     upgrade_readout_config,
     validate_checkpoint,
 )
-from training.readout import online_readout
+from training.readout import native_mixture, online_readout
 from training.trainer import online_update_target, progress_metrics
 
 
 @tools.preserve_rng_state
 def diagnose(model, dataset, windows, args):
-    was_training = model.training
-    try:
+    with readout_mode(model):
         result = analyze_checkpoint(model, dataset, windows, args)
         # Reject non-finite diagnostics before adding them to the saved report.
         json.dumps(result, allow_nan=False)
         return result
-    finally:
-        model.train(was_training)
 
 
 @tools.preserve_rng_state
 @torch.no_grad()
 def migrate(model, family, checkpoint, dataset, windows, context):
     """Check the output affine on identical features before allowing any optimization."""
-    was_training = model.training
+    modes = [(module, module.training) for module in model.modules()]
     model.eval()
     try:
         observation, _, _ = dataset.read_batch(windows[:1], context)
@@ -72,7 +74,8 @@ def migrate(model, family, checkpoint, dataset, windows, context):
             "head_optimizer_reset": legacy,
         }
     finally:
-        model.train(was_training)
+        for module, mode in modes:
+            module.training = mode
 
 
 def online_prefix(config, family, model, envs, env_steps, metrics_path, snapshot=None, diagnostic_every=64):
@@ -122,6 +125,7 @@ def online_prefix(config, family, model, envs, env_steps, metrics_path, snapshot
         "head_updates_after": model.state_head.updates.item(), "last_metrics": metrics,
         "replay_source": "fresh trajectories from the checkpoint's own updated policy; no expert seeding",
         "readout_expert_fraction": model.state_head.expert_fraction,
+        "native_expert_fraction": float(config.training.online.get("expert_fraction", 0.0)),
         "replay_rows": session.replay.count(), "completed_episodes": len(episodes),
         "completed_episode_returns": [score for score, _ in episodes],
         "elapsed_seconds": time.monotonic() - started,
@@ -130,13 +134,15 @@ def online_prefix(config, family, model, envs, env_steps, metrics_path, snapshot
     }
 
 
-def accuracy_regression(before, after, *, max_ratio=3.0, rmse_floor=0.01):
+def accuracy_regression(before, after, *, max_ratio=3.0, rmse_floor=0.01, rmse_floors=None,
+                        source="observed", horizon="1", cohort="all"):
     """An explicit smoke alarm, not a statistical test or a tuned model-selection score."""
-    baseline = before["all"]["physical"]["observed"]["1"]
-    updated = after["all"]["physical"]["observed"]["1"]
+    baseline = before[cohort]["physical"][source][str(horizon)]
+    updated = after[cohort]["physical"][source][str(horizon)]
     previous, current = baseline["rmse"], updated["rmse"]
     coordinates = {
-        key: {"before": value, "after": current[key], "limit": max(value, rmse_floor) * max_ratio}
+        key: {"before": value, "after": current[key],
+              "limit": max(value, (rmse_floors or {}).get(key, rmse_floor)) * max_ratio}
         for key, value in previous.items()
     }
     failed = [key for key, value in coordinates.items() if value["after"] > value["limit"]]
@@ -148,12 +154,134 @@ def accuracy_regression(before, after, *, max_ratio=3.0, rmse_floor=0.01):
             "normalized_mse_limit": normalized_limit}
 
 
+def diagnostic_guards(before, after, args):
+    checks = {}
+    for cohort in before:
+        for source in ("observed", "forecast"):
+            for horizon in args.horizons:
+                checks[f"{cohort}/{source}/h{horizon}"] = accuracy_regression(
+                    before, after, max_ratio=getattr(args, "max_rmse_ratio", 3.0),
+                    rmse_floor=getattr(args, "rmse_floor", .01), rmse_floors=getattr(args, "rmse_floors", {}),
+                    source=source, horizon=horizon, cohort=cohort,
+                )
+    return {"passed": all(check["passed"] for check in checks.values()), "checks": checks}
+
+
+def run_trials(config, family, model, checkpoint, dataset, windows, args, result):
+    """Share fixed diagnostic data across fresh checkpoint branches, never across training replays."""
+    fractions = list(dict.fromkeys(getattr(args, "native_expert_fractions", [0.0])))
+    candidates = [(f"native_{fraction:g}", fraction, 0) for fraction in fractions]
+    calibration_updates = getattr(args, "calibration_updates", 0)
+    if calibration_updates:
+        candidates.append((f"native_{fractions[-1]:g}_calibrated", fractions[-1], calibration_updates))
+    for fraction in fractions:
+        candidate = copy.deepcopy(config)
+        candidate.training.online.expert_fraction = fraction
+        native_mixture(candidate)
+        if fraction != float(config.training.online.expert_fraction):
+            validate_checkpoint(checkpoint, candidate, training=True)
+    unknown = set(getattr(args, "rmse_floors", {})) - set(model.state_head.coordinates)
+    if unknown:
+        raise ValueError(f"Unknown physical coordinates in --rmse-floors: {sorted(unknown)}")
+    result["before"] = diagnose(model, dataset, windows, args)
+    validation, validation_windows, calibration_episodes = None, None, []
+    policy_episodes = getattr(args, "policy_episodes", 0)
+    validation_seed = int(args.window_seed) + 4_000_000
+    policy_seeds = list(range(validation_seed, validation_seed + policy_episodes))
+    failure_seed = validation_seed + policy_episodes
+    if policy_episodes:
+        print("Evaluation | collecting fixed policy/failure validation episodes (once)", flush=True)
+        episodes = [collect_episode(config, model, seed, "policy") for seed in policy_seeds]
+        result["policy_before"] = episode_metadata(episodes)
+        episodes.extend(collect_episode(config, model, failure_seed + i, mode)
+                        for i, mode in enumerate(("zero", "random")))
+        forbidden = range(int(config.env.seed), int(config.env.seed) + int(config.env.env_num))
+        validation = TrajectoryDataset(episodes, forbidden_seeds=forbidden)
+        validation_windows = validation.sample_windows(args.windows, args.context_length + max(args.horizons), args.window_seed)
+        result["validation_data"] = validation_metadata(validation, validation_windows)
+        result["validation_before"] = diagnose(model, validation, validation_windows, args)
+        if calibration_updates:
+            calibration_episodes = [collect_episode(config, model, failure_seed + 2 + i, mode)
+                                    for i, mode in enumerate(("zero", "random"))]
+            TrajectoryDataset(calibration_episodes, forbidden_seeds=[*forbidden, *(e["seed"] for e in episodes)])
+    elif calibration_updates:
+        raise ValueError("Calibration requires disjoint simulator validation; enable --policy-episodes.")
+
+    result["trials"] = []
+    for name, fraction, calibration in candidates:
+        started = time.monotonic()
+        print(f"Trial | {name} | native_expert={fraction:g} | head_calibration_updates={calibration}", flush=True)
+        config.training.online.expert_fraction = fraction
+        family.load_checkpoint(model, copy.deepcopy(checkpoint), training=True)
+        tools.set_rng_state(checkpoint.get("rng_state"))
+        trial = {"name": name, "before": result["before"], "snapshots": [],
+                 "compatibility": checkpoint_compatibility(config), "native_expert_fraction": fraction}
+        result["trials"].append(trial)
+
+        def measure(steps, updates):
+            expert = diagnose(model, dataset, windows, args)
+            item = {"env_steps": steps, "updates": updates, "diagnostic": expert,
+                    "accuracy": accuracy_regression(result["before"], expert,
+                        max_ratio=getattr(args, "max_rmse_ratio", 3.0), rmse_floor=getattr(args, "rmse_floor", .01))}
+            item["expert_guard"] = diagnostic_guards(result["before"], expert, args)
+            if validation is not None:
+                item["validation"] = diagnose(model, validation, validation_windows, args)
+                item["validation_guard"] = diagnostic_guards(result["validation_before"], item["validation"], args)
+            return item
+
+        def snapshot(steps, updates):
+            print(f"Evaluation | {name} | online_updates={updates}", flush=True)
+            trial["snapshots"].append(measure(steps, updates))
+
+        envs = None
+        try:
+            with online_readout(config, family, model, expected_dataset=result["dataset_identity"]) as readout_replay:
+                if calibration:
+                    sampler_state = copy.deepcopy(readout_replay.state_dict()) if readout_replay is not None else None
+                    trial["calibration"] = calibrate_readout(model, calibration_episodes, calibration, failure_seed + 4)
+                    if sampler_state is not None:
+                        readout_replay.load_state_dict(sampler_state)
+                    trial["snapshots"].append(measure(0, 0))
+                envs = make_envs(config.env, seed=int(config.env.seed))
+                metrics_path = Path(args.result_path).with_name(f"{name}_metrics.jsonl")
+                trial["online"] = online_prefix(config, family, model, envs, args.env_steps, metrics_path, snapshot,
+                                                getattr(args, "diagnostic_every_updates", 64))
+        finally:
+            close_envs(envs)
+        final = measure(args.env_steps, trial["online"]["updates"])
+        trial.update(after=final["diagnostic"], accuracy=final["accuracy"], final_checks=final)
+        checks = [*trial["snapshots"], final]
+        stable = all(check["expert_guard"]["passed"] and check.get("validation_guard", {"passed": True})["passed"]
+                     for check in checks)
+        trial["status"] = "PASS" if stable else "REGRESSION"
+        if validation is not None:
+            policy = TrajectoryDataset([collect_episode(config, model, seed, "policy") for seed in policy_seeds])
+            policy_windows = policy.sample_windows(args.windows, args.context_length + max(args.horizons), args.window_seed)
+            trial["policy_after"] = episode_metadata(policy.episodes)
+            trial["policy_after_diagnostic"] = diagnose(model, policy, policy_windows, args)
+            trial["policy_after_windows"] = [asdict(window) for window in policy_windows]
+            goals = [cohort["goals"]["observed"]["1"] for cohort in final["validation"].values()]
+            goals.append(trial["policy_after_diagnostic"]["all"]["goals"]["observed"]["1"])
+            failures = [goal for goal in goals if goal["failure_states"]]
+            trial["failure_state_quality_passed"] = bool(failures) and all(
+                goal["false_success_rate"] <= args.max_false_success_rate for goal in failures
+            )
+            if stable and not trial["failure_state_quality_passed"]:
+                trial["status"] = "UNVALIDATED"
+        else:
+            trial["failure_state_quality_passed"] = None
+        trial["elapsed_seconds"] = time.monotonic() - started
+    # Retain the single-case fields for existing report consumers.
+    result.update({key: result["trials"][-1][key] for key in ("online", "after", "accuracy", "snapshots")})
+    result["status"] = ("REGRESSION" if any(trial["status"] == "REGRESSION" for trial in result["trials"])
+                        else "UNVALIDATED" if any(trial["status"] == "UNVALIDATED" for trial in result["trials"]) else "PASS")
+
+
 def run_case(job):
     args = SimpleNamespace(**job)
     path = Path(args.checkpoint)
     result = {"scenario": args.scenario, "model": args.model, "checkpoint": str(path), "status": "FAIL"}
     started = time.monotonic()
-    envs = None
     try:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         config = OmegaConf.create(checkpoint["training_config"])
@@ -198,39 +326,14 @@ def run_case(job):
             result["windows"] = [asdict(window) for window in windows]
             result["migration"] = migrate(model, family, checkpoint, dataset, windows, args.context_length)
             tools.set_rng_state(checkpoint.get("rng_state"))
-            del checkpoint
-            print("Evaluation | state_prediction=running | stage=before | held-out windows", flush=True)
-            result["before"] = diagnose(model, dataset, windows, args)
-            result["snapshots"] = []
-
-            def snapshot(steps, updates):
-                print(f"Evaluation | state_prediction=running | online_updates={updates}", flush=True)
-                diagnostic = diagnose(model, dataset, windows, args)
-                result["snapshots"].append({"env_steps": steps, "updates": updates, "diagnostic": diagnostic,
-                    "accuracy": accuracy_regression(result["before"], diagnostic,
-                        max_ratio=getattr(args, "max_rmse_ratio", 3.0), rmse_floor=getattr(args, "rmse_floor", .01))})
-
-            envs = make_envs(config.env, seed=int(config.env.seed))
-            with online_readout(config, family, model, expected_dataset=result["dataset_identity"]):
-                result["online"] = online_prefix(config, family, model, envs, args.env_steps,
-                    Path(args.result_path).with_name("metrics.jsonl"), snapshot,
-                    getattr(args, "diagnostic_every_updates", 64))
-            close_envs(envs)
-            envs = None
-            print("Evaluation | state_prediction=running | stage=after | same held-out windows", flush=True)
-            result["after"] = diagnose(model, dataset, windows, args)
-            result["accuracy"] = accuracy_regression(result["before"], result["after"],
-                max_ratio=getattr(args, "max_rmse_ratio", 3.0), rmse_floor=getattr(args, "rmse_floor", .01))
+            run_trials(config, family, model, checkpoint, dataset, windows, args, result)
         if device.type == "cuda":
             result["gpu_reserved_peak_gib"] = torch.cuda.max_memory_reserved(device) / 1024**3
         result["execution_passed"] = True
-        stable = result["accuracy"]["passed"] and all(item["accuracy"]["passed"] for item in result["snapshots"])
-        result["status"] = "PASS" if stable else "REGRESSION"
     except Exception as error:  # noqa: BLE001 - Preserve each worker's failure alongside successful reports.
         result["error"] = f"{type(error).__name__}: {error}"
         traceback.print_exc()
     finally:
-        close_envs(envs)
         result["elapsed_seconds"] = time.monotonic() - started
         Path(args.result_path).write_text(json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     return result
@@ -238,28 +341,44 @@ def run_case(job):
 
 def write_summary(output, results, args):
     lines = ["Checkpoint online check | no pretraining or checkpoint writes",
-             "Run | Updates | Migration max error | Observed nMSE h1 before->after | Forecast nMSE h100 before->after | Time"]
+             "Run / trial | Updates | Expert obs h1 / forecast h100 nMSE before->after | Simulator obs h1 nMSE | False goal | Policy return | Time"]
     for result in results:
         name = f"{result['scenario']}/{result['model']}"
         if result["status"] == "FAIL":
             lines.append(f"FAIL | {name} | {result.get('error', 'worker failed')} | {result['log']}")
             continue
-        observed = [result[stage]["all"]["physical"]["observed"]["1"]["mean_normalized_mse"] for stage in ("before", "after")]
-        forecast = [result[stage]["all"]["physical"]["forecast"]["100"]["mean_normalized_mse"] for stage in ("before", "after")]
-        lines.append(f"{result['status']} | {name} | {result['online']['updates']} | {result['migration']['max_prediction_difference']:.3g} | "
-                     f"{observed[0]:.3g}->{observed[1]:.3g} | {forecast[0]:.3g}->{forecast[1]:.3g} | {duration(result['elapsed_seconds'])}")
-        if result["status"] == "REGRESSION":
-            failures = set(result["accuracy"]["failed_coordinates"])
-            for item in result["snapshots"]:
-                failures.update(item["accuracy"]["failed_coordinates"])
-            lines.append("  Observed-state error regression: " + ", ".join(sorted(failures)))
-    lines.extend(["PASS includes the short-run observed-state RMSE guard; it does NOT establish long-run learning stability.",
-                  "REGRESSION means execution succeeded but an intermediate/final coordinate exceeded the declared error limit.",
+        for trial in result.get("trials", [result]):
+            observed = [trial[stage]["all"]["physical"]["observed"]["1"]["mean_normalized_mse"] for stage in ("before", "after")]
+            forecast = [trial[stage]["all"]["physical"]["forecast"]["100"]["mean_normalized_mse"] for stage in ("before", "after")]
+            validation = trial.get("final_checks", {}).get("validation")
+            failure, false_goal, policy = "-", "-", "-"
+            if validation is not None:
+                first, last = result["validation_before"]["all"], validation["all"]
+                failure = f"{first['physical']['observed']['1']['mean_normalized_mse']:.3g}->{last['physical']['observed']['1']['mean_normalized_mse']:.3g}"
+                rates = [value["goals"]["observed"]["1"]["false_success_rate"] for value in (first, last)]
+                false_goal = "->".join("no failures" if rate is None else f"{rate:.0%}" for rate in rates)
+                returns = [sum(episode["return"] for episode in episodes) / len(episodes)
+                           for episodes in (result["policy_before"], trial["policy_after"])]
+                policy = f"{returns[0]:.1f}->{returns[1]:.1f}"
+            lines.append(f"{trial['status']} | {name}/{trial.get('name', 'online')} | {trial['online']['updates']} | "
+                         f"{observed[0]:.3g}->{observed[1]:.3g} / {forecast[0]:.3g}->{forecast[1]:.3g} | "
+                         f"{failure} | {false_goal} | {policy} | {duration(trial['elapsed_seconds'])}")
+            failures = set()
+            for item in [*trial["snapshots"], trial.get("final_checks", {})]:
+                for domain in ("expert_guard", "validation_guard"):
+                    for key, check in item.get(domain, {}).get("checks", {}).items():
+                        if not check["passed"]:
+                            failures.add(f"{domain}/{key}")
+            if failures:
+                lines.append(f"  Error guards failed: {len(failures)} cohort/source/horizon checks; coordinates in report.json.")
+    lines.extend(["PASS is a short-run error guard; it does NOT establish long-run stability or policy quality.",
+                  "REGRESSION: intermediate/final physical errors exceeded declared limits. UNVALIDATED: insufficient failure coverage or excessive false goals.",
                   "Expert nMSE scales are unchanged. Original-unit RMSE, cohorts, and exact windows are in report.json.",
-                  "This is an early prefix of the original schedule, not a compressed training run or a policy success evaluation."])
+                  "Policy returns use complete episodes, separate seeds, and no training replay; few episodes are diagnostic only.",
+                  "Native budgets are unchanged. Calibration adds explicitly reported head-only updates; no validation fitting."])
     report = {
-        "diagnostic_version": 2, "implementation_sha256": implementation_sha256(),
-        "dataset_role": "held_out_expert", "evaluation_fitting": False, "checkpoint_writes": False,
+        "diagnostic_version": 3, "implementation_sha256": implementation_sha256(),
+        "dataset_role": "held_out_expert_and_disjoint_simulator", "evaluation_fitting": False, "checkpoint_writes": False,
         "settings": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "results": results,
     }
@@ -283,6 +402,14 @@ def main():
     parser.add_argument("--context-length", type=int, default=64)
     parser.add_argument("--window-seed", type=int, default=2000000)
     parser.add_argument("--diagnostic-every-updates", type=int, default=64)
+    parser.add_argument("--native-expert-fractions", nargs="+", type=float, default=[0.0, 0.5],
+                        help="Independent fresh online branches; same native batch/update budget.")
+    parser.add_argument("--calibration-updates", type=int, default=256,
+                        help="Additional candidate at the last native fraction; head-only, training states only. Zero disables.")
+    parser.add_argument("--policy-episodes", type=int, default=1,
+                        help="Complete policy episodes before/after; also enable fixed zero/random failure validation.")
+    parser.add_argument("--max-false-success-rate", type=float, default=.2)
+    parser.add_argument("--rmse-floors", type=json.loads, default={}, help="JSON map of coordinate-specific original-unit alarm floors.")
     parser.add_argument("--max-rmse-ratio", type=float, default=3.0, help="Observed-state alarm threshold, not a model-selection metric.")
     parser.add_argument("--rmse-floor", type=float, default=.01, help="Original-unit floor before multiplying the baseline by --max-rmse-ratio.")
     parser.add_argument("--output", type=Path,
@@ -296,6 +423,15 @@ def main():
         parser.error("Provide --dataset-root and positive step/window/batch/context sizes.")
     if args.diagnostic_every_updates < 1 or not math.isfinite(args.max_rmse_ratio) or args.max_rmse_ratio <= 1 or not math.isfinite(args.rmse_floor) or args.rmse_floor <= 0:
         parser.error("Use positive diagnostic frequency and RMSE floor, and a finite RMSE ratio greater than one.")
+    if args.calibration_updates < 0 or args.policy_episodes < 0 or (args.calibration_updates and not args.policy_episodes):
+        parser.error("Calibration needs validation episodes; counts must be nonnegative.")
+    if not all(math.isfinite(value) and 0 <= value < 1 for value in args.native_expert_fractions):
+        parser.error("Native fractions must be finite and in [0, 1).")
+    if not math.isfinite(args.max_false_success_rate) or not 0 <= args.max_false_success_rate <= 1:
+        parser.error("The false-success limit must be in [0, 1].")
+    if not isinstance(args.rmse_floors, dict) or any(not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
+                                                  for value in args.rmse_floors.values()):
+        parser.error("RMSE floors must map coordinate names to finite positive values.")
     args.horizons = [1, 100]
     args.run_root, args.dataset_root, args.output = (path.expanduser().resolve() for path in (args.run_root, args.dataset_root, args.output))
     jobs = []
@@ -328,7 +464,7 @@ def main():
                 "scenario": job["scenario"], "model": job["model"], "status": "FAIL",
                 "error": f"Worker exited {code} without a report",
             }
-            if code and result["status"] != "REGRESSION":
+            if code and result["status"] not in {"REGRESSION", "UNVALIDATED"}:
                 result["status"] = "FAIL"
             result["log"] = str(log)
             results.append(result)

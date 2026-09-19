@@ -14,18 +14,20 @@ ROOT = Path(__file__).resolve().parents[1]
 IMPLEMENTATION_ENV = "DMC_IMPLEMENTATION_SHA256"
 # Bump these for incompatible payload/recipe changes or changed metric semantics, not source formatting.
 CHECKPOINT_SCHEMA = 2
-TRAINING_RECIPE_VERSION = 5
-EVALUATION_PROTOCOL = "dmc_evaluation_v8"
+TRAINING_RECIPE_VERSION = 6
+EVALUATION_PROTOCOL = "dmc_evaluation_v9"
 
 
 def upgrade_readout_config(config):
-    """Add only auxiliary online defaults, including resolved copies in old checkpoints."""
+    """Add online-only defaults, including resolved copies in old checkpoints."""
     pending = [config]
     while pending:
         node = pending.pop()
         if OmegaConf.is_dict(node):
             if "state_head" in node and "online" not in node.state_head:
                 node.state_head.online = {"lr": 3e-5, "warmup_updates": 100, "expert_fraction": 0.5}
+            if "training" in node and "online" in node.training:
+                node.training.online.setdefault("expert_fraction", 0.0)
             pending.extend(node.values())
 
 
@@ -200,6 +202,9 @@ def family_recipe_sha256(config):
 
 def validate_training_recipe(config):
     """Reject configuration combinations that change or break the comparison protocol."""
+    from training.readout import native_mixture
+
+    native_mixture(config)
     errors = []
 
     def require(condition, message):
@@ -390,6 +395,7 @@ def comparison_signature(config):
         "expert_dataset_heldout_episodes": int(config.expert_data.heldout_episodes),
         "online_steps": int(config.training.online.steps),
         "online_updates": int(config.training.online.updates),
+        "native_expert_fraction": float(config.training.online.get("expert_fraction", 0.0)),
         "online_warmup_transitions": int(config.training.online.warmup_transitions),
         "replay_capacity": int(config.replay.max_size),
         "environment_count": int(config.env.env_num),
@@ -449,19 +455,19 @@ def validate_checkpoint(checkpoint, config, *, training=True):
             required += ("recipe_version", "training_sha256")
         expected_compatibility = checkpoint_compatibility(config)
         reusable_expert_recipes = {
-            "dreamer": {2, 3, 4},
-            "storm": {3, 4},
-            "tdmpc2": {2, 4},
-            "leworldmodel": {2, 4},
-            "temporal_straightening": {2, 4},
+            "dreamer": {2, 3, 4, 5, 6},
+            "storm": {3, 4, 5, 6},
+            "tdmpc2": {2, 4, 5, 6},
+            "leworldmodel": {2, 4, 5, 6},
+            "temporal_straightening": {2, 4, 5, 6},
         }
         if (
             training
             and checkpoint.get("phase") == "expert"
             and compatibility.get("recipe_version") in reusable_expert_recipes[str(config.model_family)]
-            and expected_compatibility["recipe_version"] == 5
+            and expected_compatibility["recipe_version"] == 6
         ):
-            # Authenticate the old recipe before allowing ONLY auxiliary readout defaults.
+            # Authenticate the old recipe before allowing online-only changes.
             # STORM v2's incorrect expert return targets still require fresh pretraining.
             saved = OmegaConf.create(checkpoint["training_config"])
             original = checkpoint_compatibility(saved)
@@ -469,6 +475,8 @@ def validate_checkpoint(checkpoint, config, *, training=True):
                 if compatibility.get(key) != original[key]:
                     raise ValueError(f"Expert checkpoint has inconsistent {key} metadata.")
             upgrade_readout_config(saved)
+            if int(checkpoint.get("expert_updates", -1)) == int(saved.training.expert.updates):
+                saved.training.online.expert_fraction = float(config.training.online.get("expert_fraction", 0.0))
             upgraded = checkpoint_compatibility(saved)
             for key in ("model_sha256", "training_sha256"):
                 if upgraded[key] != expected_compatibility[key]:

@@ -190,7 +190,24 @@ class OnlineSession:
 
     def update(self, update_count):
         metrics = {}
+        expert = getattr(self.model, "_online_expert_replay", None)
+        expert_rows = expert.batch_size if expert is not None else 0
+        sources = self.replay.episodes_per_batch - (expert.episodes_per_batch if expert is not None else 0)
         for _ in range(update_count):
-            obs, action, reward, terminal = self.replay.sample(sequence_length=self.model.sequence_length)
-            metrics = self.model.update((obs, action[:, :-1], reward[:, :-1], terminal[:, :-1]))
+            obs, action, reward, terminal = self.replay.sample(
+                batch_size=self.replay.batch_size - expert_rows,
+                sequence_length=self.model.sequence_length, episodes_per_batch=sources,
+            )
+            online = (obs, action[:, :-1], reward[:, :-1], terminal[:, :-1])
+            if expert is None:
+                metrics = self.model.update(online)
+            else:
+                batch = expert.sample_episode_batch()
+                mixed_obs = {key: torch.cat((value, batch[0][key].to(value.device))) for key, value in obs.items()}
+                mixed = (mixed_obs, *(torch.cat((value, other.to(value.device))) for value, other in zip(online[1:], batch[1:])))
+                # One native forward (including BN); the head independently retains its
+                # configured expert fraction, instead of applying retention twice.
+                metrics = self.model.update(mixed, readout_batch=online)
+            metrics["native/expert_sequences"] = expert_rows
+            metrics["native/online_sequences"] = self.replay.batch_size - expert_rows
         return metrics

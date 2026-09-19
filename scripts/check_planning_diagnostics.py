@@ -50,6 +50,7 @@ class ToyPlanner(LatentPlanner):
     def __init__(self, bias=0.0, ignores_actions=False):
         nn.Module.__init__(self)
         self.history_size = 2
+        self.action_dim = 1
         self.state_head = ToyReadout(bias)
         self.ignores_actions = ignores_actions
 

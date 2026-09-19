@@ -185,6 +185,19 @@ class PhysicalStateHead(nn.Module):
             self.online_updates.zero_()
             self.optimizer.state.clear()
 
+    @torch.no_grad()
+    def set_conditioning(self, scales):
+        """Explicit calibration candidate; preserve outputs and evaluation statistics."""
+        scales = torch.as_tensor(scales, device=self.output_scale.device, dtype=torch.float32)
+        if scales.shape != self.output_scale.shape or not torch.isfinite(scales).all() or not (scales > 0).all():
+            raise ValueError("Readout conditioning requires one finite positive scale per coordinate.")
+        ratio = self.output_scale / scales
+        self.readout[-1].weight.mul_(ratio[:, None])
+        self.readout[-1].bias.mul_(ratio)
+        self.output_scale.copy_(scales)
+        self.loss_scale.copy_(scales)
+        self.optimizer.state.clear()
+
     def forward(self, features):
         # [B,T,D] or [B,T,P,D]; preserve ordered patches and only complete causal histories.
         if features.ndim == 3:

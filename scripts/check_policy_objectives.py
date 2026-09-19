@@ -165,7 +165,7 @@ class PolicyObjectivesTest(unittest.TestCase):
             config = config_for(name)
             family = str(config.model_family)
             compatibility = checkpoint_compatibility(config)
-            self.assertEqual(compatibility["recipe_version"], 5)
+            self.assertEqual(compatibility["recipe_version"], 6)
             identity = {
                 "protocol": "test", "model_family": family, "model_variant": "test",
                 "scenario": "test", "task": "test", "seed": 0,

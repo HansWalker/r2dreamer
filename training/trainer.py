@@ -91,6 +91,9 @@ def save_checkpoint(run, path, phase, state, replay_state=None, expert_updates=0
         payload["replay_state"] = replay_state
     if phase == "online" and run.readout_replay is not None:
         payload["readout_replay_state"] = run.readout_replay.state_dict()
+    native_replay = getattr(run.model, "_online_expert_replay", None)
+    if phase == "online" and native_replay is not None:
+        payload["native_expert_replay_state"] = native_replay.state_dict()
     temporary = Path(f"{path}.tmp")
     torch.save(payload, temporary)
     temporary.replace(path)
