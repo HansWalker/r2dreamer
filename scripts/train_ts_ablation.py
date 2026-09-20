@@ -1,4 +1,4 @@
-"""Short paired TS training check: legacy flattened versus corrected patchwise curvature."""
+"""Short TS diagnostics: curvature, adaptation mechanisms, or isolated fitting."""
 
 import argparse
 import copy
@@ -204,18 +204,24 @@ def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--expert-updates", type=int, default=1000)
-    parser.add_argument("--online-updates", type=int, default=512, help="Fixed-replay adaptation updates per arm.")
-    parser.add_argument("--mechanisms", action="store_true",
-                        help="Pretrain once, then test native/frozen-BN/frozen-encoder adaptation and action conditioning.")
+    parser.add_argument("--online-updates", type=int, default=512,
+                        help="Adaptation updates per arm; head-only updates in --fit-isolation.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--mechanisms", action="store_true",
+                      help="Pretrain once, then test native/frozen-BN/frozen-encoder adaptation and action conditioning.")
+    mode.add_argument("--fit-isolation", action="store_true",
+                      help="Fit real action branches and isolate head adaptation on frozen features; no replay ablations.")
+    parser.add_argument("--action-updates", type=int, default=2000,
+                        help="Predictor fitting updates per dropout control in --fit-isolation (head uses --online-updates).")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
-    if min(args.expert_updates, args.online_updates) < 1 or args.seed < 0:
+    if min(args.expert_updates, args.online_updates, args.action_updates) < 1 or args.seed < 0:
         parser.error("Update counts must be positive; seed must be nonnegative.")
     args.scenario = "cartpole_balance_sparse"
     if args.output is None:
-        prefix = "ts_mechanisms" if args.mechanisms else "ts_ablation"
+        prefix = "ts_fit_isolation" if args.fit_isolation else "ts_mechanisms" if args.mechanisms else "ts_ablation"
         args.output = Path("runs") / datetime.now(timezone.utc).strftime(f"{prefix}_%Y%m%d_%H%M%S")
     return args
 
@@ -242,6 +248,9 @@ def main(argv=None):
               "checkpoint_writes": False, "runs": []}
     family = load_model_family("temporal_straightening")
     with family.build_replay(config) as dataset:
+        if args.fit_isolation:
+            from scripts.ts_fit_isolation import run_fit_isolation
+            return run_fit_isolation(config, dataset, args, report, started)
         sampler_start = copy.deepcopy(dataset.state_dict())
         reference = new_model(config, dataset)
         heldout = StateDataset(dataset.h5, dataset.metadata, config.model_io, config.state_head.fields, reference.state_head.targets)

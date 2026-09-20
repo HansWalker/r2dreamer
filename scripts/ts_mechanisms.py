@@ -229,12 +229,8 @@ def write_report(output, report):
     return summary
 
 
-def train_controls(config, dataset, sampler_start, replay, plans, sources, settings, cases, args, report):
-    """Pretrain once; branch every control from the complete same in-memory training state."""
-    family = load_model_family("temporal_straightening")
-    if len(plans) != args.online_updates:
-        raise ValueError("Replay plans must match the declared adaptation budget.")
-    dataset.load_state_dict(copy.deepcopy(sampler_start))
+def pretrain_shared(config, dataset, args, report):
+    """One fresh offline fit, reused by the diagnostic controls without disk checkpoints."""
     model = new_model(config, dataset)
     started = time.monotonic()
     progress = Progress("TS shared offline", args.expert_updates)
@@ -245,14 +241,24 @@ def train_controls(config, dataset, sampler_start, replay, plans, sources, setti
             log.write(json.dumps({"phase": "offline", "update": step, **values}, allow_nan=False) + "\n")
             progress.update(step, f"prediction={values['prediction_loss']:.3g} state={values['state/loss']:.3g}",
                             force=step == args.expert_updates)
+    report["shared_offline"] = {"updates": args.expert_updates, "seconds": time.monotonic() - started,
+                                "state_sha256": tensor_digest(model.state_dict()),
+                                "parameters": sum(p.numel() for p in model.parameters())}
+    return model
+
+
+def train_controls(config, dataset, sampler_start, replay, plans, sources, settings, cases, args, report):
+    """Pretrain once; branch every control from the complete same in-memory training state."""
+    family = load_model_family("temporal_straightening")
+    if len(plans) != args.online_updates:
+        raise ValueError("Replay plans must match the declared adaptation budget.")
+    dataset.load_state_dict(copy.deepcopy(sampler_start))
+    model = pretrain_shared(config, dataset, args, report)
     shared = copy.deepcopy(family.checkpoint(model))
     post_offline_sampler = copy.deepcopy(dataset.state_dict())
     old_head = copy.deepcopy(model.state_head).eval().requires_grad_(False)
     old_bank = observed_bank(model, sources, settings)
     old_bn = {key: value.clone() for key, value in batchnorm_state(model).items()}
-    report["shared_offline"] = {"updates": args.expert_updates, "seconds": time.monotonic() - started,
-                                "state_sha256": tensor_digest(model.state_dict()),
-                                "parameters": sum(p.numel() for p in model.parameters())}
     report["baseline"] = snapshot(model, old_head, old_bank, old_bn, sources, settings, cases)
     write_report(args.output, report)
     for mode in MODES:

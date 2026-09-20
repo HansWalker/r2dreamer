@@ -182,6 +182,38 @@ optimization or extra head fitting is performed. Results go to `runs/ts_mechanis
 one shared `offline_metrics.jsonl`, per-control metrics, `report.json`, and a compact `summary.txt`.
 The previous physical-error guards still apply; this does not establish online control success.
 
+To test **whether TS can fit action effects, separately from physical-head adaptation**:
+
+```bash
+bash scripts/run_ts_ablation.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision --fit-isolation
+```
+
+This skips both earlier ablation suites. One tiny Cartpole model receives 1,000 expert updates once.
+The frozen encoder then caches real zero/-1/+1 simulator branches from four training anchors and
+four anchors at a different validation seed. Two predictor/action-encoder controls start with the
+same offline weights and optimizer moments: native dropout and diagnostic-only dropout disabled.
+Each gets 2,000 updates on the same 60 cached four-observation windows, using the unchanged native
+prediction objective and optimizer settings. The curvature term is constant with the encoder frozen.
+Training-branch fitting and unseen-seed generalization are reported separately, at h1 and h5.
+The action-blind baseline is the mean actual outcome across controls at each anchor, not persistence.
+FP32 predictor probes retain the same cached encoder features; they are not separate FP32 training.
+
+Separately, two head-only controls restore the offline head and use cached, unchanging features:
+expert-only retention versus the current 50/50 expert/simulator mixture, with the normal online head
+LR, warmup and fresh Adam moments. Each gets 512 updates. Expert fitting uses eight cached batches
+from the training split; evaluation uses held-out expert windows. Four 200-step zero/random simulator
+episodes supply fitting examples and two disjoint episodes supply validation. Per-source and
+per-coordinate gradient measurements distinguish loss magnitude from actual gradient conflict.
+Neither validation bank is fitted. The short cached pools are fitting diagnostics, not a reproduction
+of the production replay distribution or a proposed recipe change.
+
+Override budgets with `--expert-updates`, `--action-updates`, and `--online-updates` (head-only here).
+Reports go to `runs/ts_fit_isolation_<timestamp>`: `summary.txt`, `report.json`, shared offline metrics,
+and four small per-control metric logs. No checkpoint writes, planner optimization, policy evaluations,
+timing calibration, or full-model benchmarks run. `COMPLETE` means execution succeeded; the declared
+training-fit criterion is not evidence of long-run online stability or policy success.
+
 Immediately before the production run, use the fuller preflight. It checks the installed GPU stack,
 runs two expert updates and the short online lifecycle for every model, evaluates all thirteen variants,
 and validates the resulting checkpoints and metrics:
