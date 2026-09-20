@@ -987,6 +987,56 @@ Output: `runs/planning_horizon_check_<timestamp>/{report.json,summary.txt}`, plu
 actions, simulator rewards/states and timings. CPU/simulator regression checks:
 `MUJOCO_GL=egl python -m scripts.check_planning_horizons`.
 
+### Staged Planner-Recipe Check
+
+```bash
+bash scripts/run_planner_recipe_check.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision
+```
+
+This is a **diagnostic**, not a production recipe change or an automatic online rerun:
+
+- **Optimizer stage:** one fresh tiny TS fit (1,000 updates), then frozen-weight control
+  from six shared Cartpole starts. Compare current production planning settings (16
+  restarts, 32 iterations, noisy random initialization), a 100-iteration single-restart
+  zero-initialized `tanh` control, and direct train-standardized action optimization
+  (Adam 0.1, 100 iterations, zero physical-action initialization/no noise). The latter two match budgets;
+  comparisons against current settings change multiple factors. Direct actions are projected
+  to DMC bounds, an explicit adaptation from upstream. All three keep terminal latent cost.
+- **Reference stage:** each family gets a separate, larger offline fit (3,000 updates).
+  LeWM uses a 12-layer/192D encoder, six-layer/16-head predictor and 2,048-wide projectors.
+  TS uses a base-32 spatial ResNet with eight channels and a six-layer/16-head predictor.
+  Batches are 128/32 respectively, with one sequence per source episode. Five consecutive
+  stored actions form each transition, with observations at offsets 0/5/10/15. Action
+  normalization uses training episodes only and is shared between fitting and planning.
+- **Goal-reaching validation:** select 12 nontrivial start/goal pairs from distinct heldout
+  episodes. Replay the recorded prefix and verify that the recorded actions still reach
+  the goal after restoring simulator state. Compare expert replay, zero actions and the
+  frozen learned planner over ten action blocks. Default pose tolerances are 0.01 m/rad.
+  Auxiliary state predictions, rewards and privileged expert actions never score plans.
+  A separate candidate-ranking diagnostic compares learned predictions with real futures.
+
+Important limits: the reference uses **224px upsampling of stored 64px images**, not native
+224px detail; action repeat two remains, so each block covers ten raw DMC steps. This is
+a vision-only local adaptation, not an exact upstream reproduction, equal-parameter test,
+or full paper training budget. TS retains the current terminal objective, not the upstream
+maze-specific intermediate cost. LeWM retains local bounded physical-coordinate CEM
+proposals, with train-standardized model inputs. Reaching a trajectory pose does not establish sustained
+balancing or velocity matching. These differences are printed and recorded, not hidden.
+
+`OFFLINE_CONTROL_OBSERVED` requires at least eight reproducible nontrivial pairs, successful
+expert replay on all pairs, learned goal-reaching >=50% and >=25 percentage points above
+zero actions, and smaller average closest pose error. This is a screening rule, not statistical
+proof. Otherwise the result is `NO_CONTROL_EVIDENCE` or `UNVALIDATED`; neither is called PASS.
+Insufficient pair coverage skips the expensive reference fit. No online training is launched.
+
+Use `--stage optimizer` or `--stage reference` to run only one stage without repeating the
+other. `--models` selects reference families; `--optimizer-updates`/`--reference-updates`
+set the separate training budgets. Existing checkpoint files are neither read nor written.
+Results go to `runs/planner_recipe_check_<timestamp>`: compact `summary.txt`, detailed
+`report.json`, and per-stage offline/control JSONL logs. CPU/simulator checks:
+`MUJOCO_GL=egl python -m scripts.check_planner_recipe`.
+
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening

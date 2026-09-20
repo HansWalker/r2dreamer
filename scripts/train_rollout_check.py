@@ -98,8 +98,9 @@ def protected_state(model):
             if not key.startswith(("predictor.", "action_encoder.", "pred_projector."))}
 
 
-def pretrain(config, dataset, args, output, result):
-    model = new_model(config, dataset)
+def pretrain(config, dataset, args, output, result, *, model=None):
+    if model is None:
+        model = new_model(config, dataset)
     initial = tensor_digest(model.state_dict())
     if hasattr(model, "configure_pretraining"):
         model.configure_pretraining(args.expert_updates)
