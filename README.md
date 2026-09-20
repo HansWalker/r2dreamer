@@ -1037,6 +1037,49 @@ Results go to `runs/planner_recipe_check_<timestamp>`: compact `summary.txt`, de
 `report.json`, and per-stage offline/control JSONL logs. CPU/simulator checks:
 `MUJOCO_GL=egl python -m scripts.check_planner_recipe`.
 
+### Action-Conditioning Check
+
+```bash
+bash scripts/run_action_conditioning_check.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision
+```
+
+This follow-up isolates weak action responses without another planner sweep. It fits TS
+and LeWM once each for 3,000 offline updates using the **same larger vision-only reference
+adapters described above**. Defaults are Cartpole, five stored actions per block and 12
+heldout start/goal pairs. It does not change production settings, fit diagnostic heads,
+optimize plans, run online training, or write checkpoints. Native offline updates still
+include the existing detached auxiliary-head fit; that head is never used by these probes.
+Goals are recorded trajectory endpoints, not equilibrium-goal task-success evaluations.
+
+- Replay ten counterfactual action sequences from each identical simulator anchor, once
+  for both models. Record real futures at all five horizons. Compare correctly paired,
+  shuffled and zero future actions while retaining the same history and targets.
+- Separate teacher-forced errors from recursive errors, and measure predicted versus
+  real-encoded action responses and goal-cost ranges. Trace opposing actions through
+  the action encoder, every predictor block, final normalization and prediction projector.
+- Compare FP32/BF16 predictors on identical cached native-precision encoder features.
+  The first two pairs also get latent-projection and goal-cost action gradients at every
+  horizon, plus an FP32 finite-difference check. Inspect encoder/projector goal geometry
+  separately, excluding the exact expert goal from the nonexpert rank statistic.
+- For TS, compare mapped identical weights with **actual upstream** action embedding,
+  predictor and recursive rollout methods, before and after fitting. Three small source
+  files are downloaded once from pinned commit `2c3c7666a69a730042590d548c6731259c4183ac`
+  into ignored `local/upstream_ts/`; SHA256 checks reject unexpected contents. Only the
+  hard-coded mask device is patched. The adapter supplies cached visual features and
+  zero-width proprioception; this is component parity, not whole-model reproduction.
+
+`--models temporal_straightening` restricts the run to TS. The previous diagnostic did not
+save weights, so the fresh offline fits cannot be skipped. Initial upstream mismatch stops
+the affected fit early. `COMPLETE` means diagnostics executed, **not** repaired policy quality;
+latent MSE is not directly comparable between models. Reports, compact summaries and
+offline metrics go to `runs/action_conditioning_<timestamp>`. No broad dataset audit or
+previous optimizer/policy sweep is repeated.
+
+Local regression tests: `MUJOCO_GL=egl python -m scripts.check_action_conditioning`.
+Upstream parity tests use the cached source (or `TS_UPSTREAM_CACHE=/path/to/cache`);
+without it, those tests explicitly skip rather than silently substituting local code.
+
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening
