@@ -135,6 +135,30 @@ and per-update `metrics.jsonl` preserve losses, coordinate RMSE/nMSE, gradient n
 settings and any regression alarms. Terminal progress is throttled to 30 seconds. `PASS` is an
 execution/error guard, not proof of task mastery; `REGRESSION` is saved and returns a nonzero exit.
 
+For a **short TS curvature A/B training check** on Lambda:
+
+```bash
+bash scripts/run_ts_ablation.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision
+```
+
+This runs only tiny Cartpole TS models: legacy flattened curvature versus the corrected per-patch
+loss, both from identical fresh initialization. Each receives 1,000 expert updates and 512 adaptation
+updates by default (`--expert-updates` / `--online-updates` override these). Expert batches and fixed
+simulator replay are identical across arms; all other current training fixes remain enabled. Sixteen
+200-step zero/random-action episodes are collected once for adaptation, with separate full-length
+simulator validation episodes and held-out expert windows. The replay phase uses the native update
+and the head's normal 50% expert retention, but deliberately removes policy optimization and feedback.
+There is no timing calibration, checkpoint loading/writing, or policy evaluation. This is an isolation
+test, not the production online loop or a reproduction of every historical setting.
+
+The compact `summary.txt`, detailed `report.json`, replay indices and per-arm `metrics.jsonl` are saved
+under `runs/ts_ablation_<timestamp>`. Physical RMSE, latent statistics, and gradient clipping are tracked;
+nMSE is secondary. Guards check post-offline versus intermediate/final adaptation errors in original
+units. If the legacy failure does not reproduce, the comparison explicitly reports `INCONCLUSIVE`.
+Even an encouraging result does not establish long-run stability or successful control. No production
+model code or settings are changed by this test.
+
 Immediately before the production run, use the fuller preflight. It checks the installed GPU stack,
 runs two expert updates and the short online lifecycle for every model, evaluates all thirteen variants,
 and validates the resulting checkpoints and metrics:
