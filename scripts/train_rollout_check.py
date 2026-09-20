@@ -19,7 +19,11 @@ import tools
 from dmc_expert.storage import dataset_identity
 from models.shared.physical_state import readout_mode
 from scripts.diagnose_fresh_readout import tensor_digest
-from scripts.diagnose_planner_oracle import collect_cases, rank_correlation, ranking_summary
+from scripts.diagnose_planner_oracle import (
+    collect_cases,
+    rank_correlation,
+    ranking_summary,
+)
 from scripts.smoke_tiny_planners import FAMILIES, native_control
 from scripts.train_planner_check import build_config, checked_update, new_model
 from scripts.ts_fit_isolation import branch_bank, finite
@@ -96,10 +100,11 @@ def protected_state(model):
 
 def pretrain(config, dataset, args, output, result):
     model = new_model(config, dataset)
+    initial = tensor_digest(model.state_dict())
     if hasattr(model, "configure_pretraining"):
         model.configure_pretraining(args.expert_updates)
     started = time.monotonic()
-    progress = Progress(f"{config.model_family} offline", args.expert_updates)
+    progress = Progress(f"{config.model_family} {result.get('trial', 'offline')}", args.expert_updates)
     with (output / "offline_metrics.jsonl").open("w", encoding="utf-8", buffering=1) as log:
         for step in range(1, args.expert_updates + 1):
             torch.manual_seed(args.seed + step)
@@ -107,6 +112,7 @@ def pretrain(config, dataset, args, output, result):
             log.write(json.dumps({"update": step, **values}, allow_nan=False) + "\n")
             progress.update(step, f"prediction={values['prediction_loss']:.4g}", force=step == args.expert_updates)
     result["offline"] = {"updates": args.expert_updates, "seconds": time.monotonic() - started,
+                         "initial_state_sha256": initial,
                          "parameters": sum(p.numel() for p in model.parameters()),
                          "state_sha256": tensor_digest(model.state_dict())}
     return model
@@ -276,7 +282,7 @@ def main():
             for weight in (0., .5):
                 fit_arm(model, config, shared, banks, weight, args, output, result, persist)
             result["status"] = "COMPLETE"
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - persist failures and continue the other model.
             result.update(status="FAIL", error=f"{type(error).__name__}: {error}")
             (output / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
         finally:

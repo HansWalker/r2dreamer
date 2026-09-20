@@ -38,7 +38,8 @@ class Predictor(nn.Module):
         self.state_dim = int(state_dim)
         dim = self.state_dim + int(action_dim)
         self.position = nn.Parameter(torch.randn(1, int(tokens_per_frame) * history, dim))
-        self.dropout = nn.Dropout(float(config.dropout))
+        # Missing field preserves the behavior of configurations saved before this correction.
+        self.dropout = nn.Dropout(float(config.get("emb_dropout", config.dropout)))
         self.blocks = nn.ModuleList(
             TransformerBlock(
                 dim,

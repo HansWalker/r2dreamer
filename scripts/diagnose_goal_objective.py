@@ -248,14 +248,19 @@ def write_report(output, report):
     def number(value):
         return "n/a" if value is None else f"{value:.3f}"
     for run in report["runs"]:
+        label = run['model'] + (f"/{run['trial']}" if "trial" in run else "")
         for horizon, group in run.get("summary", {}).items():
             selected = group["selection"]
             returns = "/".join(number(selected[key]["normalized_return"]) for key in ("latent", "uniform", "reward_oracle"))
             recovery = "/".join(number(selected[key]["recovery_rate"]) for key in ("latent", "uniform"))
-            lines.append(f"{run['model']} | {horizon} | {group['reward_informative']}/{group['cases']} | {returns} | "
+            lines.append(f"{label} | {horizon} | {group['reward_informative']}/{group['cases']} | {returns} | "
                          f"{number(selected['latent']['regret_fraction'])} | "
                          f"{group['recoverable_failures']}/{group['failure_cases']} | {recovery} | {group['coverage']}")
-        lines.append(f"{run['status']} | {run['model']}" + (f" | {run['error']}" if "error" in run else ""))
+        lines.append(f"{run['status']} | {label}" + (f" | {run['error']}" if "error" in run else ""))
+    if report["settings"].get("compare_embedding_dropout"):
+        lines += ["Paired test: legacy emb_dropout=0.1 versus upstream emb_dropout=0; transformer dropout stays 0.1.",
+                  "Same initialization, sampler seed, examples/update and native losses; goal objective is unchanged.",
+                  "Only training differs. Both scoring passes use eval mode (all dropout off); no inference-time correction."]
     lines += ["Returns are normalized by horizon * action_repeat and averaged only over reward-informative anchors.",
               "Informative = reward spread >= max(action_repeat, 10% of maximum return). LOW_CONTRAST = fewer than four anchors.",
               "Regret fraction = (candidate-best return - selected return) / candidate return spread; lower is better.",
@@ -279,6 +284,8 @@ def arguments(argv=None):
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--models", nargs="+", choices=FAMILIES, default=list(FAMILIES))
     parser.add_argument("--expert-updates", type=int, default=1000)
+    parser.add_argument("--compare-embedding-dropout", action="store_true",
+                        help="Fit legacy 0.1 and upstream 0 input-dropout arms; keep native planning and losses.")
     parser.add_argument("--sim-seeds", nargs="+", type=int, default=[12_000_000, 12_000_001])
     parser.add_argument("--horizons", nargs="+", type=int, default=[5, 25, 100])
     parser.add_argument("--candidates", type=int, default=21)
@@ -314,25 +321,40 @@ def main():
               "settings": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
               "checkpoint_reads": False, "checkpoint_writes": False, "production_settings_changed": False, "runs": []}
     config = build_config(args.models[0], args)
-    print(f"Goal objective | models={len(args.models)} | offline={args.expert_updates} once/model | "
+    fits = 2 if args.compare_embedding_dropout else 1
+    print(f"Goal objective | models={len(args.models)} | offline={args.expert_updates}/fit | fits/model={fits} | "
           f"anchors={len(args.sim_seeds) * len(PROFILES)} | candidates={args.candidates} | "
           f"horizons={args.horizons} | no checkpoints", flush=True)
     cases = collect_objective_cases(config, args)
     report["cases"] = [case_metadata(case) for case in cases]
     write_report(args.output, report)
-    for name in args.models:
+    arms = (("legacy_input_dropout", .1), ("upstream_input_dropout", 0.)) if args.compare_embedding_dropout else ((None, None),)
+    trials = [(name, label, probability) for name in args.models for label, probability in arms]
+    paired = {}
+    for name, trial, probability in trials:
         result = {"model": name, "status": "RUNNING"}
+        if trial:
+            result["trial"] = trial
         report["runs"].append(result)
-        output = args.output / name
-        output.mkdir()
+        output = args.output / name / trial if trial else args.output / name
+        output.mkdir(parents=True)
         model = None
         try:
             config = build_config(name, args)
+            if trial:
+                config.jepa_model.predictor.emb_dropout = probability
             result["config"] = OmegaConf.to_container(config, resolve=True)
             family = load_model_family(name)
             with family.build_replay(config) as dataset:
                 result["dataset_identity"] = dataset_identity(dataset.metadata)
                 model = pretrain(config, dataset, args, output, result)
+                sampler = json.dumps(dataset.state_dict(), sort_keys=True, default=lambda v: v.tolist())
+                result["sampler_sha256_after_training"] = hashlib.sha256(sampler.encode()).hexdigest()
+            if trial:
+                signature = (result["offline"]["initial_state_sha256"], result["sampler_sha256_after_training"])
+                if name in paired and paired[name] != signature:
+                    raise RuntimeError("Dropout arms used different initial weights or sampled windows.")
+                paired[name] = signature
             before = tensor_digest(model.state_dict())
             rows = score_objective(model, cases, args.horizons, args.batch_size, int(config.env.action_repeat))
             if before != tensor_digest(model.state_dict()):

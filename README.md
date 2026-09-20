@@ -919,6 +919,39 @@ repeat any prior online, loss-ablation, or throughput benchmarks.
 
 CPU and real-simulator regression checks: `MUJOCO_GL=egl python -m scripts.check_goal_objective`.
 
+#### Upstream Input-Dropout Correction
+
+Both upstream predictors use `emb_dropout=0` separately from transformer `dropout=0.1`:
+[LeWM config](https://github.com/lucas-maes/le-wm/blob/main/config/train/model/lewm.yaml),
+[TS config](https://github.com/Agentic-Learning-AI-Lab/temporal-straightening/blob/main/conf/predictor/vit.yaml).
+Previously we incorrectly used the transformer dropout probability at the predictor input too.
+New training configs restore the upstream setting. Native prediction/regularization losses,
+terminal latent goal distance, model sizes, planner budgets and independent physical heads
+are unchanged. No goal-metric calibration or physical-label supervision of planning is added.
+This is a verified configuration mismatch, **not a demonstrated cure** for goal ranking or
+online degradation. Encoder capacity, data coverage and the visual-only TS adaptation still differ
+from upstream; those differences are not changed by this correction.
+
+To isolate the correction with the existing tiny Cartpole test:
+
+```bash
+bash scripts/run_goal_objective_check.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision \
+  --compare-embedding-dropout
+```
+
+This fits two arms per model (1,000 expert updates each), checking matching initial weights
+and replay sampler state. It collects simulator cases once and scores the same cases with
+the unchanged native objective. Baseline/candidate reports and offline metrics are separate;
+there are no online runs, checkpoint writes, new planner searches or throughput benchmarks.
+Use the ranking/recovery comparisons, not just training loss, to decide whether to proceed.
+Lower input dropout can also increase overfitting; improved performance is not guaranteed.
+
+Saved configs lacking `emb_dropout` retain the old training behavior. Existing weights remain
+loadable with their saved config and have identical evaluation computations; this change does
+not repair already-trained weights. New configs have a different compatibility fingerprint,
+so do not silently resume an old run as the corrected experiment.
+
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening

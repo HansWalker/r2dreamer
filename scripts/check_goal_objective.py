@@ -34,6 +34,7 @@ from scripts.diagnose_goal_objective import (
 from scripts.diagnose_planner_oracle import encode_images, simulator_branch
 from scripts.smoke_tiny_planners import FAMILIES
 from training import load_model_family
+from training.protocol import checkpoint_compatibility
 
 
 def fake_case():
@@ -50,6 +51,46 @@ def fake_case():
 
 
 class GoalObjectiveTest(unittest.TestCase):
+    def test_upstream_input_dropout_is_separate_from_transformer_dropout(self):
+        for family in FAMILIES:
+            with self.subTest(model=family):
+                config = tiny_config(family, "cartpole_balance_sparse")
+                model = load_model_family(family).build_model(config)
+                self.assertEqual(model.predictor.dropout.p, 0.)
+                value = torch.randn(2, 3, 16)
+                model.predictor.train()
+                torch.testing.assert_close(model.predictor.dropout(value), value, rtol=0, atol=0)
+                for block in model.predictor.blocks:
+                    self.assertEqual(block.attention.dropout, .1)
+                    self.assertEqual(block.attention.to_out[-1].p, .1)
+                    self.assertEqual(block.feed_forward.net[3].p, .1)
+                    self.assertEqual(block.feed_forward.net[-1].p, .1)
+
+    def test_legacy_configs_keep_their_behavior_and_weights_costs_remain_compatible(self):
+        for family in FAMILIES:
+            with self.subTest(model=family):
+                config = tiny_config(family, "cartpole_balance_sparse")
+                legacy = copy.deepcopy(config)
+                del legacy.jepa_model.predictor.emb_dropout
+                corrected = load_model_family(family).build_model(config)
+                original = load_model_family(family).build_model(legacy)
+                self.assertEqual(original.predictor.dropout.p, .1)
+                original.load_state_dict(corrected.state_dict(), strict=True)
+                self.assertEqual(tensor_digest(original.state_dict()), tensor_digest(corrected.state_dict()))
+                self.assertNotEqual(checkpoint_compatibility(config), checkpoint_compatibility(legacy))
+                case = fake_case()
+                self.assertEqual(score_objective(original, [case], [5], 2, 2),
+                                 score_objective(corrected, [case], [5], 2, 2))
+                with readout_mode(corrected), readout_mode(original):
+                    image = case["image"][:2, 0, None].expand(-1, 3, -1, -1, -1)
+                    latent = corrected.encode({"image": image})
+                    action = torch.randn(2, 3, corrected.action_dim)
+                    torch.testing.assert_close(corrected.predict(latent, action), original.predict(latent, action), rtol=0, atol=0)
+                    candidates = action[:, None, :2]
+                    goal = latent[:, -1]
+                    torch.testing.assert_close(corrected._goal_cost(latent, action[:, :2], candidates, goal),
+                                               original._goal_cost(latent, action[:, :2], candidates, goal), rtol=0, atol=0)
+
     def test_cli_rejects_invalid_or_repeated_work(self):
         args = arguments(["--dataset-root", "/tmp/expert"])
         self.assertEqual(args.models, list(FAMILIES))
@@ -149,11 +190,18 @@ class GoalObjectiveTest(unittest.TestCase):
                 torch.testing.assert_close(torch.tensor(rows[0]["latent_cost"]), expected, rtol=1e-6, atol=1e-6)
 
     def test_end_to_end_pretrains_once_per_model_and_collects_shared_cases_once(self):
+        self._end_to_end(compare=False)
+
+    def test_paired_end_to_end_matches_initialization_and_windows_without_checkpoints(self):
+        self._end_to_end(compare=True)
+
+    def _end_to_end(self, compare):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             fixture(root, "temporal_straightening")
             args = arguments(["--dataset-root", str(root), "--expert-updates", "2", "--device", "cpu",
-                              "--horizons", "5", "--output", str(root / "output")])
+                              "--horizons", "5", "--output", str(root / "output"),
+                              *(["--compare-embedding-dropout"] if compare else [])])
 
             def config(name, args):
                 result = tiny_config(name, args.scenario)
@@ -171,13 +219,21 @@ class GoalObjectiveTest(unittest.TestCase):
             self.assertEqual(status, 0, (args.output / "summary.txt").read_text())
             self.assertEqual(collect.call_count, 1)
             report = json.loads((args.output / "report.json").read_text())
-            self.assertEqual(len(report["runs"]), 2)
+            self.assertEqual(len(report["runs"]), 4 if compare else 2)
             for result in report["runs"]:
                 self.assertEqual(result["status"], "COMPLETE")
                 self.assertTrue(result["model_unchanged_during_scoring"])
                 self.assertEqual(result["offline"]["updates"], 2)
                 self.assertEqual(result["summary"]["5"]["coverage"], "LOW_CONTRAST")
             self.assertFalse(list(args.output.rglob("*.pt")))
+            if compare:
+                for name in FAMILIES:
+                    old, new = [run for run in report["runs"] if run["model"] == name]
+                    self.assertEqual(old["offline"]["initial_state_sha256"], new["offline"]["initial_state_sha256"])
+                    self.assertEqual(old["sampler_sha256_after_training"], new["sampler_sha256_after_training"])
+                    self.assertNotEqual(old["offline"]["state_sha256"], new["offline"]["state_sha256"])
+                    self.assertEqual(old["config"]["jepa_model"]["predictor"]["emb_dropout"], .1)
+                    self.assertEqual(new["config"]["jepa_model"]["predictor"]["emb_dropout"], 0.)
 
 
 class SimulatorGoalObjectiveTest(unittest.TestCase):

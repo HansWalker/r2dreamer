@@ -39,6 +39,7 @@ jepa_model:
     dim_head: 64
     mlp_dim: 512
     dropout: 0.1
+    emb_dropout: 0.0  # Both upstream predictors leave their input embeddings intact.
     action_embedding_dim: 10
   projector_dim: 512
   sigreg:

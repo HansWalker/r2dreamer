@@ -63,7 +63,8 @@ class Predictor(nn.Module):
     def __init__(self, dim, history, config):
         super().__init__()
         self.position = nn.Parameter(torch.randn(1, history, dim))
-        self.dropout = nn.Dropout(float(config.dropout))
+        # Missing field preserves the behavior of configurations saved before this correction.
+        self.dropout = nn.Dropout(float(config.get("emb_dropout", config.dropout)))
         self.blocks = nn.ModuleList(
             ConditionalBlock(
                 dim,
