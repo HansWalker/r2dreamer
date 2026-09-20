@@ -19,7 +19,7 @@ from omegaconf import OmegaConf
 import tools
 from dmc_expert.storage import dataset_identity, validate_dataset
 from envs import close_envs, make_envs
-from models.shared.physical_state import readout_mode
+from models.shared.physical_state import format_physical_rmse, readout_mode
 from scripts.diagnose_planning_models import FAMILIES, SCENARIOS, analyze_checkpoint
 from scripts.online_validation import (
     TrajectoryDataset,
@@ -367,28 +367,32 @@ def run_case(job):
 
 def write_summary(output, results, args):
     lines = ["Checkpoint online check | no pretraining or checkpoint writes",
-             "Run / trial | Updates | Expert obs h1 / forecast h100 nMSE before->after | Simulator obs h1 nMSE | False goal | Policy return | Time"]
+             "Run / trial | Updates | False goal before->after | Policy return before->after | Time"]
     for result in results:
         name = f"{result['scenario']}/{result['model']}"
         if result["status"] == "FAIL":
             lines.append(f"FAIL | {name} | {result.get('error', 'worker failed')} | {result['log']}")
             continue
         for trial in result.get("trials", [result]):
-            observed = [trial[stage]["all"]["physical"]["observed"]["1"]["mean_normalized_mse"] for stage in ("before", "after")]
-            forecast = [trial[stage]["all"]["physical"]["forecast"]["100"]["mean_normalized_mse"] for stage in ("before", "after")]
             validation = trial.get("final_checks", {}).get("validation")
-            failure, false_goal, policy = "-", "-", "-"
+            false_goal, policy = "-", "-"
             if validation is not None:
                 first, last = result["validation_before"]["all"], validation["all"]
-                failure = f"{first['physical']['observed']['1']['mean_normalized_mse']:.3g}->{last['physical']['observed']['1']['mean_normalized_mse']:.3g}"
                 rates = [value["goals"]["observed"]["1"]["false_success_rate"] for value in (first, last)]
                 false_goal = "->".join("no failures" if rate is None else f"{rate:.0%}" for rate in rates)
                 returns = [sum(episode["return"] for episode in episodes) / len(episodes)
                            for episodes in (result["policy_before"], trial["policy_after"])]
                 policy = f"{returns[0]:.1f}->{returns[1]:.1f}"
             lines.append(f"{trial['status']} | {name}/{trial.get('name', 'online')} | {trial['online']['updates']} | "
-                         f"{observed[0]:.3g}->{observed[1]:.3g} / {forecast[0]:.3g}->{forecast[1]:.3g} | "
-                         f"{failure} | {false_goal} | {policy} | {duration(trial['elapsed_seconds'])}")
+                         f"{false_goal} | {policy} | {duration(trial['elapsed_seconds'])}")
+            before, after = [trial[stage]["all"]["physical"] for stage in ("before", "after")]
+            for source, horizon in (("observed", "1"), ("forecast", "100")):
+                lines.append(f"  Expert {source} h{horizon} RMSE | " + format_physical_rmse(
+                    after[source][horizon], before=before[source][horizon],
+                    baseline=after["true_persistence"][horizon] if source == "forecast" else None))
+            if validation is not None:
+                lines.append("  Simulator observed h1 RMSE | " + format_physical_rmse(
+                    last["physical"]["observed"]["1"], before=first["physical"]["observed"]["1"]))
             failures = set()
             for item in [*trial["snapshots"], trial.get("final_checks", {})]:
                 for domain in ("expert_guard", "validation_guard"):
@@ -399,7 +403,7 @@ def write_summary(output, results, args):
                 lines.append(f"  Error guards failed: {len(failures)} cohort/source/horizon checks; coordinates in report.json.")
     lines.extend(["PASS is a short-run error guard; it does NOT establish long-run stability or policy quality.",
                   "REGRESSION: intermediate/final physical errors exceeded declared limits. UNVALIDATED: insufficient failure coverage or excessive false goals.",
-                  "Expert nMSE scales are unchanged. Original-unit RMSE, cohorts, and exact windows are in report.json.",
+                  "Angles are wrapped radians; hold=true-state persistence (scoring only). nMSE remains secondary in JSON; guards unchanged.",
                   "Policy returns use complete episodes, separate seeds, and no training replay; few episodes are diagnostic only.",
                   "Native budgets are unchanged. Calibration adds explicitly reported head-only updates; no validation fitting.",
                   "Planning uses rendered physical goals and native latent distance; explicit legacy overrides are in JSON.",

@@ -19,6 +19,7 @@ from omegaconf import OmegaConf
 from torch import nn
 
 from models.planning import LatentPlanner
+from models.shared.physical_state import PhysicalStateTargets
 from scripts.diagnose_planning_models import (
     analyze_batch,
     analyze_checkpoint,
@@ -27,6 +28,7 @@ from scripts.diagnose_planning_models import (
     write_reports,
 )
 from scripts.smoke_models import synthetic_batch
+from scripts.smoke_tiny_planners import tiny_config
 from training import load_model_family
 from training.evaluation import StateDataset, Window
 
@@ -39,6 +41,11 @@ class ToyReadout(nn.Module):
         super().__init__()
         self.bias = nn.Parameter(torch.tensor(bias))
         self.register_buffer("std", torch.tensor([2.0]))
+        self.targets = SimpleNamespace(
+            metric_coordinates=list(self.coordinates), metric_units={"position[0]": "m"},
+            metric_error=lambda prediction, truth: prediction - truth,
+        )
+        self.targets.metric_summary = lambda errors: PhysicalStateTargets.metric_summary(self.targets, errors)
 
     def forward(self, features):
         return features[:, self.history - 1:] + self.bias
@@ -184,6 +191,45 @@ class PlanningDiagnosticsTest(unittest.TestCase):
                 self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
                 for name, value in model.state_dict().items():
                     torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+    def test_native_predictor_and_planner_rollout_use_the_same_causal_actions(self):
+        for family in ("leworldmodel", "temporal_straightening"):
+            with self.subTest(family=family):
+                torch.manual_seed(19)
+                config = tiny_config(family, SimpleNamespace(
+                    scenario="cartpole_balance_sparse", device="cpu", seed=0, episode_steps=64,
+                    offline_updates=1, online_updates=1))
+                model = load_model_family(family).build_model(config)
+                batch, observation, _ = synthetic_batch(config, model, batch_size=2, length=4)
+                # LeWM's native AdaLN gates start at zero; exercise a learned action path.
+                model.update(batch)
+                model.eval()
+                with torch.no_grad():
+                    history = model.encode({"image": observation["image"][:, :3]})
+                action = torch.randn(2, 5, 1).tanh()
+                reference = []
+                state = history
+                with torch.no_grad():
+                    for step in range(3):
+                        predicted = model.predict(state, action[:, step:step + 3])[:, -1]
+                        reference.append(predicted)
+                        state = torch.cat((state[:, 1:], predicted[:, None]), dim=1)
+                    actual = model.rollout(history, action[:, :2], action[:, None, 2:])[:, 0]
+                torch.testing.assert_close(actual, torch.stack(reference, dim=1), rtol=1e-5, atol=1e-6)
+
+                with torch.no_grad():
+                    expected = model.predict(history, action[:, :3])
+                    changed_state, changed_action = history.clone(), action[:, :3].clone()
+                    changed_state[:, -1] += 7
+                    changed_action[:, -1] *= -1
+                    changed = model.predict(changed_state, changed_action)
+                torch.testing.assert_close(changed[:, :-1], expected[:, :-1], rtol=0, atol=0)
+
+                candidates = action[:, None, 2:].clone().requires_grad_()
+                prediction = model.rollout(history, action[:, :2], candidates)
+                gradient, = torch.autograd.grad((prediction * torch.randn_like(prediction)).sum(), candidates)
+                self.assertTrue(torch.isfinite(gradient).all())
+                self.assertGreater(gradient.abs().sum().item(), 0)
 
 
 if __name__ == "__main__":

@@ -140,7 +140,7 @@ class LatentGoalTest(unittest.TestCase):
 
     def test_goal_settings_are_versioned_and_required(self):
         config = tiny_config("leworldmodel", "cartpole_balance_sparse")
-        self.assertEqual(checkpoint_compatibility(config)["recipe_version"], 8)
+        self.assertEqual(checkpoint_compatibility(config)["recipe_version"], 9)
         original = checkpoint_compatibility(config)
         config.jepa_model.goal.observation.cart_position = .1
         self.assertNotEqual(original, checkpoint_compatibility(config))

@@ -502,12 +502,15 @@ Evaluate an image-model checkpoint on that held-out dataset. Every family report
 return, late-episode success, first-hit/sustained-success diagnostics, and physical-state prediction.
 Primary success requires the reward threshold on at least 90% of the final 20% of each episode
 (`evaluation.maintenance_occupancy` and `evaluation.maintenance_fraction`). Evaluation protocol
-`dmc_evaluation_v8` reports supplementary physical-state RMSE separately for each physical coordinate
-at each prediction horizon, in its original units. It includes constant coordinates and does not divide
-by dataset variance or average unrelated units into one score. JSON stores these values in
-`physical_state_prediction.rmse["<horizon>"]["<coordinate>"]`, for example `"1"` and `"velocity[0]"`.
-Reacher's angle coordinates are `cos(position[0])`, `sin(position[0])`, and the corresponding joint-1
-pair. Cosine/sine are unitless; other positions and velocities retain metres, radians, and seconds.
+`dmc_evaluation_v11` leads with physical-state RMSE separately for each quantity and prediction horizon,
+without dividing by dataset variance or averaging unrelated units. JSON stores the primary scores in
+`physical_state_prediction.physical_rmse["<horizon>"]["<coordinate>"]`, with units in `physical_units`.
+Positions use metres; linear/angular velocities use m/s and rad/s. Cartpole's `pole_angle` and Reacher's
+`joint_angle[0]`/`joint_angle[1]` use shortest wrapped angular errors in radians. Angles are recovered
+from the mean predicted sine/cosine coordinates, not by averaging angles across the +/-pi boundary.
+Undefined predicted orientation vectors receive the maximum angular error (pi), never a free zero.
+The existing `rmse`, `observed_rmse`, and persistence fields retain the raw target-coordinate scores,
+including unitless cosine/sine errors, for compatibility and orientation-magnitude diagnostics.
 Separate `derived_rmse` and `derived_observed_rmse` report Reacher fingertip position/velocity and
 Ball-in-Cup target separation/ball-minus-cup velocity. These use analytic DMC geometry, with no extra
 learned outputs; kinematics are calculated per rollout before averaging predictions.
@@ -527,6 +530,13 @@ decoding diagnostic. Native memory mechanisms are unchanged: default STORM still
 window, planners retain their short histories, and TD-MPC2 constructs frame stacks inside the common
 prefix. `persistence_rmse` holds the last decoded observed state constant; it does not receive true
 simulator state. `derived_persistence_rmse` provides the corresponding kinematic baseline.
+`physical_observed_rmse` and `physical_persistence_rmse` provide the primary physical/angle versions.
+`physical_true_persistence_rmse` holds the last true prefix state fixed and supplies a model-independent
+baseline (the terminal `hold` values). True states are used only to score this baseline, never as model
+inputs. `true_persistence_rmse`/`derived_true_persistence_rmse` retain its raw/kinematic counterparts.
+These reporting changes do not alter any native training loss, physical-head loss, or checkpoint weights.
+Existing checkpoints can be re-evaluated without retraining; wrapped angle RMSE cannot be reconstructed
+from old aggregated cosine/sine RMSE alone.
 
 Prediction windows come only from the held-out episode range, never the training range. The evaluator
 rejects overlapping splits and attempted reads from training episodes. The 128-window default budget
@@ -598,10 +608,13 @@ and samples 64 common windows per scenario, half uniform and half motion-selecte
 Use `--scenarios ball_in_cup` or `--models temporal_straightening` to narrow the run.
 `--device cpu` is supported; CUDA is the default.
 
-- **Readout:** Compare physical errors from real-image latents against open-loop
+- **Readout:** Summaries lead with physical-unit RMSE and wrapped angle errors, not aggregate nMSE.
+  Compare physical errors from real-image latents against open-loop
   predicted latents at horizons 1, 5, 10, 25, 50, and 100. The CSV includes original-unit
   RMSE, expert normalization scales, and each coordinate's contribution to normalized
-  error. Both true-state and decoded-state persistence baselines are included.
+  error. Both true-state and decoded-state persistence baselines are included; terminal `hold` means
+  true-state persistence. Diagnostic JSON keeps nMSE as a secondary metric; existing error guards and
+  training objectives are unchanged.
 - **Representation:** Compare centered latent variance, effective covariance rank,
   temporal change, latent forecast errors, and response to zero/random future actions.
   TS patches retain their ordering rather than being averaged away.
@@ -716,6 +729,55 @@ compare original-unit errors as well as nMSE. Override `--updates`, `--head-upda
 `--eval-every` to change only the diagnostic budget. No simulator, planner, dataset audit,
 or checkpoint saving is performed. CPU checks: `python -m scripts.check_fixed_replay`.
 
+### Planner Objective Versus Dynamics
+
+Before another training run, separate incorrect forecasts from an incorrect action-ranking
+objective using read-only checkpoints:
+
+```bash
+bash scripts/run_planner_oracle.sh \
+  --run-root runs/dmc_vision_10k \
+  --latent-goals
+```
+
+Defaults test Cartpole LeWorldModel/TS, `pretrained.pt` and `final.pt`. Eight real simulator
+prefixes (two seeds, zero/random roll-in, two offsets) each receive the same 16 candidate
+action sequences. All candidates start from copied integration state, task RNG, counters,
+and episode geometry. Simulator branches are collected **once per scenario** and reused
+across both models and checkpoints. No dataset is needed or audited. There is no fitting,
+optimizer step, head evaluation, policy optimization, or checkpoint write.
+
+Three quantities are compared: native latent cost on **predicted** outcomes; that same cost
+on encoded **actual simulator** outcomes; and actual cumulative reward over the candidate
+horizon. Good forecast/oracle agreement but poor oracle/reward agreement implicates the
+goal objective or encoder geometry, even with perfect dynamics. Good oracle/reward agreement
+but poor forecast/oracle agreement implicates forecasts. Both can fail. Constant returns
+or costs are marked uninformative, not counted as successful action ranking. Candidate-set
+regret averages tied selections and is not a claim about optimized or whole-episode policies.
+For tied sparse rewards, a separate rank compares oracle latent cost with terminal squared
+physical goal relations divided by task tolerances. This is a dense diagnostic proxy, not reward.
+
+The compact `summary.txt` and detailed `report.json` include rank correlations, selection
+regret, per-candidate rewards/costs/actions, physical goal relations, open-loop versus
+teacher-forced latent errors, and true-latent persistence. Native probes use small real
+simulator clip batches with dropout disabled: they report BatchNorm train/eval gaps and
+component gradient norms, then restore all running statistics and RNG. These correlated
+diagnostic batches are **not** production batches or an online adaptation experiment.
+
+`--scenarios`, `--models`, and `--checkpoints` restrict the work; `--sim-seeds`,
+`--rollin-steps`, `--candidates`, and `--batch-size` control only diagnostic sampling/compute.
+The checkpoint's native horizon is retained. `--latent-goals` explicitly tests the current
+rendered-goal cost on legacy physical-head-controller weights; it does not reproduce old
+policy returns. Reports distinguish checkpoint recipe from the current native loss recipe.
+Use a new `--output` directory, or accept the timestamped `runs/planner_oracle_*` default.
+
+Standalone CPU checks: `MUJOCO_GL=egl python -m scripts.check_planner_oracle`. These cover
+simulator isolation and real-step parity in all three tasks, tied/constant rankings, native
+loss/gradient formulas, causal indexing, and optimized versus explicit recursive rollouts.
+The formula references are [LeWM's native loss](https://github.com/lucas-maes/le-wm/blob/main/train.py)
+and [TS's visual prediction/curvature loss](https://github.com/Agentic-Learning-AI-Lab/temporal-straightening/blob/main/models/visual_world_model.py).
+These do not claim full numerical parity with the upstream architectures or validate learning quality.
+
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening
@@ -814,12 +876,16 @@ transition returns from the next-state value (recipe 3 corrections).
 
 Training recipe 7 adds fixed-unit fresh-head initialization and finite TS native gradient clipping
 to recipe 6's planner/readout repairs. Recipe 8 additionally isolates physical readout from control
-and supplies physically rendered latent goals. Old weights still load for readout-only diagnostics;
+and supplies physically rendered latent goals. Recipe 9 fixes TS's `cos` curvature reduction:
+compute directions per visual patch before averaging, as upstream does, instead of flattening
+patches into a single motion vector. Static-patch masking and the finite empty-mask guard remain.
+This corrects loss/gradient weighting; it does not establish that the observed online degradation
+is repaired. Old weights still load for readout-only diagnostics;
 their original policy returns require the original controller/code. Neither old expert nor old online
 checkpoints silently resume the new production recipe. To test the new controller with existing
 pretrained weights, `run_online_checkpoint_smoke.sh --latent-goals ...` explicitly installs the current
 scenario's goal specification and records the override. This diagnostic never writes checkpoints or
-claims that the loaded weights were pretrained under recipe 8. Use `--native-expert-fractions 0
+claims that the loaded weights were pretrained under the current recipe. Use `--native-expert-fractions 0
 --calibration-updates 0` for a single native-training trial without extra head calibration.
 Keep corrected training results in a separate output directory; datasets remain reusable.
 

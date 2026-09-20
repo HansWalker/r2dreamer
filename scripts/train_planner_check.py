@@ -19,6 +19,7 @@ from omegaconf import OmegaConf
 import tools
 from dmc_expert.storage import dataset_identity
 from envs import close_envs, make_envs, make_eval_envs
+from models.shared.physical_state import format_physical_rmse
 from scripts.online_validation import TrajectoryDataset, collect_episode, validation_metadata
 from scripts.smoke_online_checkpoints import diagnose, diagnostic_guards
 from scripts.smoke_tiny_planners import FAMILIES, changed_parameters, native_control, parameter_copies
@@ -218,8 +219,7 @@ def run_training(config, dataset, sources, settings, output, result, persist):
         persist()
         expert = scores["heldout_expert"]["all"]["physical"]
         print(f"Check | {config.model_family} | {phase}={updates} | "
-              f"obs nMSE={expert['observed']['1']['mean_normalized_mse']:.3g} | "
-              f"forecast h100={expert['forecast']['100']['mean_normalized_mse']:.3g}", flush=True)
+              f"observed h1 RMSE: {format_physical_rmse(expert['observed']['1'])}", flush=True)
 
     snapshot("initial", 0)
     with (output / "metrics.jsonl").open("w", encoding="utf-8", buffering=1) as log:
@@ -300,7 +300,7 @@ def write_report(output, report):
     temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     temporary.replace(output / "report.json")
     lines = ["Small planner training | from scratch | expert offline + own-policy online | no checkpoints",
-             "Model | Parameters | Offline/online updates | Expert obs nMSE offline->online | h100 nMSE | Policy return | Time"]
+             "Model | Parameters | Offline/online updates | Policy return offline->online | Time"]
     for result in report["runs"]:
         if result["status"] not in {"PASS", "REGRESSION"}:
             lines.append(f"{result['status']} | {result['model']} | {result.get('error', 'in progress')}")
@@ -310,12 +310,17 @@ def write_report(output, report):
         phases, policy = result["phases"], result["policy"]
         lines.append(f"{result['status']} | {result['model']} | {result['parameters']:,} | "
                      f"{phases['offline']['updates']}/{phases['online']['updates']} | "
-                     f"{before['observed']['1']['mean_normalized_mse']:.3g}->{after['observed']['1']['mean_normalized_mse']:.3g} | "
-                     f"{before['forecast']['100']['mean_normalized_mse']:.3g}->{after['forecast']['100']['mean_normalized_mse']:.3g} | "
                      f"{policy['offline']['return']:.1f}->{policy['online']['return']:.1f} | {duration(result['seconds'])}")
+        for source, horizon in (("observed", "1"), ("forecast", "5"), ("forecast", "100")):
+            if horizon not in after[source]:
+                continue
+            lines.append(f"  Expert {source} h{horizon} RMSE offline->online | " + format_physical_rmse(
+                after[source][horizon], before=before[source][horizon],
+                baseline=after["true_persistence"][horizon] if source == "forecast" else None))
     lines += ["PASS checks execution and declared short-run error limits, not task mastery or full-size stability.",
               "REGRESSION means an intermediate/final physical-error guard failed; inspect per-coordinate RMSE in report.json.",
-              "nMSE uses fixed expert TRAIN scales; expert HELDOUT and zero/random failure trajectories are never fitted.",
+              "Angles are wrapped radians; hold=true-state persistence (scoring only). nMSE remains secondary in JSON; guards unchanged.",
+              "Expert HELDOUT and zero/random failure trajectories are never fitted; training losses are unchanged.",
               "Policy returns use two complete, fixed-seed episodes per stage. The time target covers both models, sequentially."]
     summary = "\n".join(lines) + "\n"
     (output / "summary.txt").write_text(summary, encoding="utf-8")

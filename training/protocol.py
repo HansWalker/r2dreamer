@@ -14,8 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 IMPLEMENTATION_ENV = "DMC_IMPLEMENTATION_SHA256"
 # Bump these for incompatible payload/recipe changes or changed metric semantics, not source formatting.
 CHECKPOINT_SCHEMA = 2
-TRAINING_RECIPE_VERSION = 8
-EVALUATION_PROTOCOL = "dmc_evaluation_v10"
+TRAINING_RECIPE_VERSION = 9
+EVALUATION_PROTOCOL = "dmc_evaluation_v11"
 
 
 def upgrade_readout_config(config):

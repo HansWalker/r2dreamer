@@ -15,6 +15,7 @@ import torch
 from omegaconf import OmegaConf
 
 from dmc_expert.storage import dataset_identity, validate_dataset
+from models.shared.physical_state import ERROR_METRIC_VERSION, format_physical_rmse
 from training import load_model_family
 from training.evaluation import StateDataset, latent_rollout
 from training.protocol import implementation_sha256, validate_checkpoint
@@ -62,6 +63,10 @@ def analyze_batch(model, observation, actions, targets, context, horizons, rando
         "decoded_persistence": anchor, "true_persistence": targets[:, context - 1:context],
     }
     errors = {name: (value - truth).square()[:, indices].cpu() for name, value in estimates.items()}
+    physical_errors = {
+        name: head.targets.metric_error(value, truth).square()[:, indices].cpu()
+        for name, value in estimates.items()
+    }
     future = features[:, context:]
     latent_error = (prediction - future).flatten(2).square().mean(-1)[:, indices].cpu()
     temporal = features.diff(dim=1).flatten(2).square().mean((1, 2)).cpu()
@@ -101,7 +106,7 @@ def analyze_batch(model, observation, actions, targets, context, horizons, rando
                 "failure": (~actual_success).cpu(),
                 "predicted_success": inside(relation).cpu(),
             }
-    return {"errors": errors, "latent_error": latent_error, "temporal": temporal,
+    return {"errors": errors, "physical_errors": physical_errors, "latent_error": latent_error, "temporal": temporal,
             "physical_motion": physical_motion, "frames": frames, "responses": responses, "goals": goals}
 
 
@@ -111,6 +116,10 @@ def summarize_batches(batches, windows, head, horizons):
     if not torch.isfinite(std).all() or not (std > 0).all():
         raise ValueError("Readout scales must be finite and positive.")
     errors = {name: torch.cat([batch["errors"][name] for batch in batches]) for name in batches[0]["errors"]}
+    physical_errors = {
+        name: torch.cat([batch["physical_errors"][name] for batch in batches])
+        for name in batches[0]["physical_errors"]
+    }
     frames = torch.cat([batch["frames"] for batch in batches])
     latent_error = torch.cat([batch["latent_error"] for batch in batches])
     temporal = torch.cat([batch["temporal"] for batch in batches])
@@ -128,6 +137,7 @@ def summarize_batches(batches, windows, head, horizons):
             normalized = mse / std.square()
             physical[name] = {
                 str(horizon): {
+                    **head.targets.metric_summary(physical_errors[name][indices, i]),
                     "rmse": dict(zip(coordinates, mse[i].sqrt().tolist(), strict=True)),
                     "normalized_mse": dict(zip(coordinates, normalized[i].tolist(), strict=True)),
                     "mean_normalized_mse": normalized[i].mean().item(),
@@ -198,6 +208,7 @@ def write_reports(output, results, args):
     output.mkdir(parents=True, exist_ok=True)
     report = {
         "diagnostic_version": 1, "implementation_sha256": implementation_sha256(),
+        "physical_metric_version": ERROR_METRIC_VERSION,
         "dataset_role": "held_out_expert", "evaluation_fitting": False,
         "context_length": args.context_length, "horizons": args.horizons, "window_seed": args.window_seed,
         "notes": [
@@ -215,7 +226,7 @@ def write_reports(output, results, args):
     with (output / "physical_errors.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(["scenario", "model", "checkpoint", "cohort", "horizon", "source", "coordinate",
-                         "rmse_original_units", "expert_std", "normalized_mse", "normalized_loss_fraction"])
+                         "rmse_original_units", "expert_std", "normalized_mse", "normalized_loss_fraction", "unit"])
         for result in results:
             for cohort, values in result["cohorts"].items():
                 for source, by_horizon in values["physical"].items():
@@ -224,23 +235,31 @@ def write_reports(output, results, args):
                             writer.writerow([result["scenario"], result["model"], result["checkpoint_name"],
                                              cohort, horizon, source, coordinate, rmse,
                                              result["readout_std"][coordinate], metrics["normalized_mse"][coordinate],
-                                             metrics["normalized_loss_fraction"][coordinate]])
+                                             metrics["normalized_loss_fraction"][coordinate],
+                                             metrics["physical_units"].get(coordinate, "1")])
+                        for coordinate in sorted(metrics["physical_rmse"].keys() - metrics["rmse"].keys()):
+                            writer.writerow([result["scenario"], result["model"], result["checkpoint_name"],
+                                             cohort, horizon, source, coordinate, metrics["physical_rmse"][coordinate],
+                                             "", "", "", metrics["physical_units"][coordinate]])
     first, last = map(str, (min(args.horizons), max(args.horizons)))
     lines = ["Held-out expert diagnostics | no fitting, simulator, or planner optimization",
-             f"Scenario/model/checkpoint | observed nMSE h{first} | forecast nMSE h{first}/h{last} | rank/max | latent std/motion | random-action latent delta h{first}/h{last}"]
+             f"Scenario/model/checkpoint | rank/max | latent std/motion | random-action latent delta h{first}/h{last}"]
     for result in results:
         values = result["cohorts"]["all"]
         physical, representation = values["physical"], values["representation"]
         response = values["action_sensitivity"]["random"]["latent_rms_delta"]
         lines.append(
             f"{result['scenario']}/{result['model']}/{result['checkpoint_name']} | "
-            f"{physical['observed'][first]['mean_normalized_mse']:.3g} | "
-            f"{physical['forecast'][first]['mean_normalized_mse']:.3g}/{physical['forecast'][last]['mean_normalized_mse']:.3g} | "
             f"{representation['effective_rank']:.2f}/{representation['maximum_rank']} | "
             f"{representation['rms_std']:.3g}/{representation['temporal_rms_delta']:.3g} | "
             f"{response[first]:.3g}/{response[last]:.3g}"
         )
-    lines.append("nMSE uses checkpoint expert scales; original-unit errors and coordinate contributions are in physical_errors.csv.")
+        lines.append(f"  Observed h{first} RMSE | {format_physical_rmse(physical['observed'][first])}")
+        for horizon in dict.fromkeys((first, last)):
+            lines.append(f"  Forecast h{horizon} RMSE | " + format_physical_rmse(
+                physical['forecast'][horizon], baseline=physical['true_persistence'][horizon]))
+    lines.append("Angles are wrapped radians; hold=true-state persistence (scoring only). Decoded persistence is in JSON.")
+    lines.append("nMSE/raw trigonometric errors remain secondary JSON/CSV diagnostics with unchanged expert scales.")
     lines.append("Rank/action sensitivity have no universal pass threshold. Cohort details and exact windows are in report.json.")
     summary = "\n".join(lines) + "\n"
     (output / "summary.txt").write_text(summary, encoding="utf-8")

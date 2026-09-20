@@ -28,7 +28,7 @@ from dmc_expert.storage import (
     split_episode_indices,
     validate_dataset,
 )
-from models.shared.physical_state import PhysicalStateHead, readout_mode
+from models.shared.physical_state import PhysicalStateHead, format_physical_rmse, readout_mode
 from scripts.diagnose_planning_models import FAMILIES, SCENARIOS
 from scripts.online_validation import (
     collect_episode,
@@ -215,6 +215,7 @@ def physical_metrics(prediction, truth, head, tolerance, geometry):
     actual, predicted = inside_goal(target, tolerance, geometry), inside_goal(relation, tolerance, geometry)
     successes, failures = int(actual.sum()), int((~actual).sum())
     return {
+        **head.targets.metric_summary(head.targets.metric_error(prediction, truth).square()),
         "samples": len(truth), "rmse": dict(zip(head.coordinates, mse.sqrt().tolist(), strict=True)),
         "normalized_mse": dict(zip(head.coordinates, normalized.tolist(), strict=True)),
         "mean_normalized_mse": normalized.mean().item(),
@@ -377,44 +378,41 @@ def write_reports(output, results, data, args):
     temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     temporary.replace(output / "report.json")
     lines = ["Fresh readout diagnostic | frozen native models | no online updates or checkpoint writes",
-             "Run | Small-batch fit | Expert validation nMSE h1 | Simulator validation nMSE h1 | False/missed goals | Time"]
+             "Run | Small-batch fit | False/missed goals before->after | Time"]
     for result in results:
         name = f"{result['scenario']}/{result['model']}"
         if result["status"] == "FAIL":
             lines.append(f"FAIL | {name} | {result['error']}")
             continue
-        def metric(stage, source, field="mean_normalized_mse", prediction="observed", horizon="1", result=result):
+        def metric(stage, source, prediction="observed", horizon="1", result=result):
             values = result[stage]["validation"]
             if source == "expert":
-                return values[source][prediction][horizon][field]
+                return values[source][prediction][horizon]
             rows = [values[group][prediction][horizon] for group in ("zero", "random")]
-            return sum(row[field] * row["samples"] for row in rows) / sum(row["samples"] for row in rows)
+            return {
+                "physical_units": rows[0]["physical_units"],
+                "physical_rmse": {
+                    name: (sum(row["physical_rmse"][name]**2 * row["samples"] for row in rows)
+                           / sum(row["samples"] for row in rows))**.5
+                    for name in rows[0]["physical_rmse"]
+                },
+            }
         def rate(stage, numerator, denominator, result=result):
             rows = [result[stage]["validation"][group]["observed"]["1"] for group in ("expert", "zero", "random")]
             total = sum(row[denominator] for row in rows)
             return f"{sum(row[numerator] for row in rows) / total:.1%}" if total else "no coverage"
-        expert = "->".join(f"{metric(stage, 'expert', 'mean_normalized_mse'):.3g}" for stage in ("before", "after"))
-        simulator = "->".join(f"{metric(stage, 'simulator', 'mean_normalized_mse'):.3g}" for stage in ("before", "after"))
         rates = " / ".join("->".join(rate(stage, num, den) for stage in ("before", "after"))
                            for num, den in (("false_success_count", "failure_states"), ("missed_success_count", "success_states")))
         fitted = "FIT" if result["small_batch"]["fitted"] else "NOT FIT"
-        lines.append(f"COMPLETE | {name} | {fitted} | {expert} | {simulator} | {rates} | {duration(result['elapsed_seconds'])}")
-        forecasts = []
+        lines.append(f"COMPLETE | {name} | {fitted} | {rates} | {duration(result['elapsed_seconds'])}")
         for source in ("expert", "simulator"):
-            pair = " -> ".join("/".join(f"{metric(stage, source, prediction='forecast', horizon=h):.3g}"
-                                        for h in ("5", "100")) for stage in ("before", "after"))
-            forecasts.append(f"{source}={pair}")
-        lines.append("  Forecast nMSE h5/h100 | " + " | ".join(forecasts))
-        relations = []
-        for stage in ("before", "after"):
-            rows = [result[stage]["validation"][group]["observed"]["1"] for group in ("zero", "random")]
-            rmse = [(sum(row["relation_rmse"][i]**2 * row["samples"] for row in rows)
-                     / sum(row["samples"] for row in rows))**.5 for i in range(len(rows[0]["relation_rmse"]))]
-            relations.append("[" + ", ".join(f"{value:.4g}" for value in rmse) + "]")
-        lines.append("  Simulator observed goal-relation RMSE (original units) | " + " -> ".join(relations))
+            for prediction, horizon in (("observed", "1"), ("forecast", "5"), ("forecast", "100")):
+                lines.append(f"  {source} {prediction} h{horizon} RMSE before->after | " + format_physical_rmse(
+                    metric("after", source, prediction, horizon), before=metric("before", source, prediction, horizon),
+                    baseline=metric("after", source, "true_persistence", horizon) if prediction == "forecast" else None))
     lines.extend([
         "COMPLETE means the diagnostic executed, not that the model is repaired. Small-batch FIT is only a fitting check.",
-        "nMSE keeps the original expert scales. Inspect coordinate/angle errors and forecast h5 in physical_errors.csv/report.json.",
+        "Angles are wrapped radians; hold=true-state persistence (scoring only). nMSE/raw trigonometric errors remain secondary in JSON/CSV.",
         "Expert validation episodes were seen during native pretraining, but never used to fit these fresh heads.",
         "Simulator train/validation episodes are disjoint and identical across models. Zero/random actions do not guarantee recovery coverage.",
         "This does not validate online stability or planning quality; no production settings or weights were changed.",
@@ -423,7 +421,7 @@ def write_reports(output, results, data, args):
     (output / "summary.txt").write_text(summary, encoding="utf-8")
     with (output / "physical_errors.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["scenario", "model", "stage", "split", "cohort", "source", "horizon", "coordinate", "rmse", "normalized_mse"])
+        writer.writerow(["scenario", "model", "stage", "split", "cohort", "source", "horizon", "coordinate", "rmse", "normalized_mse", "unit"])
         for result in results:
             if result["status"] == "FAIL":
                 continue
@@ -434,7 +432,12 @@ def write_reports(output, results, data, args):
                             for horizon, values in horizons.items():
                                 for coordinate, rmse in values["rmse"].items():
                                     writer.writerow([result["scenario"], result["model"], stage, split, cohort, source,
-                                                     horizon, coordinate, rmse, values["normalized_mse"][coordinate]])
+                                                     horizon, coordinate, rmse, values["normalized_mse"][coordinate],
+                                                     values["physical_units"].get(coordinate, "1")])
+                                for coordinate in sorted(values["physical_rmse"].keys() - values["rmse"].keys()):
+                                    writer.writerow([result["scenario"], result["model"], stage, split, cohort, source,
+                                                     horizon, coordinate, values["physical_rmse"][coordinate], "",
+                                                     values["physical_units"][coordinate]])
     return summary
 
 

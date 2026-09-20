@@ -246,8 +246,8 @@ class TemporalStraightening(LatentPlanner):
         prediction = self.predict(latent[:, :-1], action)
         target = latent[:, 1:].detach()
         prediction_loss = F.mse_loss(prediction, target)
-        trajectory = latent.flatten(-2)
-        velocity = trajectory[:, 1:] - trajectory[:, :-1]
+        # Upstream `cos` straightens each patch, not a motion-weighted whole image.
+        velocity = latent[:, 1:] - latent[:, :-1]
         previous, current = velocity[:, :-1], velocity[:, 1:]
         curvature = 1 - F.cosine_similarity(previous, current, dim=-1, eps=1e-6)
         moving = (previous.norm(dim=-1) > 1e-6) & (current.norm(dim=-1) > 1e-6)

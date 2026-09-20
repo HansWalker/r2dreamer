@@ -16,6 +16,7 @@ from omegaconf import OmegaConf
 
 import tools
 from envs import close_envs, make_envs
+from models.shared.physical_state import format_physical_rmse
 from scripts.diagnose_fixed_replay import FixedBatches, measure
 from scripts.online_validation import collect_episode, episode_metadata, TrajectoryDataset
 from training import load_model_family
@@ -189,21 +190,23 @@ def write_report(output, report):
     (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     lines = ["Tiny planner training | fresh initialization | no checkpoints | PASS = execution checks only",
              "Data: real random-action simulator episodes, NOT expert data; validation episodes/seeds are disjoint.",
-             "Model | Params | Offline/online updates | Held-out obs nMSE initial/offline/online | Forecast h20 offline/online | Time"]
+             "Model | Params | Offline/online updates | Time"]
     for result in report["runs"]:
         if result["status"] != "PASS":
             lines.append(f"FAIL | {result['model']} | {result.get('error', 'incomplete')}")
             continue
         initial, offline, final = result["snapshots"][0], result["snapshots"][1], result["snapshots"][-1]
         def score(snap, source, horizon):
-            return snap["scores"]["all"][source][str(horizon)]["mean_normalized_mse"]
+            return snap["scores"]["all"][source][str(horizon)]
         phases = result["phases"]
         lines.append(f"PASS | {result['model']} | {result['parameters']:,} | "
-                     f"{phases['offline']['updates']}/{phases['online']['updates']} | "
-                     + "/".join(f"{score(s, 'observed', 1):.3g}" for s in (initial, offline, final))
-                     + " | " + "/".join(f"{score(s, 'forecast', 20):.3g}" for s in (offline, final))
-                     + f" | {duration(result['seconds'])}")
-    lines.extend(["nMSE uses fixed random-action TRAINING scales, not the production expert scales.",
+                     f"{phases['offline']['updates']}/{phases['online']['updates']} | {duration(result['seconds'])}")
+        lines.append("  Initial observed h1 RMSE | " + format_physical_rmse(score(initial, "observed", 1)))
+        for source, horizon in (("observed", 1), ("forecast", 20)):
+            lines.append(f"  {source} h{horizon} RMSE offline->online | " + format_physical_rmse(
+                score(final, source, horizon), before=score(offline, source, horizon),
+                baseline=score(final, "true_persistence", horizon) if source == "forecast" else None))
+    lines.extend(["Angles are wrapped radians; hold=true-state persistence (scoring only). nMSE remains secondary in JSON with fixed training scales.",
                   "Images remain 64x64; native losses/LRs are unchanged. Batches, widths, depth, planner and schedules are tiny.",
                   "Short policy episodes are diagnostic, not task-success benchmarks. This does not validate full-size learning.",
                   "Per-coordinate RMSE, persistence baselines, exact windows, policy returns and resolved settings: report.json."])

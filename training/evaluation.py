@@ -19,6 +19,7 @@ from dmc_expert.storage import (
 )
 from models.dreamer import Dreamer
 from models.planning import LatentPlanner
+from models.shared.physical_state import ERROR_METRIC_VERSION
 from models.shared.utils import parse_model_io
 from models.storm import StormModel
 from models.storm.world_model import categorical_sample
@@ -361,7 +362,8 @@ def evaluate_state_prediction(model, config, dataset_path, metadata):
                 int(settings.state_windows), total_length, int(settings.state_seed), context_length,
                 float(settings.motion_fraction), int(settings.motion_candidates),
             )
-            errors = {name: [] for name in ("rmse", "observed_rmse", "persistence_rmse")}
+            errors = {name: [] for name in ("rmse", "observed_rmse", "persistence_rmse", "true_persistence_rmse")}
+            physical_errors = {name: [] for name in errors}
             progress = Progress("Prediction", len(windows))
             completed = 0
             progress.update(completed, "held-out windows")
@@ -397,15 +399,21 @@ def evaluate_state_prediction(model, config, dataset_path, metadata):
                         forecast = forecast + decoded.reshape(batch, count, horizons[-1], -1).sum(1)
                         observed = observed + diagnostic.reshape(batch, count, horizons[-1], -1).sum(1)
                         persistence = persistence + anchor.reshape(batch, count, 1, -1).sum(1)
-                    target = target[:, context_length:].to(device)
-                    target = torch.cat((target, head.targets.derived(target)), dim=-1)
-                    estimates = {"rmse": forecast, "observed_rmse": observed, "persistence_rmse": persistence}
+                    true_anchor = target[:, context_length - 1:context_length].to(device)
+                    true_anchor = torch.cat((true_anchor, head.targets.derived(true_anchor)), dim=-1)
+                    state_target = target[:, context_length:].to(device)
+                    target = torch.cat((state_target, head.targets.derived(state_target)), dim=-1)
+                    estimates = {"rmse": forecast / samples, "observed_rmse": observed / samples,
+                                 "persistence_rmse": persistence / samples, "true_persistence_rmse": true_anchor}
                     for name, estimate in estimates.items():
-                        squared_error = (estimate / samples - target).square()
+                        squared_error = (estimate - target).square()
                         errors[name].append(squared_error.index_select(1, horizon_indices).cpu())
+                        physical = head.targets.metric_error(estimate[..., :len(head.coordinates)], state_target)
+                        physical_errors[name].append(physical.square().index_select(1, horizon_indices).cpu())
                     completed += batch
                     progress.update(completed, "held-out windows", force=completed == len(windows))
             errors = {name: torch.cat(rows) for name, rows in errors.items()}
+            physical_errors = {name: torch.cat(rows) for name, rows in physical_errors.items()}
 
             def summarize(indices):
                 result = {}
@@ -417,6 +425,11 @@ def evaluate_state_prediction(model, config, dataset_path, metadata):
                             str(horizon): dict(zip(names, scores[index, columns].tolist(), strict=True))
                             for index, horizon in enumerate(horizons)
                         }
+                    physical = physical_errors[name][indices].mean(0).sqrt()
+                    result["physical_" + name] = {
+                        str(horizon): dict(zip(head.targets.metric_coordinates, physical[index].tolist(), strict=True))
+                        for index, horizon in enumerate(horizons)
+                    }
                 return result
 
             cohorts = {}
@@ -442,11 +455,16 @@ def evaluate_state_prediction(model, config, dataset_path, metadata):
                     "scaled by held-out episode coordinate ranges (floor 1e-3)"
                 ),
                 "persistence_definition": "hold the last decoded observed state fixed; no simulator-state input",
+                "true_persistence_definition": "hold the last true prefix state fixed; scoring baseline only, never a model input",
                 "rollout": "open_loop_recorded_actions",
                 "derived_coordinates": head.targets.derived_coordinates,
                 "derived_units": "position: m; velocity: m/s",
                 "target_version": str(config.state_head.target_version),
-                "metric": "RMSE per physical coordinate in original units; fixed checkpoint readout",
+                "metric": "physical RMSE per coordinate; wrapped angles in radians; no aggregate across different units",
+                "physical_metric_version": ERROR_METRIC_VERSION,
+                "physical_coordinates": head.targets.metric_coordinates,
+                "physical_units": head.targets.metric_units,
+                "angle_definition": "atan2 of mean decoded sine/cosine; shortest angular error; undefined orientation scored as pi",
                 "state_coordinates": head.coordinates,
                 "readout": "detached supervised physical-state head",
                 "readout_history_length": head.history,

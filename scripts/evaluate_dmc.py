@@ -202,10 +202,12 @@ def main():
         )
         counts = " | ".join(f"{name}_windows={values['windows']}" for name, values in prediction["cohorts"].items())
         print(f"Evaluation | split=heldout | rollout=open_loop | {counts}")
-        for horizon, errors in prediction["rmse"].items():
-            baseline = prediction["persistence_rmse"][horizon]
-            values = " | ".join(f"{key}={value:.4g} (hold={baseline[key]:.4g})" for key, value in errors.items())
-            print(f"Prediction | horizon={horizon} | RMSE (original units) | {values}")
+        print("Prediction | hold=true-state persistence (scoring only); decoded persistence and observed errors are in JSON")
+        for horizon, errors in prediction["physical_rmse"].items():
+            baseline = prediction["physical_true_persistence_rmse"][horizon]
+            units = prediction["physical_units"]
+            values = " | ".join(f"{key}[{units[key]}]={value:.4g} (hold={baseline[key]:.4g})" for key, value in errors.items())
+            print(f"Prediction | horizon={horizon} | RMSE | {values}")
             derived = prediction["derived_rmse"][horizon]
             if derived:
                 values = " | ".join(f"{key}={value:.4g}" for key, value in derived.items())

@@ -18,6 +18,7 @@ from tensordict import TensorDict
 import tools
 from buffer import SequenceBuffer
 from dmc_expert.storage import dataset_identity, validate_dataset
+from models.shared.physical_state import format_physical_rmse
 from scripts.diagnose_fresh_readout import (
     cache_forecasts,
     check_partition,
@@ -235,7 +236,7 @@ def write_report(output, results, args):
     }
     (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     lines = ["Fixed replay | identical batches across ablations | fresh heads | checkpoints read-only",
-             "Run / mode | Updates | Expert observed nMSE | Replay observed / forecast h5 nMSE | Clip % | Latent drift | Time"]
+             "Run / mode | Updates | Clip % | Latent drift | Time"]
     rows = []
     for result in results:
         name = f"{result['scenario']}/{result['model']}"
@@ -248,20 +249,25 @@ def write_report(output, results, args):
                 lines.append(f"FAIL | {name}/{trial['mode']} | {trial['error']}")
                 continue
             last = trial["snapshots"][-1]
-            def change(cohort, source, horizon, before=before, after=last["scores"]):
-                return "->".join(f"{scores[cohort][source][horizon]['mean_normalized_mse']:.3g}"
-                                 for scores in (before, after))
             lines.append(f"COMPLETE | {name}/{trial['mode']} | {trial['updates']} | "
-                         f"{change('expert', 'observed', '1')} | {change('replay', 'observed', '1')} / "
-                         f"{change('replay', 'forecast', '5')} | {100 * trial['clipped_fraction']:.1f} | "
+                         f"{100 * trial['clipped_fraction']:.1f} | "
                          f"{last['latent_drift_rms']:.3g} | {duration(trial['elapsed_seconds'])}")
+            for cohort, source, horizon in (("expert", "observed", "1"), ("replay", "observed", "1"),
+                                           ("replay", "forecast", "5")):
+                lines.append(f"  {cohort} {source} h{horizon} RMSE | " + format_physical_rmse(
+                    last["scores"][cohort][source][horizon], before=before[cohort][source][horizon]))
             for snapshot in [{"update": 0, "scores": before}, *trial["snapshots"]]:
                 for cohort, sources in snapshot["scores"].items():
                     for source, horizons in sources.items():
                         for horizon, values in horizons.items():
                             for coordinate, rmse in values["rmse"].items():
                                 rows.append([name, trial["mode"], snapshot["update"], cohort, source, horizon,
-                                             coordinate, rmse, values["normalized_mse"][coordinate]])
+                                             coordinate, rmse, values["normalized_mse"][coordinate],
+                                             values["physical_units"].get(coordinate, "1")])
+                            for coordinate in sorted(values["physical_rmse"].keys() - values["rmse"].keys()):
+                                rows.append([name, trial["mode"], snapshot["update"], cohort, source, horizon,
+                                             coordinate, values["physical_rmse"][coordinate], "",
+                                             values["physical_units"][coordinate]])
     lines.extend([
         "COMPLETE means finite execution, not repaired models. Inspect physical_errors.csv and goal/angle errors in report.json.",
         "Native budgets/losses unchanged; this is a short schedule prefix on static saved replay, not a policy evaluation.",
@@ -270,7 +276,7 @@ def write_report(output, results, args):
     ])
     with (output / "physical_errors.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["run", "mode", "update", "cohort", "source", "horizon", "coordinate", "rmse", "normalized_mse"])
+        writer.writerow(["run", "mode", "update", "cohort", "source", "horizon", "coordinate", "rmse", "normalized_mse", "unit"])
         writer.writerows(rows)
     summary = "\n".join(lines) + "\n"
     (output / "summary.txt").write_text(summary, encoding="utf-8")

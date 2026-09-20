@@ -9,6 +9,19 @@ from torch import nn
 
 STATE_KEY = "physical_state"
 TARGET_VERSION = "dmc_physical_state_v2"
+ERROR_METRIC_VERSION = "physical_rmse_wrapped_angles_v1"
+
+
+def format_physical_rmse(metrics, before=None, baseline=None):
+    """Format separate physical quantities; never average metres and radians."""
+    values = metrics["physical_rmse"]
+    units = metrics["physical_units"]
+    parts = []
+    for name, value in values.items():
+        change = f"{before['physical_rmse'][name]:.3g}->" if before is not None else ""
+        hold = f" (hold={baseline['physical_rmse'][name]:.3g})" if baseline is not None else ""
+        parts.append(f"{name}[{units[name]}]={change}{value:.3g}{hold}")
+    return ", ".join(parts)
 
 
 @contextmanager
@@ -64,6 +77,47 @@ class PhysicalStateTargets:
             "dmc_reacher_easy": ["fingertip_x", "fingertip_y", "fingertip_vx", "fingertip_vy"],
             "dmc_ball_in_cup_catch": ["ball_to_target_x", "ball_to_target_z", "ball_relative_vx", "ball_relative_vz"],
         }.get(self.task, [])
+        self.angle_pairs = (
+            {"pole_angle": (self.positions[1], self.positions[2])}
+            if self.task == "dmc_cartpole_balance_sparse" else
+            {f"joint_angle[{i}]": tuple(self.positions[2 * i:2 * i + 2]) for i in range(2)}
+            if self.task == "dmc_reacher_easy" else {}
+        )
+        self.metric_indices = [i for i in range(len(self.coordinates)) if i not in self.trigonometric]
+        self.metric_coordinates = [self.coordinates[i] for i in self.metric_indices] + list(self.angle_pairs)
+        self.metric_units = {
+            name: ("rad" if name in self.angle_pairs else
+                   "rad/s" if name.startswith("velocity[") and (
+                       self.task == "dmc_reacher_easy" or
+                       self.task == "dmc_cartpole_balance_sparse" and name == "velocity[1]"
+                   ) else "m/s" if name.startswith("velocity[") else "m")
+            for name in self.metric_coordinates
+        }
+
+    def metric_error(self, prediction, truth):
+        """Physical residuals, with shortest signed angular distances in radians.
+
+        An undefined predicted orientation receives the maximum angular error
+        (pi), rather than letting atan2(0, 0) count as a correct upright pole.
+        Raw cosine/sine errors remain separate diagnostics.
+        """
+        errors = [(prediction - truth)[..., self.metric_indices]]
+        for cosine, sine in self.angle_pairs.values():
+            predicted_angle = torch.atan2(prediction[..., sine], prediction[..., cosine])
+            true_angle = torch.atan2(truth[..., sine], truth[..., cosine])
+            delta = predicted_angle - true_angle
+            wrapped = torch.atan2(delta.sin(), delta.cos())
+            undefined = prediction[..., cosine].square() + prediction[..., sine].square() <= 1e-12
+            errors.append(torch.where(undefined, torch.pi, wrapped)[..., None])
+        return torch.cat(errors, dim=-1)
+
+    def metric_summary(self, squared_errors):
+        """Summarize examples, preserving one RMSE per quantity and its unit."""
+        values = squared_errors.mean(0).sqrt().tolist()
+        return {
+            "physical_rmse": dict(zip(self.metric_coordinates, values, strict=True)),
+            "physical_units": self.metric_units,
+        }
 
     def encode(self, state):
         state = np.asarray(state, dtype=np.float32)
