@@ -214,6 +214,36 @@ and four small per-control metric logs. No checkpoint writes, planner optimizati
 timing calibration, or full-model benchmarks run. `COMPLETE` means execution succeeded; the declared
 training-fit criterion is not evidence of long-run online stability or policy success.
 
+To test a **short-rollout training candidate for both TS and LeWorldModel**:
+
+```bash
+bash scripts/run_rollout_check.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision
+```
+
+Each tiny Cartpole model is trained from scratch for 1,000 expert updates once. Two arms then start
+from identical weights and optimizer moments: native one-step prediction, versus a 50/50 mixture
+of native one-step and five-step autoregressive prediction. The candidate feeds its own predictions
+back through the actual planner rollout, with gradients through all steps. The total prediction
+coefficient, regularizers, dropout, optimizer and learning rates are otherwise unchanged.
+This is an **experimental extension**, not an upstream reproduction or an enabled production fix.
+
+Encoder/projector features, BatchNorm statistics and the physical head remain fixed during the
+2,000 predictor updates per arm. Four training and two disjoint validation simulator seeds supply
+identical cached branches for both arms, including zero, opposing constant, and random action sequences. Reports compare
+teacher-forced errors, h1/h5 open-loop errors, action response, and predicted versus true-encoded
+goal-cost rankings. Physical distances/rewards are scoring-only. The physical head cannot be called
+by the fitting/rollout paths. Sparse-reward ties are reported as uninformative, not successes.
+The rollout term supervises full-prefix futures; native windows also supervise earlier positions.
+This compares objectives, including that target weighting, not a pure teacher-forcing toggle.
+
+No checkpoint reads/writes, extra head fitting, timing calibration, precision sweep or full-model
+benchmark runs. This is fixed-data adaptation, **not own-policy online training**. `COMPLETE` means
+execution, not repair; assess held-out rollout accuracy and action rankings before a full training run.
+Use `--models temporal_straightening` for TS only, or `--expert-updates` / `--fit-updates` to change
+the budget. `runs/rollout_training_check_<timestamp>` contains `report.json`, `summary.txt`, and
+one offline plus two fitting metric logs per model. Production settings are not changed.
+
 Immediately before the production run, use the fuller preflight. It checks the installed GPU stack,
 runs two expert updates and the short online lifecycle for every model, evaluates all thirteen variants,
 and validates the resulting checkpoints and metrics:
