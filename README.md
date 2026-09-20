@@ -887,6 +887,38 @@ The formula references are [LeWM's native loss](https://github.com/lucas-maes/le
 and [TS's visual prediction/curvature loss](https://github.com/Agentic-Learning-AI-Lab/temporal-straightening/blob/main/models/visual_world_model.py).
 These do not claim full numerical parity with the upstream architectures or validate learning quality.
 
+### True-Future Goal Selection Check
+
+When short random branches give almost identical rewards, test the goal objective without
+calling either model's predictor or physical head:
+
+```bash
+bash scripts/run_goal_objective_check.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision
+```
+
+This pretrains the same tiny Cartpole LeWorldModel and TS encoders used in the rollout
+diagnostic for 1,000 expert updates each, then freezes them. No online adaptation, new loss,
+planner optimization, checkpoint reads/writes, or production changes. Simulator data is
+collected once: 12 mirrored/jittered balanced, boundary, and failure states; 21 candidate
+sequences per state; actual futures at horizons 5, 25 and 100. Only endpoint images are rendered.
+Horizon 5 matches the current planner; longer lookahead is diagnostic only.
+
+The native terminal latent-goal cost ranks those true futures. Selection is compared with
+uniform random choice, actual candidate-best reward, and a physical-distance baseline.
+Two candidates come from privileged simulator LQR feedback, recorded as fixed action sequences
+shared by both models. They improve coverage of recoverable outcomes, but are **not** a proposed
+learned controller. Simulator reward/state labels never enter the model's cost or training.
+
+`summary.txt` reports normalized return, selection regret, reward contrast and recovery rate;
+`report.json` includes per-state/action/horizon scores, velocities, cohort breakdowns, configs
+and hashes. Flat-reward cases do not count as evidence; unavailable recovery is not an objective
+failure. These are constructed states and finite-candidate short branches, not full policy returns.
+Reports and offline metrics go to timestamped `runs/goal_objective_check_*`. Defaults do not
+repeat any prior online, loss-ablation, or throughput benchmarks.
+
+CPU and real-simulator regression checks: `MUJOCO_GL=egl python -m scripts.check_goal_objective`.
+
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening
