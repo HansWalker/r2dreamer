@@ -127,8 +127,23 @@ def simulate_case(env, actions, horizons, gain):
             "successes": np.asarray(successes), "states": np.asarray(states)}
 
 
-def collect_objective_cases(config, args):
-    if args.horizons[-1] >= int(config.env.time_limit) // int(config.env.action_repeat):
+def observe_prefix(env, history_size):
+    """Build real image/action history from the current simulator state."""
+    images, actions = [env.render()], []
+    for _ in range(history_size - 1):
+        action = np.zeros(env.action_space.shape, dtype=np.float32)
+        observation, _, done, _ = env.step(action)
+        if done:
+            raise ValueError("Diagnostic prefix reached the episode time limit.")
+        images.append(observation["image"])
+        actions.append(action)
+    return {"prefix": torch.from_numpy(np.stack(images)),
+            "past_action": torch.from_numpy(np.asarray(actions, dtype=np.float32).reshape(history_size - 1, *env.action_space.shape))}
+
+
+def collect_objective_cases(config, args, *, history_size=None):
+    prefix_steps = max(0, (history_size or 1) - 1)
+    if prefix_steps + args.horizons[-1] >= int(config.env.time_limit) // int(config.env.action_repeat):
         raise ValueError("Diagnostic horizon would reach the episode time limit.")
     cases, gain = [], None
     progress = Progress("True simulator futures", len(args.sim_seeds) * len(PROFILES))
@@ -145,17 +160,19 @@ def collect_objective_cases(config, args):
                 if seed % 2:
                     state *= -1
                 set_cart_state(env, state)
+                prefix = {} if history_size is None else observe_prefix(env, history_size)
                 before = env._env.physics.get_state().copy()
                 actions, labels = candidate_bank(args.candidates, args.horizons[-1], seed + index)
                 result = simulate_case(env, actions, args.horizons, gain)
                 np.testing.assert_array_equal(before, env._env.physics.get_state())
                 cases.append({"id": f"{seed}/{name}", "seed": seed, "profile": name, "cohort": cohort,
-                              "anchor_state": state.tolist(),
+                              "initial_state": state.tolist(), "anchor_state": cart_state(env).tolist(),
                               "anchor_relation": goal_relation(env._env.physics, env._domain, env._task).tolist(),
                               "anchor_success": float(env._env.task.get_reward(env._env.physics)) >= 1 - 1e-6,
                               "goal_image": torch.from_numpy(observation["goal_image"].copy()),
                               "tolerance": goal_relation_spec(env._env.physics, env._domain, env._task)["tolerance"],
-                              "feedback_gain": gain.tolist(), "action": actions, "candidate_labels": labels, **result})
+                              "feedback_gain": gain.tolist(), "action": actions, "candidate_labels": labels,
+                              **prefix, **result})
                 progress.update(len(cases), force=len(cases) == progress.total)
         finally:
             env.close()
@@ -233,9 +250,12 @@ def aggregate(rows):
 
 
 def case_metadata(case):
-    result = {key: value for key, value in case.items() if key not in ("image", "goal_image")}
-    result = {key: value.tolist() if isinstance(value, np.ndarray) else value for key, value in result.items()}
-    result["images_sha256"] = tensor_digest({"future": case["image"], "goal": case["goal_image"]})
+    result = {key: value for key, value in case.items() if key not in ("image", "goal_image", "prefix")}
+    result = {key: value.tolist() if isinstance(value, (np.ndarray, torch.Tensor)) else value for key, value in result.items()}
+    images = {"future": case["image"], "goal": case["goal_image"]}
+    if "prefix" in case:
+        images["prefix"] = case["prefix"]
+    result["images_sha256"] = tensor_digest(images)
     return result
 
 

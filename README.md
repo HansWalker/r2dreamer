@@ -952,6 +952,41 @@ loadable with their saved config and have identical evaluation computations; thi
 not repair already-trained weights. New configs have a different compatibility fingerprint,
 so do not silently resume an old run as the corrected experiment.
 
+### Paired Planning-Horizon Check
+
+Test longer lookahead without changing the goal objective or retraining for each horizon:
+
+```bash
+bash scripts/run_planning_horizon_check.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision
+```
+
+This fits each tiny Cartpole LeWorldModel/TS once for 1,000 expert updates with the corrected
+input dropout, then freezes its weights. Each model runs native closed-loop planning at
+horizons **5, 15, 25** (0.1, 0.3, 0.5 simulator seconds) for **100 agent steps** from the same
+12 constructed balanced/boundary/failure starts. Two real zero-action transitions provide a
+common three-frame prefix. Planner caches reset between trials; samples/restarts, iterations,
+goals and per-call RNG seeds are identical across horizons. Longer horizons have different
+random tensor shapes and greater compute; this is not an equal-compute comparison.
+
+The same weights also rank shared candidate trajectories using **predicted** versus **actual**
+future images. All horizons use prefixes of one candidate bank. The summary compares only
+anchors with informative returns at every horizon; JSON also includes all-anchor averages,
+individual scores and physical baselines. The privileged simulator-feedback candidates are
+diagnostic ranking controls only, never supplied to the native closed-loop planners.
+
+There are no online updates, dropout ablations, checkpoint reads/writes, dataset audits or
+production changes. The auxiliary physical head is fitted during pretraining but never used
+for action selection. Short controlled trials do not establish full-episode success or online
+learning stability. `--policy-steps` changes trial length, not training; the runner rejects trials
+that would cross the original episode boundary. The terminal prints progress and a compact
+six-row summary with returns, tail success, planning time and candidate rankings.
+
+Output: `runs/planning_horizon_check_<timestamp>/{report.json,summary.txt}`, plus one
+`offline_metrics.jsonl` per model and `horizon_*/policy_metrics.jsonl` containing each step's
+actions, simulator rewards/states and timings. CPU/simulator regression checks:
+`MUJOCO_GL=egl python -m scripts.check_planning_horizons`.
+
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening
