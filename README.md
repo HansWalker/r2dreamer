@@ -159,6 +159,29 @@ units. If the legacy failure does not reproduce, the comparison explicitly repor
 Even an encouraging result does not establish long-run stability or successful control. No production
 model code or settings are changed by this test.
 
+To isolate **action conditioning versus encoder/BatchNorm/readout drift**, use the same launcher:
+
+```bash
+bash scripts/run_ts_ablation.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision --mechanisms
+```
+
+This skips the old-curvature comparison. It pretrains one corrected tiny TS model for 1,000 updates
+once, then restores the identical weights and optimizer moments for three 512-update adaptation
+controls: native, frozen BatchNorm, and frozen encoder. Batches, dropout seeds, and the head's online
+schedule/50% expert retention are shared. These controls are diagnostic, not production recipe changes.
+The same held-out images are decoded with old/new encoder and readout combinations; restoring only
+the old BatchNorm buffers separately tests inference-statistic drift without changing current weights.
+Crossed-head errors measure compatibility, not whether physical information is irretrievably lost.
+
+Four extra simulator anchors provide zero/-1/+1 action branches at the native five-step Cartpole
+horizon. The diagnostic compares predicted and actual encoded action effects, matched versus wrong
+actions, and gradients through the action input/encoder. CUDA probes also compare BF16 with FP32 on
+the same weights, without retraining. These branches are validation-only and collected once; no policy
+optimization or extra head fitting is performed. Results go to `runs/ts_mechanisms_<timestamp>` with
+one shared `offline_metrics.jsonl`, per-control metrics, `report.json`, and a compact `summary.txt`.
+The previous physical-error guards still apply; this does not establish online control success.
+
 Immediately before the production run, use the fuller preflight. It checks the installed GPU stack,
 runs two expert updates and the short online lifecycle for every model, evaluates all thirteen variants,
 and validates the resulting checkpoints and metrics:

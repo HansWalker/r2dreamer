@@ -205,13 +205,18 @@ def arguments(argv=None):
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--expert-updates", type=int, default=1000)
     parser.add_argument("--online-updates", type=int, default=512, help="Fixed-replay adaptation updates per arm.")
+    parser.add_argument("--mechanisms", action="store_true",
+                        help="Pretrain once, then test native/frozen-BN/frozen-encoder adaptation and action conditioning.")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--output", type=Path, default=Path("runs") / datetime.now(timezone.utc).strftime("ts_ablation_%Y%m%d_%H%M%S"))
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     if min(args.expert_updates, args.online_updates) < 1 or args.seed < 0:
         parser.error("Update counts must be positive; seed must be nonnegative.")
     args.scenario = "cartpole_balance_sparse"
+    if args.output is None:
+        prefix = "ts_mechanisms" if args.mechanisms else "ts_ablation"
+        args.output = Path("runs") / datetime.now(timezone.utc).strftime(f"{prefix}_%Y%m%d_%H%M%S")
     return args
 
 
@@ -256,6 +261,10 @@ def main(argv=None):
                       initial_sampler_sha256=sampler_digest(dataset),
                       replay_batches_sha256=hashlib.sha256(json.dumps(plans).encode()).hexdigest())
         del reference
+        if args.mechanisms:
+            from scripts.ts_mechanisms import run_mechanisms
+            return run_mechanisms(config, dataset, sampler_start, replay, plans, sources, settings,
+                                  args, report, started)
         print(f"Train | two TS arms | each: {args.expert_updates} expert + {args.online_updates} replay updates", flush=True)
         for variant in VARIANTS:
             report["runs"].append({"variant": variant, "status": "RUNNING"})
