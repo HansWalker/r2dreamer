@@ -3,6 +3,9 @@ task: dmc_ball_in_cup_catch
 collection_task: ball_in_cup/catch
 dataset: ball_in_cup_catch
 planning_horizon: 25
+goal_observation:
+  cup_displacement: [0.0, 0.0]  # x/z joint displacements in metres, not world positions.
+  ball_to_target: [0.0, 0.0]  # Cup target minus ball position, in metres.
 state_fields:
   position: [0, 1, 2, 3]
   velocity: [0, 1, 2, 3]

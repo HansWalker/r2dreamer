@@ -1,4 +1,4 @@
-"""Task-relative latent planning shared by planning model families."""
+"""Native latent-goal planning with an independent physical-state evaluation head."""
 
 import math
 
@@ -44,10 +44,7 @@ class LatentPlanner(nn.Module):
         if self.goal_geometry == "box" and tolerance.numel() != 2:
             raise ValueError("Box goal geometry requires one tolerance per relation coordinate.")
         self.register_buffer("goal_tolerance", tolerance)
-        self.goal_stable_steps = int(goal.stable_steps)
-        self.goal_action_weight = float(goal.action_weight)
-        if not 1 <= self.goal_stable_steps <= int(self.planner.horizon):
-            raise ValueError("Goal stable_steps must be between one and the planning horizon.")
+        self.goal_reduction = "sum" if str(config.model_family) == "leworldmodel" else "mean"
 
         self.encoder = encoder
         self.action_encoder = action_encoder
@@ -109,7 +106,7 @@ class LatentPlanner(nn.Module):
 
     @staticmethod
     def replay_observation(history):
-        return {key: value[:, -1] for key, value in history.items()}
+        return {"image": history["image"][:, -1]}
 
     def representation_loss(self, obs, latent, action):
         raise NotImplementedError
@@ -200,20 +197,11 @@ class LatentPlanner(nn.Module):
             state = torch.cat((state[:, 1:], next_state[:, None]), dim=1)
         return torch.stack(prediction, dim=1).reshape(batch, samples, horizon, *latent_shape)
 
-    def _goal_cost(self, history, past_action, candidates):
+    def _goal_cost(self, history, past_action, candidates, goal):
         prediction = self.rollout(history, past_action, candidates)
-        batch, samples = prediction.shape[:2]
-        prefix = history[:, None, 1:].expand(-1, samples, -1, *history.shape[2:])
-        trajectory = torch.cat((prefix, prediction), dim=2)
-        tail = trajectory[:, :, -(self.history_size + self.goal_stable_steps - 1) :]
-        physical = self.state_head(tail.flatten(0, 1)).reshape(batch, samples, self.goal_stable_steps, -1)
-        relation = self.state_head.targets.goal_relation(physical)
-        relation = relation / self.goal_tolerance
-        # Keep a restoring signal inside the success region as well as outside it.
-        # Success thresholds belong to evaluation, not to a flat planning objective.
-        cost = relation.square().sum(dim=-1)
-        action_cost = candidates.square().mean(dim=(-1, -2))
-        return cost.mean(dim=-1) + self.goal_action_weight * action_cost
+        error = (prediction[:, :, -1] - goal.detach()[:, None]).square().flatten(2)
+        # Upstream LeWM sums embedding coordinates; TS averages its visual tokens.
+        return error.sum(-1) if self.goal_reduction == "sum" else error.mean(-1)
 
     def _first_mask(self, first, batch):
         return (
@@ -223,7 +211,7 @@ class LatentPlanner(nn.Module):
         )
 
     @torch.no_grad()
-    def _cem(self, history, past_action, deterministic, first):
+    def _cem(self, history, past_action, deterministic, first, goal):
         batch = next(iter(history.values())).shape[0]
         horizon = int(self.planner.horizon)
         samples = int(self.planner.samples)
@@ -237,7 +225,7 @@ class LatentPlanner(nn.Module):
         for _ in range(int(self.planner.iterations)):
             noise = torch.randn(batch, samples, horizon, self.action_dim, device=self.device)
             actions = (mean[:, None] + std[:, None] * noise).clamp(-1, 1)
-            cost = self._goal_cost(latent, past_action, actions)
+            cost = self._goal_cost(latent, past_action, actions, goal)
             elite_index = cost.topk(int(self.planner.elites), dim=1, largest=False).indices
             elite = actions.gather(
                 1,
@@ -251,7 +239,7 @@ class LatentPlanner(nn.Module):
             action = action + std[:, 0] * torch.randn_like(action)
         return action.clamp(-1, 1)
 
-    def _gradient_plan(self, history, past_action, deterministic, first):
+    def _gradient_plan(self, history, past_action, deterministic, first, goal):
         batch = next(iter(history.values())).shape[0]
         restarts = int(self.planner.samples)
         horizon = int(self.planner.horizon)
@@ -273,14 +261,14 @@ class LatentPlanner(nn.Module):
         for start in range(0, candidates, batch_size):
             stop = min(start + batch_size, candidates)
             indices = torch.arange(start, stop, device=self.device) // restarts
-            chunks.append((start, stop, latent[indices], past_action[indices]))
+            chunks.append((start, stop, latent[indices], past_action[indices], goal[indices]))
         with torch.enable_grad():
             for _ in range(iterations):
                 optimizer.zero_grad(set_to_none=True)
                 gradient = torch.empty_like(logits).flatten(0, 1)
-                for start, stop, chunk_latent, chunk_past in chunks:
+                for start, stop, chunk_latent, chunk_past, chunk_goal in chunks:
                     chunk = logits.flatten(0, 1)[start:stop].detach().requires_grad_()
-                    cost = self._goal_cost(chunk_latent, chunk_past, chunk.tanh()[:, None])
+                    cost = self._goal_cost(chunk_latent, chunk_past, chunk.tanh()[:, None], chunk_goal)
                     # Each candidate has independent action variables. Averaging across
                     # environments/restarts changes Adam's effective epsilon and step.
                     gradient[start:stop] = torch.autograd.grad(cost.sum(), chunk)[0]
@@ -294,7 +282,7 @@ class LatentPlanner(nn.Module):
         with torch.no_grad():
             actions = logits.tanh()
             self._gradient_actions = actions.detach()
-            cost = self._goal_cost(latent, past_action, actions)
+            cost = self._goal_cost(latent, past_action, actions, goal)
             best = cost.argmin(dim=1)
             action = actions[torch.arange(batch, device=self.device), best, 0]
             if not deterministic:
@@ -302,6 +290,11 @@ class LatentPlanner(nn.Module):
             return action.clamp(-1, 1)
 
     def act(self, history, past_action, deterministic=False, first=None):
+        if "goal_image" not in history:
+            raise ValueError(
+                "Latent planning requires a rendered physical goal (goal_image). "
+                "Use the physical_render_v1 environment config; the evaluation head is not a controller."
+            )
         was_training = self.training
         self.eval()
         gradient_planner = str(self.planner.type) == "gradient"
@@ -310,11 +303,14 @@ class LatentPlanner(nn.Module):
         for parameter in trainable:
             parameter.requires_grad_(False)
         try:
+            with torch.no_grad():
+                # Re-encode with current weights; never keep stale goals across online updates.
+                goal = self.encode({"image": history["goal_image"].to(self.device)[:, None]})[:, 0]
             history = {key: history[key].to(self.device) for key in self.encoder.keys}
             past_action = past_action.to(self.device)
             if gradient_planner:
-                return self._gradient_plan(history, past_action, deterministic, first)
-            return self._cem(history, past_action, deterministic, first)
+                return self._gradient_plan(history, past_action, deterministic, first, goal)
+            return self._cem(history, past_action, deterministic, first, goal)
         finally:
             for parameter in trainable:
                 parameter.requires_grad_(True)

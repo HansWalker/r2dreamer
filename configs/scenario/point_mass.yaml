@@ -6,6 +6,8 @@ task: dmc_point_mass_easy
 collection_task: point_mass/easy
 dataset: point_mass_easy
 planning_horizon: 5
+goal_observation:
+  position: [0.0, 0.0]
 
 goal:
   geometry: radial

@@ -49,6 +49,7 @@ class ToyEnvironment:
     def observation(self):
         return TensorDict({
             "image": torch.full((1, 64, 64, 3), self.steps, dtype=torch.uint8),
+            "goal_image": torch.zeros(1, 64, 64, 3, dtype=torch.uint8),
             "physical_state": torch.tensor([[.01 * self.steps, 1, 0, .01, 0]]),
             "is_terminal": torch.zeros(1, 1),
         }, batch_size=(1,))
@@ -231,6 +232,32 @@ class OnlineCheckpointSmokeTest(unittest.TestCase):
         before, after = diagnostic(.002), diagnostic(.002)
         after["all"]["physical"]["observed"]["1"]["mean_normalized_mse"] = 10000
         self.assertFalse(accuracy_regression(before, after)["passed"])
+
+    def test_legacy_controller_override_is_explicit_read_only_and_reported(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, job = fixture(Path(temporary), "leworldmodel")
+            path = Path(job["checkpoint"])
+            checkpoint = torch.load(path, weights_only=False)
+            config = OmegaConf.create(checkpoint["training_config"])
+            del config.env["goal"]
+            del config.jepa_model.goal["source"], config.jepa_model.goal["observation"]
+            config.jepa_model.goal.stable_steps = 2
+            config.jepa_model.goal.action_weight = 1e-4
+            checkpoint["training_config"] = OmegaConf.to_container(config, resolve=True)
+            checkpoint["compatibility"] = {**checkpoint_compatibility(config), "recipe_version": 7}
+            torch.save(checkpoint, path)
+            original = path.read_bytes()
+            with patch("scripts.smoke_online_checkpoints.make_envs", return_value=ToyEnvironment()) as envs:
+                result = run_case(job)
+                self.assertEqual(result["status"], "FAIL")
+                self.assertIn("--latent-goals", result["error"])
+                envs.assert_not_called()
+                job["latent_goals"] = True
+                result = run_case(job)
+            self.assertTrue(result.get("execution_passed"), result.get("error"))
+            self.assertTrue(result["controller"]["explicit_legacy_override"])
+            self.assertFalse(result["controller"]["physical_head_used_for_planning"])
+            self.assertEqual(path.read_bytes(), original)
 
     def test_readout_sampler_uses_only_train_split_and_resumes_exactly(self):
         for name in ("dreamer", "storm", "tdmpc2", "leworldmodel", "temporal_straightening"):

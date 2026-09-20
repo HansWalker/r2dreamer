@@ -90,6 +90,51 @@ Cartpole Balance Sparse dataset and one expert update per model:
 ./scripts/run_smoke.sh
 ```
 
+For a **fresh, extremely small LeWorldModel/Temporal Straightening training check**, without
+the expert dataset, pretrained weights, or checkpoint writes:
+
+```bash
+bash scripts/run_tiny_planner_check.sh
+```
+
+This defaults to CPU and Cartpole, with roughly 14K/22K parameters, 64x64 images, batches of
+8 sequences, 128 offline updates and 128 online updates. Four real random-action episodes
+(not expert data) supply offline training and the head's 50% retention source. Online replay
+starts empty and receives only each model's own actions. Two disjoint simulator episodes
+measure observed-state and open-loop physical errors before/after training and every 64 online
+updates. Native losses, optimizer types and learning rates stay unchanged; sizes, schedules,
+episode lengths and planner budgets are deliberately tiny. A tripwire forbids physical-head
+calls during planning. `PASS` means execution checks passed, not that task learning or full-size
+stability is established. Reports include individual-coordinate errors and short policy returns.
+Use `--scenario reacher` or `--scenario ball_in_cup`, `--device cuda:0`, `--offline-updates`,
+`--online-updates`, or `--output` as needed. Existing output directories are never overwritten.
+
+For a **roughly one-hour GPU training diagnostic**, use the expert dataset and both small planners
+on one scenario (Cartpole by default):
+
+```bash
+bash scripts/run_planner_training_check.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision --minutes 60
+```
+
+The time target is for both models combined, run sequentially. A short, disposable timing pass
+measures training, collection and evaluation, then chooses the SAME offline/online update count
+for both models. All timing-pass weights and replay are discarded; actual training starts from
+scratch with fixed update budgets and schedules. This is an estimate, not a hard deadline.
+`--updates N` skips timing and uses an explicit shared budget (at least 2,048 per phase).
+Models use 64-wide representations, two-layer predictors, batches of 128 length-4 sequences,
+BF16 neural compute, unchanged native loss/optimizer recipes, and reduced planner search budgets.
+Episodes remain 500 agent steps. Online replay starts empty, with 1,024 warmup transitions and
+four further agent transitions per update; only the detached head retains 50% expert labels.
+No production settings, datasets or checkpoints are modified, and no checkpoints are written.
+
+Fixed expert-held-out windows and separate zero/random-action episodes check physical errors at
+initialization, after offline training and four times online. Neither validation source is fitted.
+Policy returns use two complete fixed-seed episodes after each phase. `report.json`, `summary.txt`
+and per-update `metrics.jsonl` preserve losses, coordinate RMSE/nMSE, gradient norms, timing,
+settings and any regression alarms. Terminal progress is throttled to 30 seconds. `PASS` is an
+execution/error guard, not proof of task mastery; `REGRESSION` is saved and returns a nonzero exit.
+
 Immediately before the production run, use the fuller preflight. It checks the installed GPU stack,
 runs two expert updates and the short online lifecycle for every model, evaluates all thirteen variants,
 and validates the resulting checkpoints and metrics:
@@ -245,8 +290,10 @@ The local copy must fit on disk; staging all three image datasets can require su
 
 Temporal Straightening uses 256 candidate trajectories per planning autograd pass and 32 planning
 iterations. Model weights are temporarily frozen during action optimization; action gradients,
-candidate counts, and horizons are preserved. Action embeddings and masks are reused, and the goal readout only decodes
-the required trajectory tail. One larger pass is not a guaranteed 2x speedup.
+candidate counts, and horizons are preserved. Action embeddings and masks are reused. Goal images are
+encoded once per action decision with current weights; planning never calls the physical readout.
+One larger pass is not a guaranteed 2x speedup. Older physical-head-planning timings are not measurements
+of the current controller.
 
 ```bash
 bash scripts/run_planner_benchmark.sh --dataset-root /absolute/path/to/data/dmc_expert_vision
@@ -413,9 +460,9 @@ to training, while episodes 10,000 through 10,499 are reserved for evaluation. T
 family receives images only; physical measurements never enter the encoder or policy as inputs.
 
 Collection stores a two-coordinate task relation beside each image: cart position and pole-angle error
-for Cartpole, finger-to-target for Reacher, and ball-to-moving-cup-target for Ball-in-Cup. LeWorldModel and
-Temporal Straightening derive these relations from the shared physical-state head for planning, rather
-than learning duplicate goal outputs. All five families use the same targets within each scenario:
+for Cartpole, finger-to-target for Reacher, and ball-to-moving-cup-target for Ball-in-Cup. These relations
+are diagnostics only. The shared physical-state head is auxiliary in every family, never a controller.
+All five families use the same targets within each scenario:
 
 | Scenario | Learned physical targets | Outputs |
 | --- | --- | --- |
@@ -442,7 +489,8 @@ auxiliary readout change**, independent of the optional native expert replay bel
 The separate expert sampler and online head counter are checkpointed for resumption. Its dataset
 statistics are not rescanned. Online-only runs without a dataset must explicitly set
 `state_head.online.expert_fraction=0`; they use zero mean and unit output scale.
-No physical-state, reward, or planning loss from this head updates the native representation or dynamics. Online replay
+The physical loss updates only the head. Its outputs and weights cannot affect native updates or
+action selection. Online replay
 computes identical labels from the simulator. The held-out range supplies prediction evaluation data.
 Dataset metadata fingerprints the expert checkpoint, collector, external TD-MPC2 source, and collection
 runtime so an interrupted collection cannot resume into a mixture of incompatible trajectories.
@@ -500,11 +548,29 @@ be resumed under the new meanings (including Reacher, whose output width stays e
 datasets remain reusable. The v8 evaluation changes do not require retraining v20 checkpoints; rerun
 evaluation to obtain the common-prefix metrics. Do not mix previous prediction scores with v8 scores.
 LeWorldModel and Temporal Straightening remain reward-free during representation training;
-validation return only selects checkpoints. Their planners minimize squared task-relative displacement,
-scaled by the DMC goal tolerances, with no goal image supplied at evaluation time. The dense cost
-retains a restoring gradient inside the success region; actual rewards and success thresholds are unchanged.
-Evaluation v9 identifies this policy change and the corrected independent TS action gradients.
-Old policy returns must not be relabeled as v9 evaluations:
+validation return only selects checkpoints. Recipe 8 / evaluation v10 uses physical goals rendered
+into native goal observations, not the physical evaluation head. Goals are specified in
+`scenario.goal_observation`, and `jepa_model.goal.source=physical_render_v1` identifies the interface:
+
+- Cartpole: configured cart position in metres and pole angle in radians; default centered/upright.
+- Reacher: the current episode's target location, with a fixed configured inverse-kinematics elbow
+  branch. No current arm state or future trajectory is used to select the goal.
+- Ball-in-Cup: configured cup joint displacement and target-minus-ball offset; default centered cup,
+  ball at its target. Point-mass also supports a fixed physical position goal.
+
+A separate, unshared physics copy renders the goal using the same camera and preprocessing as live
+images. Only Reacher's task target is copied each reset. Goal construction checks task success and
+joint limits once per new goal, never rolls out candidate actions, and does not alter live physics or
+RNG. Fixed images are cached; goal embeddings are refreshed each decision as the encoder changes.
+Goal images are not inserted into replay or representation/readout training.
+
+Planners compare the terminal predicted embedding to the goal embedding: LeWM sums squared coordinate
+errors; image-only TS averages over visual tokens/features. CEM and gradient search retain their
+existing budgets. The physical-head cost, final-two-step averaging, and action penalty are removed.
+TS remains an explicit image-only adaptation; rendering a single goal pose does not impose zero
+velocity or represent every pose in the task's success region. Goal observations are additional task
+specifications for these two families, not live proprioceptive inputs or held-out demonstrations.
+Do not mix the new policy returns with evaluations of the old physical-head controller:
 
 ```bash
 python3 -m scripts.evaluate_dmc \
@@ -747,11 +813,19 @@ Dreamer and STORM retain pre-tanh samples for online actor scoring; STORM also b
 transition returns from the next-state value (recipe 3 corrections).
 
 Training recipe 7 adds fixed-unit fresh-head initialization and finite TS native gradient clipping
-to recipe 6's planner/readout repairs. Old checkpoints remain evaluable with exactly their saved
-predictions and evaluation statistics, using their saved configuration. Neither old expert nor
-old online checkpoints silently resume production training under recipe 7. Read-only diagnostics
-can explicitly reuse native weights and fit replacement heads, but that is not a fresh recipe-7 run.
+to recipe 6's planner/readout repairs. Recipe 8 additionally isolates physical readout from control
+and supplies physically rendered latent goals. Old weights still load for readout-only diagnostics;
+their original policy returns require the original controller/code. Neither old expert nor old online
+checkpoints silently resume the new production recipe. To test the new controller with existing
+pretrained weights, `run_online_checkpoint_smoke.sh --latent-goals ...` explicitly installs the current
+scenario's goal specification and records the override. This diagnostic never writes checkpoints or
+claims that the loaded weights were pretrained under recipe 8. Use `--native-expert-fractions 0
+--calibration-updates 0` for a single native-training trial without extra head calibration.
 Keep corrected training results in a separate output directory; datasets remain reusable.
+
+Run `MUJOCO_GL=egl python -m scripts.check_physical_goals` for CPU head-isolation tests and actual
+DMC rendering/parallel collection/reset/update/evaluation checks. These are standalone tests, not
+additional work inside the production training loop.
 
 Run `python -m scripts.check_state_normalization` for CPU checks of loss conditioning, legacy
 prediction/gradient preservation, optimizer migration, and all five families' checkpoint paths.
@@ -785,15 +859,19 @@ python3 -m scripts.model_size_report
 
 The standalone report breaks each model into encoder, dynamics, decoder, prediction heads, and
 controller, plus the physical-state head, auxiliary weights, and frozen copies. The detached head is
-auxiliary for Dreamer, STORM, and TD-MPC2; it is part of the controller budget for the two goal planners.
+auxiliary for every family; it no longer counts toward the two goal planners' learning/control budget.
 It checks component proportions
 against each family's reference implementation, using the scratch-ResNet variant for Temporal
 Straightening. It fails if a component's relative share differs by more than 10%, a same-task budget
 spread exceeds 50K parameters, a recurrent pair gap exceeds 2K, or a model moves more than 50K away
 from the shared target. These size checks do not run inside training.
 
-Temporal Straightening has 5,248,804 to 5,249,009 learning/control parameters across the three scenarios:
-about 19.6% encoder, 79.4% dynamics, and 1.0% physical readout. Its six predictor layers retain roughly
+Native architectures are unchanged by the controller correction. TS now has approximately 5.196M
+learning/control parameters, plus its separately reported approximately 53K physical head. This is
+about 54K below the 5.25M target, with a maximum same-task spread of 57,273 parameters. The existing
+strict 50K target/spread checks flag this; they have not been relaxed and the model has not been
+resized to hide the accounting change.
+Its six predictor layers retain roughly
 equal attention and feedforward parameter allocations. Visualization is disabled by default;
 `jepa_model.decoder.enabled=true` adds 1,526,355 separately reported parameters. Its reconstruction
 losses still receive detached latents and do not train the encoder or predictor.
@@ -814,9 +892,9 @@ settings live in `configs/storm_dmc.yaml`. Their implementations remain separate
   visualization but is disabled in the comparison runs. Removing the proprioceptive branch is a
   deliberate deviation; the remaining visual prediction term retains its previous effective weight.
 
-The goal planners use task-relation outputs of the detached physical readout. During action
-optimization its weights are fixed, but gradients can pass through it and the dynamics to candidate
-actions. Planning and evaluation share the same autoregressive rollout implementation.
+The goal planners use terminal latent distance to a separately rendered physical goal. During action
+optimization native weights are fixed, but gradients pass through predicted latents to candidate
+actions; no physical decoder is involved. Planning and evaluation share the same autoregressive rollout implementation.
 Temporal Straightening computes action gradients in batches of at most
 `jepa_model.planner.gradient_batch_size=256` candidate trajectories. This bounds planning memory
 without changing the number of environments, restarts, iterations, or future steps, and preserves

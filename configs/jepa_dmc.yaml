@@ -8,6 +8,9 @@ training:
   expert:
     enabled: true
 
+env:
+  goal: ${jepa_model.goal}
+
 replay:
   batch_size: 336
   sequence_length: 4
@@ -16,10 +19,11 @@ jepa_model:
   use_amp: true  # BF16 neural compute; FP32 losses, physical readout, and action optimization.
   history_size: 3
   goal:
+    source: physical_render_v1
+    observation: ${scenario.goal_observation}
+    # Physical tolerances are for diagnostics only, not the planning objective.
     geometry: ${scenario.goal.geometry}
     tolerance: ${scenario.goal.tolerance}
-    stable_steps: 2
-    action_weight: 1e-4
   encoder:
     embedding_dim: 192
     vision:

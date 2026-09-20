@@ -155,7 +155,7 @@ def model_groups(family, model):
             "dynamics": (model.action_encoder, model.predictor, model.pred_projector),
             "decoder": () if family == "temporal_straightening" else (model.decoder,),
             "heads": (),
-            "controller": (model.state_head,),
+            "controller": (),
             "auxiliary": (model.decoder,) if family == "temporal_straightening" else (),
         }
     raise ValueError(f"No parameter grouping for model family {family!r}")
@@ -186,8 +186,7 @@ def build(config_name, scenario, overrides=()):
     counts = {name: parameter_count(*groups[name]) for name in GROUPS}
     auxiliary = parameter_count(*groups.get("auxiliary", ()))
     state_head = parameter_count(model.state_head)
-    if family_name not in {"leworldmodel", "temporal_straightening"}:
-        auxiliary += state_head
+    auxiliary += state_head
     trainable = parameter_count(model)
     budget = sum(counts.values())
     grouped = budget + auxiliary

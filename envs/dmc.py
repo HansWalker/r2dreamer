@@ -5,6 +5,7 @@ import numpy as np
 
 from models.shared.physical_state import STATE_KEY, PhysicalStateTargets
 
+from .goals import GOAL_IMAGE_KEY, PhysicalGoalRenderer
 from .parallel import ParallelEnv
 
 
@@ -63,6 +64,7 @@ class DeepMindControl(gym.Env):
         seed=0,
         max_steps=None,
         state_fields=None,
+        goal=None,
     ):
         from dm_control import suite
 
@@ -81,6 +83,9 @@ class DeepMindControl(gym.Env):
         if camera is None:
             camera = {"quadruped": 2, "fish": 3}.get(domain, 0)
         self._camera = camera
+        self._goal_spec = goal
+        self._goal_renderer = None
+        self._goal_image = None
         self.reward_range = [-np.inf, np.inf]
 
         spec = self._env.action_spec()
@@ -96,6 +101,8 @@ class DeepMindControl(gym.Env):
     @property
     def observation_space(self):
         spaces = {"image": gym.spaces.Box(0, 255, self._size + (3,), dtype=np.uint8)}
+        if self._goal_spec is not None:
+            spaces[GOAL_IMAGE_KEY] = gym.spaces.Box(0, 255, self._size + (3,), dtype=np.uint8)
         if self._state_fields:
             size = len(self._state_targets.coordinates)
             spaces[STATE_KEY] = gym.spaces.Box(-np.inf, np.inf, (size,), dtype=np.float32)
@@ -130,7 +137,14 @@ class DeepMindControl(gym.Env):
 
     def reset(self, **kwargs):
         self._episode_step = 0
-        return self._observation(self._env.reset())
+        time_step = self._env.reset()
+        if self._goal_spec is not None:
+            if self._goal_renderer is None:
+                self._goal_renderer = PhysicalGoalRenderer(
+                    self._env, self._domain, self._task, self._goal_spec, self._size, self._camera
+                )
+            self._goal_image = self._goal_renderer.render(self._env.physics)
+        return self._observation(time_step)
 
     def _observation(self, time_step):
         observation = {
@@ -145,7 +159,15 @@ class DeepMindControl(gym.Env):
                 for key, indices in self._state_fields.items()
             ])
             observation[STATE_KEY] = self._state_targets.encode(state)
+        if self._goal_image is not None:
+            observation[GOAL_IMAGE_KEY] = self._goal_image
         return observation
+
+    def close(self):
+        if self._goal_renderer is not None:
+            self._goal_renderer.close()
+            self._goal_renderer = None
+        self._env.close()
 
     def render(self, *args, **kwargs):
         if kwargs.get("mode", "rgb_array") != "rgb_array":
@@ -161,6 +183,7 @@ def make_env(config, seed, include_physical_state=False):
         seed=seed,
         max_steps=config.time_limit // config.action_repeat,
         state_fields=config.state_fields if include_physical_state else None,
+        goal=config.get("goal"),
     )
 
 

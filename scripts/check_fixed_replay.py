@@ -82,7 +82,8 @@ class FixedReplayTest(unittest.TestCase):
                     self.assertEqual(before_encoder == tensor_digest(representation_state(model)), mode == "frozen_encoder")
                     planner = "_gradient_plan" if str(model.planner.type) == "gradient" else "_cem"
                     with patch.object(model, planner, return_value=torch.zeros(4, model.action_dim)):
-                        model.act({"image": batch[0]["image"][:, :3]}, batch[1][:, :2])
+                        model.act({"image": batch[0]["image"][:, :3],
+                                   "goal_image": batch[0]["image"][:, -1]}, batch[1][:, :2])
                     self.assertTrue(all(module.training == (mode == "native") for module in bns))
                     for module in (model.encoder, model.projector):
                         self.assertEqual(module.training, mode != "frozen_encoder")

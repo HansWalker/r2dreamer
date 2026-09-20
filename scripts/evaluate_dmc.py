@@ -100,6 +100,11 @@ def main():
 
     goal_conditioned = bool(getattr(model, "goal_conditioned", False))
     goal_spec = OmegaConf.to_container(config.jepa_model.goal, resolve=True) if goal_conditioned else None
+    if goal_conditioned and (goal_spec.get("source") != "physical_render_v1" or config.env.get("goal") is None):
+        raise ValueError(
+            "This checkpoint used physical-head planning. Evaluate its original policy with its original code; "
+            "testing a new latent-goal controller must be reported as a separate diagnostic."
+        )
     print("Evaluation | policy_rollout=running")
     envs = make_eval_envs(config.env)
     try:
@@ -168,8 +173,10 @@ def main():
         "sustained_success_definition": "fraction that remain above the threshold for consecutive agent steps",
         "goal_conditioned": goal_conditioned,
         "goal_definition": (
-            "fixed DMC task-relative success region predicted from latent state" if goal_conditioned else None
+            "physical goal rendered in an isolated simulator; terminal native embedding distance"
+            if goal_conditioned else None
         ),
+        "physical_head_role": "detached evaluation readout only",
         "goal_spec": goal_spec,
         "physical_state_prediction": prediction,
         "state_prediction_evaluated": prediction is not None,

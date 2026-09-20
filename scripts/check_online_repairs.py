@@ -46,31 +46,31 @@ class OnlineRepairsTest(unittest.TestCase):
                                         gradient_batch_size=chunk),
                 encode=lambda observation: observation["image"],
                 _first_mask=lambda first, batch: torch.ones(batch, dtype=torch.bool),
-                _goal_cost=lambda history, past, actions: 1e-9 * (actions - .7).square().sum((-1, -2)),
+                _goal_cost=lambda history, past, actions, goal: 1e-9 * (actions - .7).square().sum((-1, -2)),
             )
             # Identical initial candidates, including when the overall random tensor shape changes.
             with patch("torch.randn", side_effect=lambda *shape, **kwargs: torch.full(shape, .2, **kwargs)):
                 action = LatentPlanner._gradient_plan(model, {"image": torch.ones(environments, 3, 1)},
-                                                     torch.zeros(environments, 2, 1), True, None)
+                                                     torch.zeros(environments, 2, 1), True, None,
+                                                     torch.zeros(environments, 1))
             if reference is None:
                 reference = action[0]
             torch.testing.assert_close(action, reference.expand_as(action), atol=1e-7, rtol=0)
 
-    def test_dense_task_gradient_exists_inside_success_region_without_action_penalty(self):
-        for geometry in ("box", "radial"):
-            head = lambda features: features
-            head.targets = SimpleNamespace(goal_relation=lambda value: value)
+    def test_native_goal_gradient_uses_only_terminal_latent_and_detached_goal(self):
+        for reduction, expected in (("sum", .08), ("mean", .04)):
             model = SimpleNamespace(
-                history_size=1, goal_stable_steps=2, goal_action_weight=0,
-                goal_geometry=geometry, goal_tolerance=torch.ones(2), state_head=head,
+                goal_reduction=reduction,
                 rollout=lambda history, past, actions: actions,
             )
             actions = torch.full((2, 3, 4, 2), .2, requires_grad=True)
-            cost = LatentPlanner._goal_cost(model, torch.zeros(2, 1, 2), None, actions)
-            torch.testing.assert_close(cost, torch.full((2, 3), .08))
+            goal = torch.zeros(2, 2, requires_grad=True)
+            cost = LatentPlanner._goal_cost(model, torch.zeros(2, 1, 2), None, actions, goal)
+            torch.testing.assert_close(cost, torch.full((2, 3), expected))
             gradient = torch.autograd.grad(cost.sum(), actions)[0]
-            self.assertTrue((gradient[:, :, -2:] > 0).all())
-            self.assertTrue((gradient[:, :, :-2] == 0).all())
+            self.assertTrue((gradient[:, :, -1:] > 0).all())
+            self.assertTrue((gradient[:, :, :-1] == 0).all())
+            self.assertIsNone(goal.grad)
 
     def test_mixed_native_forward_keeps_online_readout_input_and_total_budget(self):
         config = tiny_config("leworldmodel", "cartpole_balance_sparse")

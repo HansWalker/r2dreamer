@@ -58,7 +58,10 @@ def expert_update(model, batch):
 
 
 def build_context(obs, obs_history, action_history, history_size, action_dim):
-    sample = next(iter(obs.values()))
+    # Only actual images form temporal context. Goals are episode-level planner inputs.
+    goal = obs.get("goal_image")
+    obs = {"image": obs["image"]}
+    sample = obs["image"]
     rows = []
     actions = []
     for index in range(sample.shape[0]):
@@ -72,10 +75,10 @@ def build_context(obs, obs_history, action_history, history_size, action_dim):
         zero = torch.zeros(action_dim, device=sample.device)
         past = [zero] * (action_count - len(past)) + past
         actions.append(torch.stack(past) if past else zero.new_empty((0, action_dim)))
-    return (
-        {key: torch.stack([row[key] for row in rows]) for key in rows[0]},
-        torch.stack(actions),
-    )
+    history = {key: torch.stack([row[key] for row in rows]) for key in rows[0]}
+    if goal is not None:
+        history["goal_image"] = goal
+    return history, torch.stack(actions)
 
 
 @torch.no_grad()
@@ -97,7 +100,7 @@ def evaluate(config, model, envs):
 
         while not finished.all():
             history, past_action = build_context(
-                {"image": obs["image"]},
+                obs,
                 obs_history,
                 action_history,
                 model.history_size,
@@ -149,7 +152,7 @@ class OnlineSession:
     def collect(self):
         policy_obs = {"image": self.obs["image"]}
         history, past_action = build_context(
-            policy_obs,
+            self.obs,
             self.obs_history,
             self.action_history,
             self.model.history_size,

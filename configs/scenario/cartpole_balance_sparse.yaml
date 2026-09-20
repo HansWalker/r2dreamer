@@ -3,6 +3,9 @@ task: dmc_cartpole_balance_sparse
 collection_task: cartpole/balance_sparse
 dataset: cartpole_balance_sparse
 planning_horizon: 5
+goal_observation:
+  cart_position: 0.0  # Metres from the track center.
+  pole_angle: 0.0  # Radians from upright.
 state_fields:
   position: [0, 1, 2]
   velocity: [0, 1]

@@ -35,7 +35,7 @@ def collect_episode(config, model, seed, mode):
                 images.append(obs["image"][0].cpu().clone())
                 states.append(obs[STATE_KEY][0].cpu().clone())
                 if mode == "policy":
-                    context, previous = build_context({"image": obs["image"]}, history, past,
+                    context, previous = build_context(obs, history, past,
                                                       model.history_size, model.action_dim)
                     action = model.act(context, previous, deterministic=True,
                                        first=torch.tensor([step == 0], device=model.device))

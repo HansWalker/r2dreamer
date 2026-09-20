@@ -112,6 +112,8 @@ def policy_action(config, model, observation, action):
     if hasattr(model.planner, "elites"):
         model.planner.elites = 2
     history = {key: value[:, : model.history_size].to(device) for key, value in observation.items()}
+    if getattr(model, "goal_conditioned", False):
+        history["goal_image"] = observation["image"][:, -1].to(device)
     past_action = action[:, : max(model.history_size - 1, 0)].to(device)
     kwargs = {"deterministic": True}
     if family == "tdmpc2":

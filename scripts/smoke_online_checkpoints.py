@@ -297,6 +297,25 @@ def run_case(job):
         validate_checkpoint(checkpoint, config, training=False)
         if checkpoint.get("compatibility", {}).get("training_sha256") != checkpoint_compatibility(config)["training_sha256"]:
             raise ValueError("Checkpoint has inconsistent training recipe metadata.")
+        legacy_controller = config.jepa_model.goal.get("source") != "physical_render_v1"
+        if legacy_controller:
+            if not getattr(args, "latent_goals", False):
+                raise ValueError(
+                    "Checkpoint uses physical-head planning. Pass --latent-goals to explicitly test the new "
+                    "physical-render/latent-distance controller with these read-only pretrained weights."
+                )
+            from hydra import compose, initialize_config_dir
+
+            with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1] / "configs"), version_base=None):
+                current = compose(config_name=f"{args.model}_dmc_vision", overrides=[f"scenario={args.scenario}"])
+                config.jepa_model.goal = OmegaConf.to_container(current.jepa_model.goal, resolve=True)
+            config.env.goal = OmegaConf.to_container(config.jepa_model.goal, resolve=True)
+        result["controller"] = {
+            "source": config.jepa_model.goal.source,
+            "explicit_legacy_override": legacy_controller,
+            "physical_head_used_for_planning": False,
+            "goal": OmegaConf.to_container(config.jepa_model.goal, resolve=True),
+        }
         upgrade_readout_config(config)
         quantum = int(config.env.env_num) * int(config.env.action_repeat)
         if args.env_steps % quantum or not 0 < args.env_steps <= int(config.training.online.steps):
@@ -382,9 +401,11 @@ def write_summary(output, results, args):
                   "REGRESSION: intermediate/final physical errors exceeded declared limits. UNVALIDATED: insufficient failure coverage or excessive false goals.",
                   "Expert nMSE scales are unchanged. Original-unit RMSE, cohorts, and exact windows are in report.json.",
                   "Policy returns use complete episodes, separate seeds, and no training replay; few episodes are diagnostic only.",
-                  "Native budgets are unchanged. Calibration adds explicitly reported head-only updates; no validation fitting."])
+                  "Native budgets are unchanged. Calibration adds explicitly reported head-only updates; no validation fitting.",
+                  "Planning uses rendered physical goals and native latent distance; explicit legacy overrides are in JSON.",
+                  "False goals describe the evaluation readout, not the planner's internal success predictions."])
     report = {
-        "diagnostic_version": 3, "implementation_sha256": implementation_sha256(),
+        "diagnostic_version": 4, "implementation_sha256": implementation_sha256(),
         "dataset_role": "held_out_expert_and_disjoint_simulator", "evaluation_fitting": False, "checkpoint_writes": False,
         "settings": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "results": results,
@@ -403,6 +424,8 @@ def main():
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=["cartpole_balance_sparse"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--latent-goals", action="store_true",
+                        help="Explicitly replace legacy physical-head control with rendered physical goals and native latent planning.")
     parser.add_argument("--env-steps", type=int, default=4096, help="Stop early without changing the saved training schedule.")
     parser.add_argument("--windows", type=int, default=16, help="Fixed held-out windows, shared before/after training.")
     parser.add_argument("--batch-size", type=int, default=4, help="Diagnostic batch size, not training batch size.")

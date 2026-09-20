@@ -14,8 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 IMPLEMENTATION_ENV = "DMC_IMPLEMENTATION_SHA256"
 # Bump these for incompatible payload/recipe changes or changed metric semantics, not source formatting.
 CHECKPOINT_SCHEMA = 2
-TRAINING_RECIPE_VERSION = 7
-EVALUATION_PROTOCOL = "dmc_evaluation_v9"
+TRAINING_RECIPE_VERSION = 8
+EVALUATION_PROTOCOL = "dmc_evaluation_v10"
 
 
 def upgrade_readout_config(config):
@@ -315,6 +315,15 @@ def validate_training_recipe(config):
         require(int(planner.horizon) > 0 and int(planner.iterations) > 0, "TD-MPC2 planner settings must be positive")
     elif family in {"leworldmodel", "temporal_straightening"}:
         require(
+            config.jepa_model.goal.get("source") == "physical_render_v1",
+            "latent planners require physical_render_v1 goals, not physical-head planning",
+        )
+        require(config.env.get("goal") == config.jepa_model.goal, "environment and planner goals must match")
+        require(
+            not any(key in config.jepa_model.goal for key in ("stable_steps", "action_weight")),
+            "physical-head cost settings are obsolete; latent planners use terminal embedding distance",
+        )
+        require(
             sequence_length == int(config.jepa_model.history_size) + 1,
             "planning-model replay length must equal history_size + 1",
         )
@@ -454,8 +463,7 @@ def validate_checkpoint(checkpoint, config, *, training=True):
         if training:
             required += ("recipe_version", "training_sha256")
         expected_compatibility = checkpoint_compatibility(config)
-        # v7 changes fresh head initialization, not just online training. Old expert
-        # checkpoints remain evaluable, but cannot silently resume the new recipe.
+        # Version changes must not silently resume an older optimization/controller recipe.
         mismatches = [key for key in required if compatibility.get(key) != expected_compatibility[key]]
         if mismatches:
             purpose = "training" if training else "evaluation"
