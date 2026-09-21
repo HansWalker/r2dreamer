@@ -128,7 +128,7 @@ def validate_budget(config, args):
         raise ValueError("Policy/forecast horizon must stay within one simulator episode.")
 
 
-def run_model(config, args, cases, output, result, persist):
+def run_model(config, args, cases, output, result, persist, *, measurement=measure):
     family = load_model_family(config.model_family)
     total = max(args.eval_updates)
     config.training.expert.updates = total
@@ -149,7 +149,7 @@ def run_model(config, args, cases, output, result, persist):
             suffix = f"_env_{env_steps}" if phase == "online" else ""
             folder = output / f"{phase}_{updates}{suffix}"
             folder.mkdir()
-            scores = measure(config, model, cases, expert_batch, args, folder)
+            scores = measurement(config, model, cases, expert_batch, args, folder)
             item = {"phase": phase, "updates": updates, "env_steps": env_steps, **scores}
             result["snapshots"].append(item)
             persist()

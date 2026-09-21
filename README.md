@@ -1177,6 +1177,46 @@ training replay, optimizer moments, RNG or planner caches. The report includes a
 counts and completed training episodes. Policy evaluations remain the same short trials,
 not full-episode benchmark scores. There are still no checkpoint reads/writes or extra sweeps.
 
+### Physical Controller Comparison
+
+```bash
+bash scripts/run_physical_controller_check.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision
+```
+
+Diagnostic-only Cartpole comparison of image-goal planning and physical arrival costs.
+Each tiny LeWorldModel/TS model is trained once for 5,000 offline updates, then continues
+for 4,096 environment steps under the original online schedule (262 updates). At both
+endpoints, controllers use identical frozen native weights, starts, horizons, solvers,
+planning budgets and per-call random seeds. Native online collection always uses image
+planning, so this tests scoring, not learning with the proposed physical controller.
+
+A separate fresh controller head is fitted for 2,000 updates at each endpoint. It uses
+the existing position/orientation/velocity targets, detached three-frame histories, and
+equal observed/imagined clips. Only the head changes: native training and the auxiliary
+evaluation head remain untouched. Supplemental zero/random simulator episodes and expert
+TRAIN episodes are collected/read once and shared across models; controller validation
+episodes and policy starts are disjoint. Controller-validation expert episodes may have been
+seen during native pretraining, but never head fitting; benchmark held-out windows are a
+further evaluation-only check. Training supervision is therefore not matched across controllers.
+The extra supervised controller is explicitly an adaptation, not a paper reproduction.
+
+The fixed cost averages cart-boundary error and upright-pole chord error along the horizon,
+then adds a last-three-step velocity penalty. Cart limit is 0.25 m, angular scale is
+acos(0.995), velocity scales are 0.5 m/s and 1 rad/s, and velocity weight is 0.1.
+These are declared diagnostic choices, not tuned or guaranteed stabilization settings.
+No goal-image term, reward head, physical-state input, native loss modification, or
+checkpoint read/write is added. Physical forecasts can still be wrong or exploited.
+
+`summary.txt` compares paired short policy returns/tail success and candidate choices
+using forecast-decoded states, real-image-decoded states, and true simulator states.
+`report.json` adds per-coordinate physical RMSE/false goals by source, exact training and
+validation clips, hashes, budgets and timings. Per-step controller/policy/native metrics
+are JSONL files. `COMPLETE` means execution, not improvement. No old sweeps or audits run.
+Use `--online-steps 0` for the offline endpoint only; `--models temporal_straightening`
+restricts the test to TS. Outputs default to `runs/physical_controller_<timestamp>`.
+Local checks: `MUJOCO_GL=egl python -m scripts.check_physical_controller`.
+
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening
