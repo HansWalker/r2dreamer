@@ -1157,6 +1157,26 @@ Use `--online-steps 0` for offline only, `--models leworldmodel` for one model, 
 `--eval-updates 1000 3000 10000` to change the measurement points and total offline budget.
 Local checks: `MUJOCO_GL=egl python -m scripts.check_planner_learning_curve`.
 
+For a longer online continuation without changing the models, offline training budget,
+or native online schedule:
+
+```bash
+bash scripts/run_planner_learning_curve.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision \
+  --eval-updates 5000 \
+  --online-steps 32000 \
+  --online-eval-steps 4096 16000
+```
+
+This skips the earlier offline measurements, not their training updates. It measures at
+the offline endpoint, at 4,096 and 16,000 online environment steps, and automatically at
+32,000 steps: 262, 1,789 and 3,842 online updates respectively. These are cumulative steps
+across 16 environments, including action repeats; the last point covers two full episodes
+per environment. Intermediate evaluations reuse the same held-out cases without resetting
+training replay, optimizer moments, RNG or planner caches. The report includes actual step
+counts and completed training episodes. Policy evaluations remain the same short trials,
+not full-episode benchmark scores. There are still no checkpoint reads/writes or extra sweeps.
+
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening

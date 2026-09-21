@@ -34,6 +34,7 @@ class LearningCurveTests(unittest.TestCase):
     def test_cli_and_default_recipe(self):
         args = arguments(["--dataset-root", "/tmp/data", "--device", "cpu"])
         self.assertEqual(args.eval_updates, [1000, 3000, 5000])
+        self.assertEqual(args.online_eval_steps, [])
         for name, objective in (("leworldmodel", "last"), ("temporal_straightening", "ts_mpc")):
             config = build_config(name, args)
             validate_budget(config, args)
@@ -46,6 +47,9 @@ class LearningCurveTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()), patch("sys.stderr", new=io.StringIO()):
             for extra in (["--eval-updates", "0"], ["--eval-updates", "2", "2"],
                           ["--online-steps", "-1"], ["--horizon", "0"], ["--policy-steps", "0"],
+                          ["--online-eval-steps", "0"], ["--online-eval-steps", "2048", "2048"],
+                          ["--online-eval-steps", "4096"], ["--online-eval-steps", "8192"],
+                          ["--online-steps", "0", "--online-eval-steps", "32"],
                           ["--models", "leworldmodel", "leworldmodel"]):
                 with self.assertRaises(SystemExit):
                     arguments(["--dataset-root", "/tmp/data", *extra])
@@ -59,6 +63,23 @@ class LearningCurveTests(unittest.TestCase):
         args.policy_steps = 498
         with self.assertRaisesRegex(ValueError, "one simulator episode"):
             validate_budget(config, args)
+
+    def test_long_online_budget_keeps_the_production_schedule(self):
+        args = arguments(["--dataset-root", "/tmp/data", "--device", "cpu", "--eval-updates", "5000",
+                          "--online-steps", "32000", "--online-eval-steps", "16000", "4096"])
+        self.assertEqual(args.online_eval_steps, [4096, 16000])
+        for name in args.models:
+            config = build_config(name, args)
+            validate_budget(config, args)
+            self.assertEqual(config.training.online.steps, 80000)
+            self.assertEqual(config.training.online.updates, 10000)
+            self.assertEqual([online_update_target(config, step) for step in [4096, 16000, 32000]],
+                             [262, 1789, 3842])
+            self.assertEqual(args.online_steps // (config.env.env_num * config.env.time_limit), 2)
+        for points in ([2048], [4097]):
+            args.online_eval_steps = points
+            with self.assertRaisesRegex(ValueError, "Online evaluation steps"):
+                validate_budget(config, args)
 
     def test_error_shapes_and_hold_baseline(self):
         for shape in ((4,), (2, 4)):
@@ -122,7 +143,8 @@ class LearningCurveTests(unittest.TestCase):
             root = Path(tmp)
             real_fixture(root)
             args = arguments(["--dataset-root", str(root), "--device", "cpu", "--eval-updates", "2", "4",
-                              "--online-steps", "32", "--policy-steps", "2", "--horizon", "3", "--output", str(root / "output")])
+                              "--online-steps", "32", "--online-eval-steps", "22", "--policy-steps", "2",
+                              "--horizon", "3", "--output", str(root / "output")])
             created, envs, online_initial = {}, [], {}
 
             def config_for(name, args):
@@ -171,7 +193,8 @@ class LearningCurveTests(unittest.TestCase):
                 model, name = created[run["model"]], run["model"]
                 self.assertEqual(run["offline_updates"], 4)
                 self.assertEqual([(s["phase"], s["updates"]) for s in run["snapshots"]],
-                                 [("offline", 2), ("offline", 4), ("online", 2)])
+                                 [("offline", 2), ("offline", 4), ("online", 1), ("online", 2)])
+                self.assertEqual([s["env_steps"] for s in run["snapshots"]], [0, 0, 22, 32])
                 self.assertEqual(online_initial[name]["sha256"], run["snapshots"][1]["model_sha256"])
                 self.assertEqual(run["online"]["schedule_updates"], 8)
                 self.assertEqual(run["online"]["schedule_env_steps"], 64)
@@ -194,6 +217,7 @@ class LearningCurveTests(unittest.TestCase):
                 self.assertTrue((args.output / name / "online_metrics.jsonl").exists())
             self.assertFalse(list(args.output.rglob("*.pt")))
             self.assertIn("COMPLETE means execution", (args.output / "summary.txt").read_text())
+            self.assertIn("online_1[env=22]", (args.output / "summary.txt").read_text())
 
     def test_snapshot_rng_isolation_even_if_policy_fails(self):
         model = torch.nn.Linear(1, 1)

@@ -121,6 +121,8 @@ def validate_budget(config, args):
     if args.online_steps and (args.online_steps % quantum or args.online_steps > int(config.training.online.steps)
                               or online_update_target(config, args.online_steps) < 1):
         raise ValueError(f"Online steps must be a multiple of {quantum}, exceed warmup, and fit the production schedule.")
+    if any(step % quantum or online_update_target(config, step) < 1 for step in args.online_eval_steps):
+        raise ValueError(f"Online evaluation steps must be multiples of {quantum} and exceed warmup.")
     limit = int(config.env.time_limit) // int(config.env.action_repeat)
     if int(config.jepa_model.history_size) - 1 + max(args.horizon, args.policy_steps) >= limit:
         raise ValueError("Policy/forecast horizon must stay within one simulator episode.")
@@ -144,13 +146,26 @@ def run_model(config, args, cases, output, result, persist):
         result["expert_windows"] = [asdict(window) for window in windows]
 
         def snapshot(phase, updates, env_steps=0):
-            folder = output / f"{phase}_{updates}"
+            suffix = f"_env_{env_steps}" if phase == "online" else ""
+            folder = output / f"{phase}_{updates}{suffix}"
             folder.mkdir()
             scores = measure(config, model, cases, expert_batch, args, folder)
             item = {"phase": phase, "updates": updates, "env_steps": env_steps, **scores}
             result["snapshots"].append(item)
             persist()
             print(snapshot_line(str(config.model_family), item), flush=True)
+
+        online_points = iter(args.online_eval_steps)
+        next_online_point = next(online_points, None)
+
+        def online_snapshot(steps, updates):
+            nonlocal next_online_point
+            if next_online_point is None or steps < next_online_point:
+                return
+            snapshot("online", updates, steps)
+            # Measure after a completed update burst, recording the actual step count.
+            while next_online_point is not None and next_online_point <= steps:
+                next_online_point = next(online_points, None)
 
         # One schedule for the whole run, never restarted at a measurement boundary.
         if hasattr(model, "configure_pretraining"):
@@ -177,7 +192,8 @@ def run_model(config, args, cases, output, result, persist):
                 # The online scheduler keeps its FULL production budget, not this prefix's length.
                 with online_readout(config, family, model, expected_dataset=result["dataset_identity"]):
                     result["online"] = online_prefix(
-                        config, family, model, envs, args.online_steps, output / "online_metrics.jsonl")
+                        config, family, model, envs, args.online_steps, output / "online_metrics.jsonl",
+                        snapshot=online_snapshot if args.online_eval_steps else None, diagnostic_every=1)
             finally:
                 close_envs(envs)
             snapshot("online", result["online"]["updates"], result["online"]["env_steps"])
@@ -193,7 +209,10 @@ def snapshot_line(name, snapshot):
     def pair(values):
         return f"{values[0]:.3g}/{values[-1]:.3g}"
     selected = "/".join(number(candidate["selected_return"][k]) for k in ("predicted", "true_latent", "uniform", "best"))
-    return (f"{name}/{snapshot['phase']}_{snapshot['updates']} | {pair(expert['latent']['mse'])} | "
+    stage = f"{snapshot['phase']}_{snapshot['updates']}"
+    if snapshot["phase"] == "online":
+        stage += f"[env={snapshot['env_steps']}]"
+    return (f"{name}/{stage} | {pair(expert['latent']['mse'])} | "
             f"{pair(candidate['mse'])} | {number(candidate['cost_rank'])}({candidate['rank_count']}) | {selected} | "
             f"{policy['return_mean']:.2f}/{policy['maximum_return']} | {policy['sustained_rate']:.0%}")
 
@@ -212,12 +231,15 @@ def write_report(output, report):
             physical = item["expert"]["physical"]
             lines.append(f"  {run['model']}/{item['phase']}_{item['updates']} expert observed h1 RMSE | "
                          + format_physical_rmse(physical["observed"]["1"]))
+        online = run.get("online", {})
         lines.append(f"{run['status']} | {run['model']} | offline={run.get('offline_updates', 0)} | "
-                     f"online={run.get('online', {}).get('updates', 0)} | time={duration(run.get('seconds'))}"
+                     f"online={online.get('updates', 0)} | env_steps={online.get('env_steps', 0)} | "
+                     f"completed_episodes={online.get('completed_episodes', 0)} | time={duration(run.get('seconds'))}"
                      + (f" | {run['error']}" if "error" in run else ""))
     lines += [
         "Native objectives only: LeWM terminal latent distance, TS upstream MPC weighting; one physical-rendered goal.",
         "Offline schedule spans the FINAL requested update; snapshots do not restart it. Online is an early production-schedule prefix.",
+        "Online labels show optimizer updates and cumulative environment steps (summed across environments, including action repeats).",
         "Same held-out expert windows, simulator starts, candidate actions and policy RNG at every measurement; none are fitted.",
         "Latent MSE changes with encoder scale; hold errors and target spread are in JSON. It is not comparable across models.",
         "Cost rank is predicted vs actual-future latent cost on reward-informative anchors; positive is better, n excludes undefined ranks.",
@@ -241,6 +263,8 @@ def arguments(argv=None):
                         help="Measurement points; the largest is the total offline training/scheduler budget.")
     parser.add_argument("--online-steps", type=int, default=4096,
                         help="Environment steps in the ORIGINAL online schedule; 0 skips the continuation.")
+    parser.add_argument("--online-eval-steps", nargs="+", type=int, default=[],
+                        help="Intermediate online environment-step points, measured after an update burst. The final point is always measured.")
     parser.add_argument("--policy-steps", type=int, default=100)
     parser.add_argument("--horizon", type=int, default=5)
     parser.add_argument("--device", default="cuda:0")
@@ -249,9 +273,12 @@ def arguments(argv=None):
     args = parser.parse_args(argv)
     if (min(args.eval_updates) < 1 or args.policy_steps < 1 or args.horizon < 1
             or args.online_steps < 0 or args.seed < 0
-            or any(len(v) != len(set(v)) for v in (args.models, args.eval_updates))):
+            or any(len(v) != len(set(v)) for v in (args.models, args.eval_updates, args.online_eval_steps))):
         parser.error("Use positive unique update points/horizons, positive policy steps, nonnegative online steps/seed, and unique models.")
+    if any(step <= 0 or step >= args.online_steps for step in args.online_eval_steps):
+        parser.error("Online evaluation points must be positive and strictly before --online-steps; the final evaluation is automatic.")
     args.eval_updates.sort()
+    args.online_eval_steps.sort()
     args.scenario = "cartpole_balance_sparse"
     return args
 
@@ -275,7 +302,8 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     print(f"Learning curve | models={len(args.models)} | offline={max(args.eval_updates)} once/model | "
-          f"measure={args.eval_updates} | online_env_steps={args.online_steps} | checkpoints=disabled", flush=True)
+          f"measure={args.eval_updates} | online_env_steps={args.online_steps} | "
+          f"online_measure={args.online_eval_steps + ([args.online_steps] if args.online_steps else [])} | checkpoints=disabled", flush=True)
     first = configs[args.models[0]]
     cases = collect_objective_cases(first, SimpleNamespace(
         sim_seeds=[args.seed + 12_000_000, args.seed + 12_000_001],
