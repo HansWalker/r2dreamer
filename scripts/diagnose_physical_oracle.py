@@ -159,7 +159,7 @@ def evaluate(config, cases, source_settings, cost, args, output):
         planner = OraclePlanner(config.jepa_model.planner, oracle, cost, args.device)
         returns = np.zeros(len(cases))
         success_trace, action_trace, planning_times = [], [], []
-        progress = Progress(f"True-state {config.model_family}", args.policy_steps)
+        progress = Progress(f"True-state {config.model_family}/h{planner.planner.horizon}", args.policy_steps)
         with (output / "policy_metrics.jsonl").open("w", encoding="utf-8", buffering=1) as log:
             for step in range(args.policy_steps):
                 torch.manual_seed(int(source_settings["seed"]) + 14_000_000 + step)
@@ -206,26 +206,35 @@ def write_report(output, report):
     temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     temporary.replace(output / "report.json")
     lines = ["True-state physical controller | true MuJoCo futures | no fitting or checkpoint access",
-             "Model/solver | Return/max | Balanced/boundary/failure | Sustained tail | Time"]
+             "Model/solver | H(seconds) | Return/max | Balanced/boundary/failure | Sustained tail | Time"]
     for run in report["runs"]:
+        label = f"{run['model']}/{run['planner']['type']}"
+        horizon = run["planner"]["horizon"]
         if run["status"] != "COMPLETE":
-            lines.append(f"{run['status']} | {run['model']} | {run.get('error', '')}")
+            lines.append(f"{run['status']} | {label} | H={horizon} | {run.get('error', '')}")
             continue
         policy = run["policy"]
         cohorts = "/".join(f"{policy['cohort_return'].get(key, float('nan')):.2f}" for key in ("balanced", "boundary", "failure"))
-        lines.append(f"{run['model']}/{run['planner']['type']} | {policy['return_mean']:.2f}/{policy['maximum_return']} | "
+        lines.append(f"{label} | {horizon}({policy['seconds_lookahead']:.2f}s) | "
+                     f"{policy['return_mean']:.2f}/{policy['maximum_return']} | "
                      f"{cohorts} | {policy['sustained_rate']:.0%} | {duration(policy['seconds'])}")
+    baselines = {run["model"]: run for run in report["runs"]}
+    for name, run in baselines.items():
         if run["matched_policy_length"]:
-            for phase, baseline in run["learned_physical_baselines"].items():
-                lines.append(f"  Saved {phase} physical controller | return={baseline['return_mean']:.2f} | "
-                             f"sustained={baseline['sustained_rate']:.0%}")
+            scores = " | ".join(f"{phase}={baseline['return_mean']:.2f} ({baseline['sustained_rate']:.0%} tail)"
+                                for phase, baseline in run["learned_physical_baselines"].items())
+            lines.append(f"Saved learned {name} | H={run['source_horizon']} | {scores}")
         else:
-            lines.append("  Different policy length: saved returns are not directly comparable.")
+            lines.append(f"Saved learned {name} | different policy length: returns are not directly comparable.")
         if not run["matched_rng_backend"]:
-            lines.append("  Different CPU/CUDA RNG backend: seeds match, but planner random draws do not.")
+            lines.append(f"  {name}: different CPU/CUDA RNG backend from the source test.")
     lines += ["COMPLETE means execution, not successful balancing. Inspect per-case traces, not only mean return.",
-              "Same source starts, action repeats, physical cost, planner budgets, warm starts and per-call seeds.",
+              "Same source starts, action repeats, physical cost, samples/restarts, iterations and per-call seeds.",
+              "Every horizon starts fresh; warm starts are used only within that trial. Horizon changes random tensor shapes and compute.",
+              "Longer horizons also make optimization harder; failure does not prove the cost is unsolvable with a stronger solver.",
+              "Saved learned scores use the source horizon; they are not horizon-matched controls for longer oracle trials.",
               "TS uses finite-difference simulator derivatives with the existing Adam/tanh planner; not exact autograd.",
+              "TS simulator work grows roughly quadratically with horizon; CEM grows roughly linearly.",
               "MuJoCo rollouts are CPU work even with CUDA planner tensors; timing is not a neural-planner speed comparison.",
               "No learned encoder, state head, dataset, native latent objective, training update or checkpoint is used.",
               "Success would isolate errors in the learned route; failure would leave cost/horizon/solver limitations unresolved."]
@@ -241,6 +250,8 @@ def arguments(argv=None):
                         default=["leworldmodel", "temporal_straightening"])
     parser.add_argument("--device", default="cuda:0", help="Planner tensor/RNG device; MuJoCo remains CPU-based.")
     parser.add_argument("--fd-epsilon", type=float, default=1e-3)
+    parser.add_argument("--horizons", nargs="+", type=int,
+                        help="Agent-step horizons to compare, e.g. 5 25 50; defaults to the source horizon.")
     parser.add_argument("--policy-steps", type=int, help="Defaults to the source test length; overrides break length matching.")
     parser.add_argument("--output", type=Path, default=Path("runs") / datetime.now(timezone.utc).strftime("physical_oracle_%Y%m%d_%H%M%S"))
     args = parser.parse_args(argv)
@@ -250,6 +261,8 @@ def arguments(argv=None):
         parser.error("Finite-difference epsilon must be finite and between 0 and 0.1.")
     if args.policy_steps is not None and args.policy_steps < 1:
         parser.error("Policy steps must be positive.")
+    if args.horizons is not None and (min(args.horizons) < 1 or len(set(args.horizons)) != len(args.horizons)):
+        parser.error("Horizons must be positive and unique.")
     return args
 
 
@@ -258,6 +271,7 @@ def main(argv=None):
     data = args.source_report.read_bytes()
     source = json.loads(data)
     args.policy_steps = args.policy_steps or int(source["settings"]["policy_steps"])
+    args.horizons = args.horizons or [int(source["settings"]["horizon"])]
     cost = CartpoleCost(**source["physical_cost"])
     runs = {run["model"]: run for run in source["runs"]}
     cases = [{key: case[key] for key in ("id", "seed", "cohort", "initial_state", "anchor_state", "anchor_success")}
@@ -272,7 +286,7 @@ def main(argv=None):
         if (run["status"] != "COMPLETE" or config.env.task != "dmc_cartpole_balance_sparse"
                 or horizon != source["settings"]["horizon"] or config.jepa_model.planner.type not in ("cem", "gradient")):
             raise ValueError("Expected a completed cartpole physical-controller run with matched planner settings.")
-        if args.policy_steps + horizon + int(config.jepa_model.history_size) - 1 >= config.env.time_limit // config.env.action_repeat:
+        if args.policy_steps + max(args.horizons) + int(config.jepa_model.history_size) - 1 >= config.env.time_limit // config.env.action_repeat:
             raise ValueError("Requested policy and forecast horizon could reach the episode boundary.")
         configs[name] = config
     if torch.device(args.device).type == "cuda" and not torch.cuda.is_available():
@@ -282,27 +296,36 @@ def main(argv=None):
               "settings": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
               "physical_cost": source["physical_cost"], "cases": cases, "runs": [],
               "checkpoint_reads": False, "checkpoint_writes": False, "training_updates": 0}
-    print(f"Physical oracle | models={len(configs)} | cases={len(cases)} | policy_steps={args.policy_steps} | no training", flush=True)
+    print(f"Physical oracle | models={len(configs)} | horizons={args.horizons} | trials={len(configs) * len(args.horizons)} | "
+          f"cases={len(cases)} | policy_steps={args.policy_steps} | no training", flush=True)
+    if any(config.jepa_model.planner.type == "gradient" for config in configs.values()):
+        print("Runtime | TS finite-difference simulator work scales roughly with horizon squared; longer horizons can take hours.", flush=True)
     started = time.monotonic()
-    for name, config in configs.items():
-        output = args.output / name
-        output.mkdir()
+    for name, source_config in configs.items():
         endpoints = {s["phase"]: s for s in runs[name]["snapshots"]}
-        result = {"model": name, "status": "RUNNING", "planner": OmegaConf.to_container(config.jepa_model.planner),
-                  "matched_policy_length": args.policy_steps == source["settings"]["policy_steps"],
-                  "matched_rng_backend": torch.device(args.device).type == torch.device(config.device).type,
-                  "source_planner_device": config.device,
-                  "learned_physical_baselines": {phase: s["physical_controller"]["policy"] for phase, s in endpoints.items()}}
-        report["runs"].append(result)
-        write_report(args.output, report)
-        try:
-            result["policy"] = evaluate(config, cases, source["settings"], cost, args, output)
-            result["status"] = "COMPLETE"
-        except Exception as error:
-            result.update(status="FAIL", error=f"{type(error).__name__}: {error}")
-            (output / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
-        write_report(args.output, report)
-        print(f"{result['status']} | {name}" + (f" | {result['error']}" if "error" in result else ""), flush=True)
+        for horizon in args.horizons:
+            config = copy.deepcopy(source_config)
+            config.jepa_model.planner.horizon = horizon
+            output = args.output / name / f"horizon_{horizon}"
+            output.mkdir(parents=True)
+            result = {"model": name, "status": "RUNNING", "planner": OmegaConf.to_container(config.jepa_model.planner),
+                      "source_horizon": int(source_config.jepa_model.planner.horizon),
+                      "matched_policy_length": args.policy_steps == source["settings"]["policy_steps"],
+                      "matched_rng_backend": torch.device(args.device).type == torch.device(config.device).type,
+                      "source_planner_device": config.device,
+                      "trace_file": str((output / "policy_metrics.jsonl").relative_to(args.output)),
+                      "learned_physical_baselines": {phase: s["physical_controller"]["policy"] for phase, s in endpoints.items()}}
+            report["runs"].append(result)
+            write_report(args.output, report)
+            print(f"START | {name} | H={horizon}", flush=True)
+            try:
+                result["policy"] = evaluate(config, cases, source["settings"], cost, args, output)
+                result["status"] = "COMPLETE"
+            except Exception as error:
+                result.update(status="FAIL", error=f"{type(error).__name__}: {error}")
+                (output / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
+            write_report(args.output, report)
+            print(f"{result['status']} | {name} | H={horizon}" + (f" | {result['error']}" if "error" in result else ""), flush=True)
     report["seconds"] = time.monotonic() - started
     print(write_report(args.output, report), end="")
     print(f"Reports | {args.output.resolve()}")

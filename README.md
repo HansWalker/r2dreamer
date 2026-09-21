@@ -1286,9 +1286,36 @@ This is a control-quality isolation, not a speed comparison. `--models leworldmo
 or `--models temporal_straightening` selects a solver; `--policy-steps` can shorten
 debug runs but then returns are not directly comparable with the saved longer tests.
 
+To isolate lookahead, compare horizons 5, 25 and 50 (0.1, 0.5 and 1.0 simulator
+seconds with this source report), keeping the physical cost and solver budgets fixed:
+
+```bash
+bash scripts/run_physical_oracle_check.sh \
+  --source-report runs/physical_learning_curve_20260921_170135/report.json \
+  --horizons 5 25 50
+```
+
+Each solver/horizon gets fresh environments and planner caches; warm starts are
+used only between actions within a trial. Per-call seeds match, but different
+tensor shapes mean random candidates are not identical across horizons. The cost's
+velocity term still uses the last three predicted steps, not a rescaled tail.
+Longer horizons increase both lookahead and optimization difficulty; a negative
+result does not rule out a stronger optimizer solving the same cost.
+
+**Runtime:** CEM simulator work grows roughly linearly with horizon, while TS's
+finite-difference simulator gradients grow roughly quadratically. From the previous
+two-minute H=5 timings, the full sweep may take several hours, mostly TS at H=50.
+For a quicker first answer, append `--models leworldmodel` (roughly half an hour),
+then run `--models temporal_straightening` separately if needed. These are rough
+estimates, not neural-model training times. No dataset audits or training run.
+
 Outputs: `runs/physical_oracle_<timestamp>/summary.txt`, `report.json`, and one
-`policy_metrics.jsonl` per solver with every action, true state, reward and success.
-The summary compares against the saved offline/online physical-controller endpoints.
+`<model>/horizon_<H>/policy_metrics.jsonl` per trial with every action, true state,
+reward and success. The report records each trace path and saves completed trials
+as the sweep progresses. A failed trial does not discard other results.
+The summary shows each horizon and the saved offline/online physical-controller
+endpoints; those saved learned baselines use the source horizon only, not the
+longer oracle horizons.
 `COMPLETE` means execution, not balancing success. If the true-state controller fails,
 cost/horizon/solver limitations remain unresolved; if it works, learned state/dynamics
 errors become the next target. Native image-goal planning is not evaluated by this test.
