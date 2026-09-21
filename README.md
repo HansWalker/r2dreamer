@@ -1217,6 +1217,47 @@ Use `--online-steps 0` for the offline endpoint only; `--models temporal_straigh
 restricts the test to TS. Outputs default to `runs/physical_controller_<timestamp>`.
 Local checks: `MUJOCO_GL=egl python -m scripts.check_physical_controller`.
 
+### Four-Hour Learning Curve
+
+```bash
+bash scripts/run_physical_learning_curve.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision
+```
+
+Fixed-budget extension of the physical-controller test, estimated at about four hours
+**total for both models**, roughly two hours offline and two online including measurements.
+LeWorldModel runs offline then online, followed by TS offline then online. Models remain
+the same tiny sizes; no architecture, loss, controller-fit budget or planner change is made.
+No calibration, timed stopping, old diagnostic sweep or extra dataset audit runs.
+
+| Phase | Budget per model | Measurements |
+|---|---|---|
+| Offline | 24,000 updates | 1,000, 6,000, 12,000, 18,000, 24,000 updates |
+| Online | 20,000 updates / 157,952 environment steps | 4,096, 41,024, 80,000, 118,976, 157,952 environment steps |
+
+The online measurements correspond to 262, 5,000, 10,000, 15,000 and 20,000 updates.
+Environment steps include action repeats and are summed across environments. Doubling
+the post-warmup data and update budgets preserves the original data/update ratio and
+warmup data requirement. Both schedulers span their entire requested phase, without
+restarting at measurements. This is an extended diagnostic schedule, not the original
+80,000-step production budget. Native image planning still collects the online data;
+both controllers are compared on frozen weights at every measurement.
+
+The estimates use the downloaded `planner_online_long_20260921_045640` and
+`physical_controller_20260921_071819` timings: about 0.27 seconds per offline update
+summed across models, about 0.33 seconds per online update including collection, and
+about 140 seconds per paired-model measurement. Including pool setup and ten measurement
+points gives roughly 2.1 hours per phase. Allow for I/O and machine-load variation;
+the script uses fixed steps, not a four-hour deadline. These estimates apply to defaults.
+
+Outputs: `runs/physical_learning_curve_<timestamp>/summary.txt`, `report.json`,
+`learning_curve.csv`, and full JSONL training/controller/policy traces. CSV rows include
+native/physical returns, sustained success, and held-out observed/forecast physical RMSE.
+At each measurement, `native.pt` saves native weights, optimizer state and config;
+`controller.pt` saves the separate fitted controller and its cost settings. These are
+reusable diagnostic snapshots, **not exact online-resume checkpoints**: training replay
+and live simulator state are not stored. The short test still defaults to no checkpoints.
+
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening

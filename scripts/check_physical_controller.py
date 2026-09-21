@@ -1,6 +1,7 @@
 """CPU/simulator contracts for isolated physical-controller comparisons."""
 
 import copy
+import csv
 import io
 import json
 import tempfile
@@ -16,18 +17,18 @@ from omegaconf import OmegaConf
 
 import tools
 from scripts.check_fresh_readout import episodes
-from scripts.check_online_checkpoint_smoke import ToyEnvironment
+from scripts.check_online_checkpoint_smoke import ToyEnvironment, fixture as online_fixture
 from scripts.check_planner_recipe import real_fixture
 from scripts.check_state_normalization import tiny_config
 from scripts.diagnose_fresh_readout import tensor_digest
 from scripts.diagnose_goal_objective import PROFILES, collect_objective_cases
 from scripts.diagnose_physical_controller import (
-    CartpoleCost, arguments, cache_windows, compare, decode_futures, main,
+    CartpoleCost, arguments, cache_windows, compare, configure_curve, decode_futures, main,
     physical_controller, physical_errors, physical_labels,
 )
 from scripts.smoke_models import synthetic_batch
 from scripts.train_planner_check import build_config, new_model
-from scripts.train_planner_learning_curve import validate_budget
+from scripts.train_planner_learning_curve import run_model, validate_budget
 from training import load_model_family
 from training.evaluation import StateDataset
 from training.trainer import online_update_target
@@ -38,18 +39,95 @@ class PhysicalControllerTests(unittest.TestCase):
         args = arguments(["--dataset-root", "/tmp/data", "--device", "cpu"])
         self.assertEqual(args.eval_updates, [5000])
         self.assertEqual(args.head_updates, 2000)
+        self.assertFalse(args.save_checkpoints)
+        self.assertEqual(args.online_schedule_multiplier, 1)
         for name, objective in (("leworldmodel", "last"), ("temporal_straightening", "ts_mpc")):
             config = build_config(name, args)
-            validate_budget(config, args)
+            before = OmegaConf.to_container(config, resolve=True)
+            configure_curve(config, args)
+            self.assertEqual(OmegaConf.to_container(config, resolve=True), before)
             self.assertEqual(config.jepa_model.planner.objective, objective)
             self.assertEqual(config.jepa_model.history_size, 3)
             self.assertEqual(online_update_target(config, args.online_steps), 262)
         with patch("sys.stderr", new=io.StringIO()):
             for extra in (["--head-updates", "0"], ["--head-windows", "3"], ["--validation-windows", "5"],
                           ["--head-batch", "0"], ["--online-steps", "-1"], ["--expert-updates", "0"],
+                          ["--eval-updates", "1", "1"], ["--eval-updates", "0"],
+                          ["--online-eval-steps", "0"], ["--online-eval-steps", "4096"],
+                          ["--online-eval-steps", "32", "32"], ["--online-schedule-multiplier", "0"],
                           ["--models", "leworldmodel", "leworldmodel"]):
                 with self.assertRaises(SystemExit):
                     arguments(["--dataset-root", "/tmp/data", *extra])
+
+    def test_long_curve_budget_preserves_online_update_ratio_and_recipe(self):
+        args = arguments(["--dataset-root", "/tmp/data", "--device", "cpu",
+                          "--eval-updates", "24000", "1000", "6000", "12000", "18000",
+                          "--online-schedule-multiplier", "2", "--online-steps", "157952",
+                          "--online-eval-steps", "4096", "41024", "80000", "118976", "--save-checkpoints"])
+        self.assertEqual(args.expert_updates, 24000)
+        self.assertEqual(args.eval_updates, [1000, 6000, 12000, 18000, 24000])
+        for name in args.models:
+            config = build_config(name, args)
+            original = copy.deepcopy(config)
+            configure_curve(config, args)
+            self.assertEqual(config.training.online.steps, 157952)
+            self.assertEqual(config.training.online.updates, 20000)
+            for step, updates in ((4096, 262), (41024, 5000), (80000, 10000), (118976, 15000), (157952, 20000)):
+                self.assertEqual(online_update_target(config, step), updates)
+                if step <= 80000:
+                    self.assertEqual(online_update_target(config, step), online_update_target(original, step))
+            config.training.online.steps, config.training.online.updates = 80000, 10000
+            self.assertEqual(OmegaConf.to_container(config), OmegaConf.to_container(original))
+
+    def test_curve_snapshots_save_reloadable_weights_without_changing_training(self):
+        for name in ("leworldmodel", "temporal_straightening"):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config, _ = online_fixture(root, name)
+                config.env.dataset_root = str(root)
+                args = arguments(["--dataset-root", str(root), "--device", "cpu", "--eval-updates", "1", "4",
+                                  "--online-schedule-multiplier", "2", "--online-steps", "112",
+                                  "--online-eval-steps", "40", "64", "88", "--policy-steps", "2",
+                                  "--save-checkpoints"])
+                configure_curve(config, args)
+                models = []
+                def create(settings, dataset):
+                    model = new_model(settings, dataset)
+                    models.append(model)
+                    return model
+                results = []
+                for measured in (False, True):
+                    settings = copy.deepcopy(args)
+                    settings.save_checkpoints = measured
+                    if not measured:
+                        settings.eval_updates, settings.online_eval_steps = [4], []
+                    output = root / str(measured)
+                    output.mkdir()
+                    result = {}
+                    with patch("scripts.train_planner_learning_curve.make_envs", return_value=ToyEnvironment()), \
+                         patch("scripts.train_planner_learning_curve.new_model", side_effect=create), \
+                         patch("scripts.train_planner_learning_curve.snapshot_line", return_value="snapshot"), \
+                         redirect_stdout(io.StringIO()):
+                        run_model(copy.deepcopy(config), settings, [], output, result, lambda: None,
+                                  measurement=lambda *unused: {})
+                    self.assertEqual(result["status"], "COMPLETE")
+                    self.assertEqual(result["online"]["updates"], 16)
+                    self.assertEqual(result["online"]["head_updates_after"], 20)
+                    results.append(result)
+                self.assertEqual(tensor_digest(models[0].state_dict()), tensor_digest(models[1].state_dict()))
+                torch.testing.assert_close(models[0].optimizer_state_dict(), models[1].optimizer_state_dict(), rtol=0, atol=0)
+                self.assertEqual([(s["phase"], s["updates"]) for s in results[1]["snapshots"]],
+                                 [("offline", 1), ("offline", 4), ("online", 4), ("online", 8), ("online", 12), ("online", 16)])
+                self.assertFalse(list((root / "False").rglob("*.pt")))
+                for snapshot in results[1]["snapshots"]:
+                    payload = torch.load(root / "True" / snapshot["native_checkpoint"], map_location="cpu", weights_only=False)
+                    self.assertEqual(payload["updates"], snapshot["updates"])
+                    self.assertFalse(payload["resume_supported"])
+                    self.assertNotIn("replay_state", payload)
+                self.assertEqual(tensor_digest(payload["model_state_dict"]), tensor_digest(models[1].state_dict()))
+                restored = load_model_family(name).build_model(config)
+                load_model_family(name).load_checkpoint(restored, payload, training=True)
+                self.assertEqual(tensor_digest(restored.state_dict()), tensor_digest(models[1].state_dict()))
 
     def test_cost_uses_region_orientation_and_arrival_velocity_not_exact_center(self):
         cost = CartpoleCost()
@@ -165,7 +243,7 @@ class PhysicalControllerTests(unittest.TestCase):
             fixture = real_fixture(root)
             args = arguments(["--dataset-root", str(root), "--device", "cpu", "--policy-steps", "2",
                               "--horizon", "3", "--head-updates", "2", "--head-windows", "8",
-                              "--validation-windows", "4", "--head-batch", "4"])
+                              "--validation-windows", "4", "--head-batch", "4", "--save-checkpoints"])
             data = episodes(length=9)
             with patch("scripts.diagnose_goal_objective.PROFILES", dict(list(PROFILES.items())[:2])), redirect_stdout(io.StringIO()):
                 cases = collect_objective_cases(fixture, SimpleNamespace(
@@ -206,6 +284,9 @@ class PhysicalControllerTests(unittest.TestCase):
                     np.testing.assert_equal(rng["numpy"], after["numpy"])
                     torch.testing.assert_close(rng["torch"], after["torch"], rtol=0, atol=0)
                     candidate = result["physical_controller"]
+                    saved = torch.load(output / candidate["fitting"]["checkpoint"], map_location="cpu", weights_only=False)
+                    self.assertEqual(saved["model_sha256"], before)
+                    self.assertEqual(tensor_digest(saved["state_dict"]), candidate["fitting"]["final_sha256"])
                     self.assertEqual(candidate["fitting"]["updates"], 2)
                     self.assertNotEqual(candidate["fitting"]["initial_sha256"], candidate["fitting"]["final_sha256"])
                     self.assertEqual(set(candidate["validation"]["scores"]), {"expert", "zero", "random"})
@@ -266,6 +347,11 @@ class PhysicalControllerTests(unittest.TestCase):
                 self.assertEqual(int(created[run["model"]].state_head.updates), 4)
                 self.assertNotIn("_goal_cost", created[run["model"]].__dict__)
             self.assertIn("COMPLETE means execution", (args.output / "summary.txt").read_text())
+            with (args.output / "learning_curve.csv").open(newline="") as stream:
+                curve = list(csv.DictReader(stream))
+            self.assertEqual(len(curve), 4)
+            self.assertIn("controller_forecast_h3_pole_angle_rmse", curve[0])
+            self.assertEqual([row["phase"] for row in curve], ["offline", "online", "offline", "online"])
             self.assertFalse(list(args.output.rglob("*.pt")))
 
 

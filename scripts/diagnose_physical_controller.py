@@ -5,6 +5,7 @@ is fitted on separate training clips; the benchmark evaluation head is untouched
 """
 
 import argparse
+import csv
 import hashlib
 import json
 import math
@@ -231,6 +232,13 @@ def compare(config, model, cases, expert_batch, args, output, pools):
         policy = evaluate_horizon(config, model, cases, args.horizon, args, folder)
     if tensor_digest(model.state_dict()) != before or tensor_digest(head.state_dict()) != head_before:
         raise RuntimeError("Controller comparison changed protected model/head weights or buffers.")
+    if args.save_checkpoints:
+        temporary = output / "controller.pt.tmp"
+        torch.save({"format": "physical_controller_v1", "state_dict": head.state_dict(),
+                    "model_sha256": before, "cost": asdict(CartpoleCost()), "fitting": fitting,
+                    "resume_supported": False}, temporary)
+        temporary.replace(output / "controller.pt")
+        fitting["checkpoint"] = "controller.pt"
     native["physical_controller"] = {"fitting": fitting, "validation": validation_scores, "heldout_expert": heldout,
                                      "candidates": ranking, "policy": policy, "protected_sha256": before}
     native["seconds"] = time.monotonic() - started
@@ -244,8 +252,10 @@ def write_report(output, report):
     temporary = output / "report.json.tmp"
     temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     temporary.replace(output / "report.json")
-    lines = ["Physical controller check | frozen paired controllers | separate readout | no checkpoints",
+    checkpoint_mode = "snapshot weights saved (not resumable replay)" if report["checkpoint_writes"] else "no checkpoints"
+    lines = [f"Physical controller check | frozen paired controllers | separate readout | {checkpoint_mode}",
              "Model/stage | Policy image/physical (max) | Tail image/physical | Candidate physical forecast/observed/true/uniform/best"]
+    curve = []
     for run in report["runs"]:
         for snapshot in run.get("snapshots", []):
             physical = snapshot["physical_controller"]
@@ -253,11 +263,27 @@ def write_report(output, report):
             values = physical["candidates"]["selected_return"]
             selected = "/".join("n/a" if values[k] is None else f"{values[k]:.2f}"
                                 for k in ("forecast", "observed", "true", "uniform", "best"))
-            lines.append(f"{run['model']}/{snapshot['phase']}_{snapshot['updates']} | "
+            stage = f"{snapshot['phase']}_{snapshot['updates']}"
+            if snapshot["phase"] == "online":
+                stage += f"[env={snapshot['env_steps']}]"
+            lines.append(f"{run['model']}/{stage} | "
                          f"{old['return_mean']:.2f}/{new['return_mean']:.2f} ({old['maximum_return']}) | "
                          f"{old['sustained_rate']:.0%}/{new['sustained_rate']:.0%} | {selected}")
             scores = physical["heldout_expert"]["forecast"]["rmse"]
             lines.append("  Controller held-out expert forecast h1 RMSE | " + format_physical_rmse(scores["1"]))
+            row = {"model": run["model"], "phase": snapshot["phase"], "updates": snapshot["updates"],
+                   "env_steps": snapshot["env_steps"], "image_return": old["return_mean"],
+                   "physical_return": new["return_mean"], "maximum_return": old["maximum_return"],
+                   "image_sustained": old["sustained_rate"], "physical_sustained": new["sustained_rate"],
+                   "measurement_seconds": snapshot["seconds"]}
+            for source in ("observed", "forecast"):
+                metrics = {"native": snapshot["expert"]["physical"][source],
+                           "controller": physical["heldout_expert"][source]["rmse"]}
+                for head, horizons in metrics.items():
+                    for horizon, score in horizons.items():
+                        row.update({f"{head}_{source}_h{horizon}_{coordinate}_rmse": value
+                                    for coordinate, value in score["physical_rmse"].items()})
+            curve.append(row)
         lines.append(f"{run['status']} | {run['model']} | time={duration(run.get('seconds'))}"
                      + (f" | {run['error']}" if "error" in run else ""))
     lines += ["Physical cost: mean cart-boundary + pole chord error, plus last-three-step velocity cost; fixed scales/weights in JSON.",
@@ -266,6 +292,11 @@ def write_report(output, report):
               "Candidate scores use identical informative anchors; true states/feedback candidates are diagnostic only, never fed to either deployed controller.",
               "Policy starts, budgets, solvers and per-call RNG are paired. Returns are short controlled-start tests, not full benchmark scores.",
               "COMPLETE means execution, not improvement. Source-specific RMSE, false goals, exact clips, timings and policy traces are in JSON/logs."]
+    if curve:
+        with (output / "learning_curve.csv").open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(curve[0]))
+            writer.writeheader()
+            writer.writerows(curve)
     if "seconds" in report:
         lines.append(f"Total | {duration(report['seconds'])}")
     summary = "\n".join(lines) + "\n"
@@ -278,7 +309,15 @@ def arguments(argv=None):
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--models", nargs="+", choices=FAMILIES, default=list(FAMILIES))
     parser.add_argument("--expert-updates", type=int, default=5000)
+    parser.add_argument("--eval-updates", nargs="+", type=int,
+                        help="Offline measurements; the largest overrides --expert-updates and sets the full offline schedule.")
     parser.add_argument("--online-steps", type=int, default=4096)
+    parser.add_argument("--online-eval-steps", nargs="+", type=int, default=[],
+                        help="Intermediate online environment steps; the final measurement is automatic.")
+    parser.add_argument("--online-schedule-multiplier", type=int, default=1,
+                        help="Multiply the full online update/data budgets after warmup, preserving the data/update ratio.")
+    parser.add_argument("--save-checkpoints", action="store_true",
+                        help="Save native weights/optimizers and the fitted controller at measurements; no replay or exact online resume.")
     parser.add_argument("--horizon", type=int, default=5)
     parser.add_argument("--policy-steps", type=int, default=100)
     parser.add_argument("--head-updates", type=int, default=2000)
@@ -290,12 +329,27 @@ def arguments(argv=None):
     parser.add_argument("--output", type=Path, default=Path("runs") / datetime.now(timezone.utc).strftime("physical_controller_%Y%m%d_%H%M%S"))
     args = parser.parse_args(argv)
     if (min(args.expert_updates, args.horizon, args.policy_steps, args.head_updates, args.head_windows,
-            args.validation_windows, args.head_batch) < 1 or min(args.seed, args.online_steps) < 0
+            args.validation_windows, args.head_batch, args.online_schedule_multiplier) < 1 or min(args.seed, args.online_steps) < 0
             or args.head_windows % 4 or args.validation_windows % 4 or len(args.models) != len(set(args.models))):
         parser.error("Use positive budgets, window counts divisible by four, nonnegative seed/online steps, and unique models.")
     args.scenario = "cartpole_balance_sparse"
-    args.eval_updates, args.online_eval_steps = [args.expert_updates], []
+    args.eval_updates = sorted(args.eval_updates or [args.expert_updates])
+    args.online_eval_steps.sort()
+    if min(args.eval_updates) < 1 or any(len(points) != len(set(points)) for points in (args.eval_updates, args.online_eval_steps)):
+        parser.error("Evaluation points must be positive and unique.")
+    if any(step <= 0 or step >= args.online_steps for step in args.online_eval_steps):
+        parser.error("Online evaluation points must be positive and before --online-steps; the final evaluation is automatic.")
+    args.expert_updates = max(args.eval_updates)
     return args
+
+
+def configure_curve(config, args):
+    settings = config.training.online
+    warmup_steps = int(settings.warmup_transitions) * int(config.env.action_repeat)
+    settings.steps = warmup_steps + (int(settings.steps) - warmup_steps) * args.online_schedule_multiplier
+    settings.updates = int(settings.updates) * args.online_schedule_multiplier
+    config.jepa_model.planner.horizon = args.horizon
+    validate_budget(config, args)
 
 
 def main():
@@ -309,12 +363,15 @@ def main():
         torch.cuda.set_device(device)
     configs = {name: build_config(name, args) for name in args.models}
     for config in configs.values():
-        config.jepa_model.planner.horizon = args.horizon
-        validate_budget(config, args)
+        configure_curve(config, args)
     args.output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     print(f"Physical controller | models={len(configs)} | offline={args.expert_updates} | "
-          f"online_env_steps={args.online_steps} | head_updates/snapshot={args.head_updates} | no checkpoints", flush=True)
+          f"online_env_steps={args.online_steps} | head_updates/snapshot={args.head_updates} | "
+          f"checkpoints={'snapshots' if args.save_checkpoints else 'disabled'}", flush=True)
+    print(f"Measurements | offline={args.eval_updates} | "
+          f"online={args.online_eval_steps + ([args.online_steps] if args.online_steps else [])} | "
+          f"online_schedule_multiplier={args.online_schedule_multiplier}", flush=True)
     cases = collect_objective_cases(configs[args.models[0]], SimpleNamespace(
         sim_seeds=[args.seed + 12_000_000, args.seed + 12_000_001],
         horizons=list(range(1, args.horizon + 1)), candidates=16), history_size=3)
@@ -326,7 +383,7 @@ def main():
               "diagnostic_sha256": hashlib.sha256(b"".join(path.read_bytes() for path in files)).hexdigest(),
               "settings": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
               "physical_cost": asdict(CartpoleCost()), "cases": [case_metadata(case) for case in cases],
-              "checkpoint_reads": False, "checkpoint_writes": False, "runs": []}
+              "checkpoint_reads": False, "checkpoint_writes": args.save_checkpoints, "runs": []}
     pools = None
 
     @tools.preserve_rng_state

@@ -151,6 +151,19 @@ def run_model(config, args, cases, output, result, persist, *, measurement=measu
             folder.mkdir()
             scores = measurement(config, model, cases, expert_batch, args, folder)
             item = {"phase": phase, "updates": updates, "env_steps": env_steps, **scores}
+            if getattr(args, "save_checkpoints", False):
+                payload = {
+                    **family.checkpoint(model), "format": "planner_learning_curve_v1",
+                    "training_config": OmegaConf.to_container(config, resolve=True),
+                    "phase": phase, "updates": updates, "env_steps": env_steps,
+                    "offline_updates": result["offline_updates"],
+                    "dataset_identity": result["dataset_identity"], "rng_state": tools.get_rng_state(),
+                    "resume_supported": False,
+                }
+                temporary = folder / "native.pt.tmp"
+                torch.save(payload, temporary)
+                temporary.replace(folder / "native.pt")
+                item["native_checkpoint"] = f"{folder.name}/native.pt"
             result["snapshots"].append(item)
             persist()
             print(snapshot_line(str(config.model_family), item), flush=True)
