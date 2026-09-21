@@ -5,7 +5,7 @@ import numpy as np
 
 from models.shared.physical_state import STATE_KEY, PhysicalStateTargets
 
-from .goals import GOAL_IMAGE_KEY, PhysicalGoalRenderer
+from .goals import GOAL_IMAGE_KEY, GOAL_IMAGES_KEY, PhysicalGoalRenderer
 from .parallel import ParallelEnv
 
 
@@ -86,6 +86,7 @@ class DeepMindControl(gym.Env):
         self._goal_spec = goal
         self._goal_renderer = None
         self._goal_image = None
+        self._goal_images = None
         self.reward_range = [-np.inf, np.inf]
 
         spec = self._env.action_spec()
@@ -103,6 +104,11 @@ class DeepMindControl(gym.Env):
         spaces = {"image": gym.spaces.Box(0, 255, self._size + (3,), dtype=np.uint8)}
         if self._goal_spec is not None:
             spaces[GOAL_IMAGE_KEY] = gym.spaces.Box(0, 255, self._size + (3,), dtype=np.uint8)
+            alternatives = self._goal_spec.get("alternatives", [])
+            if alternatives:
+                spaces[GOAL_IMAGES_KEY] = gym.spaces.Box(
+                    0, 255, (1 + len(alternatives), *self._size, 3), dtype=np.uint8
+                )
         if self._state_fields:
             size = len(self._state_targets.coordinates)
             spaces[STATE_KEY] = gym.spaces.Box(-np.inf, np.inf, (size,), dtype=np.float32)
@@ -144,6 +150,7 @@ class DeepMindControl(gym.Env):
                     self._env, self._domain, self._task, self._goal_spec, self._size, self._camera
                 )
             self._goal_image = self._goal_renderer.render(self._env.physics)
+            self._goal_images = self._goal_renderer.images if len(self._goal_renderer.specs) > 1 else None
         return self._observation(time_step)
 
     def _observation(self, time_step):
@@ -161,6 +168,8 @@ class DeepMindControl(gym.Env):
             observation[STATE_KEY] = self._state_targets.encode(state)
         if self._goal_image is not None:
             observation[GOAL_IMAGE_KEY] = self._goal_image
+            if self._goal_images is not None:
+                observation[GOAL_IMAGES_KEY] = self._goal_images
         return observation
 
     def close(self):

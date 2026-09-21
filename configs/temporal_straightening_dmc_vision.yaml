@@ -25,6 +25,7 @@ jepa_model:
     grad_clip: 1.0
   planner:
     type: gradient
+    objective: ts_mpc  # Upstream mode=all, base=2, alpha=0; includes observed prefix.
     samples: 16
     iterations: 32
     gradient_batch_size: 256  # Same candidates/objective; one pass for 16 envs x 16 candidates.

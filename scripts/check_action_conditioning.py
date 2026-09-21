@@ -167,7 +167,7 @@ class SimulatorActionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             args = arguments(["--dataset-root", str(self.root), "--device", "cpu", "--models", "leworldmodel",
                               "--pairs", "2", "--minimum-pairs", "1", "--gradient-pairs", "1", "--stride", "2",
-                              "--expert-updates", "2", "--output", str(Path(temp) / "results")])
+                              "--expert-updates", "2", "--fit-updates", "2", "--output", str(Path(temp) / "results")])
             cache = Path(os.environ.get("TS_UPSTREAM_CACHE", str(Path("local/upstream_ts") / COMMIT)))
             if (cache / "vit.py").exists():
                 args.models = ["temporal_straightening", "leworldmodel"]

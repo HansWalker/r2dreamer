@@ -683,9 +683,11 @@ joint limits once per new goal, never rolls out candidate actions, and does not 
 RNG. Fixed images are cached; goal embeddings are refreshed each decision as the encoder changes.
 Goal images are not inserted into replay or representation/readout training.
 
-Planners compare the terminal predicted embedding to the goal embedding: LeWM sums squared coordinate
-errors; image-only TS averages over visual tokens/features. CEM and gradient search retain their
-existing budgets. The physical-head cost, final-two-step averaging, and action penalty are removed.
+LeWM compares the terminal predicted embedding to the goal using summed squared coordinate errors.
+New TS configurations use upstream MPC's exponentially weighted trajectory error (`objective=ts_mpc`),
+averaging visual tokens/features and retaining the upstream temporal reduction and observed prefix.
+CEM and gradient search retain their existing budgets. The physical-head cost and action penalty
+remain removed. Saved configs without an objective field retain the old terminal-only behavior.
 TS remains an explicit image-only adaptation; rendering a single goal pose does not impose zero
 velocity or represent every pose in the task's success region. Goal observations are additional task
 specifications for these two families, not live proprioceptive inputs or held-out demonstrations.
@@ -1019,8 +1021,8 @@ This is a **diagnostic**, not a production recipe change or an automatic online 
 Important limits: the reference uses **224px upsampling of stored 64px images**, not native
 224px detail; action repeat two remains, so each block covers ten raw DMC steps. This is
 a vision-only local adaptation, not an exact upstream reproduction, equal-parameter test,
-or full paper training budget. TS retains the current terminal objective, not the upstream
-maze-specific intermediate cost. LeWM retains local bounded physical-coordinate CEM
+or full paper training budget. This historical diagnostic explicitly retains the old terminal
+objective, not the corrected TS production MPC objective. LeWM retains local bounded physical-coordinate CEM
 proposals, with train-standardized model inputs. Reaching a trajectory pose does not establish sustained
 balancing or velocity matching. These differences are printed and recorded, not hidden.
 
@@ -1063,11 +1065,21 @@ Goals are recorded trajectory endpoints, not equilibrium-goal task-success evalu
   horizon, plus an FP32 finite-difference check. Inspect encoder/projector goal geometry
   separately, excluding the exact expert goal from the nonexpert rank statistic.
 - For TS, compare mapped identical weights with **actual upstream** action embedding,
-  predictor and recursive rollout methods, before and after fitting. Three small source
+  predictor and recursive rollout methods, before and after fitting. Four small source
   files are downloaded once from pinned commit `2c3c7666a69a730042590d548c6731259c4183ac`
   into ignored `local/upstream_ts/`; SHA256 checks reject unexpected contents. Only the
   hard-coded mask device is patched. The adapter supplies cached visual features and
   zero-width proprioception; this is component parity, not whole-model reproduction.
+- Initial TS checks also compare the actual upstream visual loss, cached-latent and parameter
+  gradients, a matched optimizer step, and MPC cost/action gradients. These use FP32 with
+  TF32, AMP and dropout disabled; copies retain optimizer moments. This does not validate
+  upstream encoder weights, proprioception, or stochastic dropout equivalence.
+- A 256-update fitting control uses disposable predictor copies, the native one-step loss,
+  frozen encoder/projector, and disjoint simulator episode splits. Optimizer moments are
+  retained but the native adaptation LR schedule starts fresh, avoiding LeWM's exhausted
+  pretraining rate. It records actual weight changes and reports teacher-forced
+  and recursive errors before/after; endpoint geometry remains a separate diagnostic.
+  Set `--fit-updates 0` to skip it, or `--parity-only` to stop before the offline fit.
 
 `--models temporal_straightening` restricts the run to TS. The previous diagnostic did not
 save weights, so the fresh offline fits cannot be skipped. Initial upstream mismatch stops
@@ -1079,6 +1091,37 @@ previous optimizer/policy sweep is repeated.
 Local regression tests: `MUJOCO_GL=egl python -m scripts.check_action_conditioning`.
 Upstream parity tests use the cached source (or `TS_UPSTREAM_CACHE=/path/to/cache`);
 without it, those tests explicitly skip rather than silently substituting local code.
+
+### Paired Planner Corrections
+
+```bash
+bash scripts/run_planner_fix_check.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision
+```
+
+This bounded Cartpole test fits one small model per family for 1,000 offline updates, then
+compares controllers using the same frozen weights, candidate actions and simulator starts.
+It runs no online training and writes no checkpoints. TS upstream inference/training parity
+must pass before its fit starts. Reports and compact summaries go to `runs/planner_fixes_<timestamp>`.
+
+The arms are the legacy terminal objective; corrected upstream MPC (TS only); each family's
+native objective with a small set of valid rendered goals; and that goal set with a three-step
+arrival-tail cost. The last two are **explicit DMC adaptations, not paper reproductions**.
+They remain opt-in: production `jepa_model.goal.alternatives` is empty, and `objective=tail`
+is not a default. Scenario presets supply alternative cart positions, Reacher elbow branches,
+or cup positions. The tail uses one consistent goal across its steps; it encourages staying
+near the goal but does not prove zero velocity or sustained task success.
+
+Learned and true-simulator-future candidate rankings use the exact same cost helper. A separate
+256-update native-loss fitting control on disposable copies separates weak dynamics from weak
+goal geometry, with disjoint fitting/validation simulator seeds. Physical heads never score
+plans or supply inputs. Short 100-step intervention rollouts and `COMPLETE` report execution,
+not a repaired policy. Budgets are adjustable with `--expert-updates`, `--fit-updates`,
+`--policy-steps`, and `--horizon`; no broad dataset audit or old planner sweep is repeated.
+
+Historical endpoint-only objective, horizon and optimizer diagnostics retain `objective=last`
+explicitly so their scores do not silently change. Use this paired test for the new MPC/goal-set
+comparison. Local checks: `MUJOCO_GL=egl python -m scripts.check_planner_fixes`.
 
 ### Short Online Check From Expert Checkpoints
 
@@ -1260,7 +1303,8 @@ settings live in `configs/storm_dmc.yaml`. Their implementations remain separate
   visualization but is disabled in the comparison runs. Removing the proprioceptive branch is a
   deliberate deviation; the remaining visual prediction term retains its previous effective weight.
 
-The goal planners use terminal latent distance to a separately rendered physical goal. During action
+The goal planners use latent distance to a separately rendered physical goal: terminal-only for
+LeWM and upstream weighted MPC scoring for new TS configurations. During action
 optimization native weights are fixed, but gradients pass through predicted latents to candidate
 actions; no physical decoder is involved. Planning and evaluation share the same autoregressive rollout implementation.
 Temporal Straightening computes action gradients in batches of at most

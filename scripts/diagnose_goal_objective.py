@@ -263,7 +263,7 @@ def write_report(output, report):
     temporary = output / "report.json.tmp"
     temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     temporary.replace(output / "report.json")
-    lines = ["Goal objective check | true simulator futures | frozen encoders | no learned dynamics or physical-head scoring",
+    lines = ["Goal objective check | terminal-only cost | true simulator futures | frozen encoders | no learned dynamics or physical-head scoring",
              "Model | Horizon | Reward cases | Return latent/random/best | Regret fraction | Recoverable failures | Recovery latent/random | Coverage"]
     def number(value):
         return "n/a" if value is None else f"{value:.3f}"
@@ -361,6 +361,7 @@ def main():
         model = None
         try:
             config = build_config(name, args)
+            config.jepa_model.planner.objective = "last"  # This probe scores endpoint images only.
             if trial:
                 config.jepa_model.predictor.emb_dropout = probability
             result["config"] = OmegaConf.to_container(config, resolve=True)

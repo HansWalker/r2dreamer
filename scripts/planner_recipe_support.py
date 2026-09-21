@@ -101,6 +101,7 @@ def reference_configs(base, stride):
     settings.planner.elites = 30
     settings.planner.iterations = 100 if ts else 10
     settings.planner.horizon = 5
+    settings.planner.objective = "last"  # Historical reference experiment, endpoint-only scoring.
     if ts:
         settings.prediction_weight = 1.0  # Visual-only MSE, not the old visual/proprio channel ratio.
     return raw, model

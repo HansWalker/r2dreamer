@@ -67,7 +67,7 @@ class PlanningHorizonTest(unittest.TestCase):
         self.assertIsNone(result["5"]["common_returns"]["forecast"])
         self.assertIsNone(result["5"]["forecast_vs_oracle_rank"])
 
-    def test_forecast_endpoint_indices_match_native_cost_without_head_or_model_updates(self):
+    def test_forecast_endpoint_indices_match_terminal_cost_without_head_or_model_updates(self):
         case = fake_case()
         case["image"] = case["image"].expand(-1, 2, -1, -1, -1).clone()
         case["states"] = np.zeros((3, 2, 4))
@@ -77,6 +77,7 @@ class PlanningHorizonTest(unittest.TestCase):
         for family in FAMILIES:
             with self.subTest(family=family):
                 model = load_model_family(family).build_model(tiny_config(family, "cartpole_balance_sparse"))
+                model.planner.objective = "last"
                 before = tensor_digest(model.state_dict())
                 modes = [m.training for m in model.modules()]
                 with patch.object(model, "update", side_effect=AssertionError("No model update")), \

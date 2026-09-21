@@ -1,4 +1,4 @@
-"""Paired native-planner horizon diagnostic: train once, then freeze all model weights."""
+"""Paired terminal-cost horizon diagnostic: train once, then freeze all model weights."""
 
 import argparse
 import copy
@@ -113,10 +113,13 @@ def evaluate_horizon(config, model, cases, horizon, args, output):
     started = time.monotonic()
     before = tensor_digest(model.state_dict())
     try:
+        goal_sets = []
         for case in cases:
             env = make_env(config.env, case["seed"], include_physical_state=False)
             envs.append(env)
             observation = env.reset()
+            if "goal_images" in observation:
+                goal_sets.append(torch.from_numpy(observation["goal_images"].copy()))
             set_cart_state(env, case["initial_state"])
             prefix = observe_prefix(env, model.history_size)
             # Check once per arm: environment state and input history must be paired.
@@ -127,6 +130,9 @@ def evaluate_horizon(config, model, cases, horizon, args, output):
         history = torch.stack([c["prefix"] for c in cases]).to(model.device)
         past = torch.stack([c["past_action"] for c in cases]).to(model.device)
         goals = torch.stack([c["goal_image"] for c in cases]).to(model.device)
+        goal_input = {"goal_image": goals}
+        if goal_sets:
+            goal_input["goal_images"] = torch.stack(goal_sets).to(model.device)
         reset_seconds = time.monotonic() - started
         returns = np.zeros(len(cases))
         successes = []
@@ -143,7 +149,7 @@ def evaluate_horizon(config, model, cases, horizon, args, output):
                 tick = time.monotonic()
                 with torch.no_grad():
                     action = native_control(model, lambda history=history, past=past, first=first: model.act(
-                        {"image": history, "goal_image": goals}, past, deterministic=True, first=first))
+                        {"image": history, **goal_input}, past, deterministic=True, first=first))
                 actions = action.detach().cpu().numpy()
                 synchronize(model)
                 policy_times.append(time.monotonic() - tick)
@@ -201,7 +207,7 @@ def write_report(output, report):
     temporary = output / "report.json.tmp"
     temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     temporary.replace(output / "report.json")
-    lines = ["Planning horizons | one offline fit/model | frozen weights | unchanged native goal cost",
+    lines = ["Planning horizons | one offline fit/model | frozen weights | legacy terminal goal cost",
              "Model | H(seconds) | Policy return/max | Tail success | Policy s/call | Common anchors | Rank-test return predicted/true/uniform/best | Status"]
     def number(value):
         return "n/a" if value is None else f"{value:.3f}"
@@ -274,6 +280,8 @@ def main():
         raise ValueError("Horizon pairing requires a shared history of at least two real frames.")
     history_size = histories.pop()
     for config in configs.values():
+        # Preserve this endpoint-only experiment; use planner_fixes for MPC/tail comparisons.
+        config.jepa_model.planner.objective = "last"
         if history_size - 1 + max(args.policy_steps, *args.horizons) >= int(config.env.time_limit) // int(config.env.action_repeat):
             raise ValueError("Requested trial would reach the episode time limit; shorten --policy-steps/--horizons.")
     args.output.mkdir(parents=True, exist_ok=False)
@@ -285,7 +293,7 @@ def main():
               "online_updates": 0, "runs": []}
     print(f"Planning horizons | models={len(configs)} | offline={args.expert_updates} once/model | "
           f"horizons={args.horizons} | anchors={len(args.sim_seeds) * len(PROFILES)} | "
-          f"policy_steps={args.policy_steps} | no checkpoints", flush=True)
+          f"policy_steps={args.policy_steps} | objective=last | no checkpoints", flush=True)
     cases = collect_objective_cases(next(iter(configs.values())), args, history_size=history_size)
     report["cases"] = [case_metadata(case) for case in cases]
     write_report(args.output, report)

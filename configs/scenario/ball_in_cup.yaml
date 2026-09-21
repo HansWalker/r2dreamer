@@ -10,6 +10,10 @@ state_fields:
   position: [0, 1, 2, 3]
   velocity: [0, 1, 2, 3]
 
+goal_alternatives:
+  - {cup_displacement: [-0.1, 0.0], ball_to_target: [0.0, 0.0]}
+  - {cup_displacement: [0.1, 0.0], ball_to_target: [0.0, 0.0]}
+
 goal:
   geometry: box
   tolerance: [0.025, 0.025]

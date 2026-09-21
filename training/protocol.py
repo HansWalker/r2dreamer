@@ -321,13 +321,19 @@ def validate_training_recipe(config):
         require(config.env.get("goal") == config.jepa_model.goal, "environment and planner goals must match")
         require(
             not any(key in config.jepa_model.goal for key in ("stable_steps", "action_weight")),
-            "physical-head cost settings are obsolete; latent planners use terminal embedding distance",
+            "physical-head cost settings are obsolete; latent planners use embedding distance",
         )
         require(
             sequence_length == int(config.jepa_model.history_size) + 1,
             "planning-model replay length must equal history_size + 1",
         )
         planner = config.jepa_model.planner
+        objective = str(planner.get("objective", "last"))
+        require(objective in {"last", "ts_mpc", "tail"}, "unknown latent planner objective")
+        require(objective != "ts_mpc" or family == "temporal_straightening", "ts_mpc is specific to Temporal Straightening")
+        if objective == "tail":
+            require(1 <= int(planner.get("tail_steps", 3)) <= int(planner.horizon),
+                    "stable-arrival tail_steps must not exceed the planning horizon")
         require(
             int(planner.horizon) > 0 and int(planner.iterations) > 0,
             "planner horizon and iterations must be positive",

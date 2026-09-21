@@ -10,6 +10,10 @@ state_fields:
   position: [0, 1, 2]
   velocity: [0, 1]
 
+goal_alternatives:
+  - {cart_position: -0.1, pole_angle: 0.0}
+  - {cart_position: 0.1, pole_angle: 0.0}
+
 goal:
   # Native sparse reward bounds: centered cart and pole within acos(0.995) of upright.
   geometry: box

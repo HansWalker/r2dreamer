@@ -163,11 +163,12 @@ class GoalObjectiveTest(unittest.TestCase):
         self.assertEqual(recovered["tail_agent_steps"], 10)
         self.assertEqual(recovered["selection"]["latent"]["sustained_rate"], 1.)
 
-    def test_native_cost_parity_without_predictor_head_planner_or_model_mutation(self):
+    def test_terminal_cost_parity_without_predictor_head_planner_or_model_mutation(self):
         case = fake_case()
         for family in FAMILIES:
             with self.subTest(model=family):
                 model = load_model_family(family).build_model(tiny_config(family, "cartpole_balance_sparse"))
+                model.planner.objective = "last"
                 before = tensor_digest(model.state_dict())
                 modes = [module.training for module in model.modules()]
                 with patch.object(model, "rollout", side_effect=AssertionError("No learned dynamics")), \

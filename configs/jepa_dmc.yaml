@@ -21,6 +21,7 @@ jepa_model:
   goal:
     source: physical_render_v1
     observation: ${scenario.goal_observation}
+    alternatives: []  # Explicit goal-set adaptation only; never inferred from the live state.
     # Physical tolerances are for diagnostics only, not the planning objective.
     geometry: ${scenario.goal.geometry}
     tolerance: ${scenario.goal.tolerance}
@@ -53,6 +54,8 @@ jepa_model:
       base_channels: 12
   planner:
     type: cem
+    objective: last  # LeWM upstream terminal latent distance.
+    tail_steps: 3  # Only used by the explicit DMC stable-arrival adaptation.
     horizon: ${scenario.planning_horizon}
     samples: 300
     elites: 30

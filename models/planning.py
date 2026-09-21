@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from models.shared.physical_state import STATE_KEY, PhysicalStateHead, readout_mode
+from models.shared.latent_goal import latent_goal_cost
 from models.shared.utils import parse_model_io
 
 
@@ -199,9 +200,11 @@ class LatentPlanner(nn.Module):
 
     def _goal_cost(self, history, past_action, candidates, goal):
         prediction = self.rollout(history, past_action, candidates)
-        error = (prediction[:, :, -1] - goal.detach()[:, None]).square().flatten(2)
-        # Upstream LeWM sums embedding coordinates; TS averages its visual tokens.
-        return error.sum(-1) if self.goal_reduction == "sum" else error.mean(-1)
+        return latent_goal_cost(
+            prediction, goal, reduction=self.goal_reduction,
+            mode=self.planner.get("objective", "last"), history=history,
+            tail_steps=int(self.planner.get("tail_steps", 3)),
+        )
 
     def _first_mask(self, first, batch):
         return (
@@ -290,7 +293,7 @@ class LatentPlanner(nn.Module):
             return action.clamp(-1, 1)
 
     def act(self, history, past_action, deterministic=False, first=None):
-        if "goal_image" not in history:
+        if "goal_image" not in history and "goal_images" not in history:
             raise ValueError(
                 "Latent planning requires a rendered physical goal (goal_image). "
                 "Use the physical_render_v1 environment config; the evaluation head is not a controller."
@@ -305,7 +308,10 @@ class LatentPlanner(nn.Module):
         try:
             with torch.no_grad():
                 # Re-encode with current weights; never keep stale goals across online updates.
-                goal = self.encode({"image": history["goal_image"].to(self.device)[:, None]})[:, 0]
+                if "goal_images" in history:
+                    goal = self.encode({"image": history["goal_images"].to(self.device)})
+                else:
+                    goal = self.encode({"image": history["goal_image"].to(self.device)[:, None]})[:, 0]
             history = {key: history[key].to(self.device) for key in self.encoder.keys}
             past_action = past_action.to(self.device)
             if gradient_planner:

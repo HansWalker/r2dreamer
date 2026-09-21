@@ -59,7 +59,7 @@ def expert_update(model, batch):
 
 def build_context(obs, obs_history, action_history, history_size, action_dim):
     # Only actual images form temporal context. Goals are episode-level planner inputs.
-    goal = obs.get("goal_image")
+    goals = {key: obs[key] for key in ("goal_image", "goal_images") if key in obs}
     obs = {"image": obs["image"]}
     sample = obs["image"]
     rows = []
@@ -76,8 +76,7 @@ def build_context(obs, obs_history, action_history, history_size, action_dim):
         past = [zero] * (action_count - len(past)) + past
         actions.append(torch.stack(past) if past else zero.new_empty((0, action_dim)))
     history = {key: torch.stack([row[key] for row in rows]) for key in rows[0]}
-    if goal is not None:
-        history["goal_image"] = goal
+    history.update(goals)
     return history, torch.stack(actions)
 
 

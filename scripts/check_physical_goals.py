@@ -91,7 +91,7 @@ class LatentGoalTest(unittest.TestCase):
             for shape in ((4,), (3, 4)):
                 prediction = torch.randn(2, 5, 7, *shape, requires_grad=True)
                 goal = torch.randn(2, *shape, requires_grad=True)
-                model = SimpleNamespace(goal_reduction=reduction, rollout=lambda *args: prediction)
+                model = SimpleNamespace(goal_reduction=reduction, planner={"objective": "last"}, rollout=lambda *args: prediction)
                 cost = LatentPlanner._goal_cost(model, None, None, None, goal)
                 expected = torch.stack([
                     getattr((prediction[b, :, -1] - goal[b]).square().flatten(1), reduction)(1)

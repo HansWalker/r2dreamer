@@ -54,6 +54,7 @@ def optimizer_cases(config, seed):
 
 def optimizer_check(args, output, result, persist):
     config = build_config("temporal_straightening", args)
+    config.jepa_model.planner.objective = "last"  # Keep the historical optimizer experiment paired.
     # Use the production planner budget, not the old eight-iteration tiny-test budget.
     config.jepa_model.planner.samples = 16
     config.jepa_model.planner.iterations = 32

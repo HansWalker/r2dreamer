@@ -21,7 +21,8 @@ from scripts.diagnose_fresh_readout import tensor_digest
 from scripts.planner_recipe_support import BlockReplay, NormalizedActionEncoder, action_statistics, heldout_pairs, reference_configs
 from scripts.train_planner_check import build_config, new_model
 from scripts.train_rollout_check import pretrain
-from scripts.upstream_ts_probe import COMMIT, parity, sources
+from scripts.upstream_ts_probe import COMMIT, parity, sources, training_parity
+from scripts.predictor_fit_control import fit_control
 from training import load_model_family
 from training.progress import duration
 from training.protocol import implementation_sha256
@@ -45,6 +46,14 @@ def summary(report):
             for stage, item in run["upstream"].items():
                 lines.append(f"  TS upstream {stage}: {item['status']} | " + ", ".join(
                     f"{k} max={v['max_abs_error']:.3g}" for k, v in item["checks"].items()))
+        fit = run.get("fit_control")
+        if fit:
+            lines.append(f"  Native fitting control: {fit['status']} (copy only) | weights_changed={fit.get('weights_changed', 'n/a')}")
+            for split in ("train", "validation") if "after" in fit else ():
+                def average(stage, key):
+                    return mean([r[key] for r in fit[stage][split]])
+                lines.append(f"  {split}: TF h1 {average('before', 'teacher_h1'):.3g}->{average('after', 'teacher_h1'):.3g}; "
+                             f"recursive h5 {average('before', 'recursive_final'):.3g}->{average('after', 'recursive_final'):.3g}")
         cases = run.get("cases", [])
         if not cases:
             continue
@@ -67,7 +76,8 @@ def summary(report):
               "Shuffled/zero replace only future controls, holding histories and targets fixed. Past observed actions never change.",
               "Response ratio compares predicted versus real-encoded +1/-1 action effects; goal range ratio compares candidate cost ranges.",
               "FP32/BF16 predictor probes share cached native-precision encoder features, isolating predictor numerics.",
-              "Upstream parity covers TS predictor/action encoder/rollout, NOT vision encoder, full training recipe or proprioception.",
+              "TS parity includes cached-latent loss/backprop and a matched optimizer step; NOT vision encoder, dropout-mask parity or proprioception.",
+              "FP32 probes disable TF32 and use math SDPA; native fitting controls use disjoint episode splits on disposable copies.",
               "COMPLETE means diagnostics ran, not that planning is fixed. Per-layer traces, gradients and exact branch data are in report.json.",
               "Reference-sized vision-only adapters and action blocks match the last diagnostic; production models/objectives are unchanged."]
     return "\n".join(lines) + "\n"
@@ -85,6 +95,8 @@ def arguments(argv=None):
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
     parser.add_argument("--expert-updates", type=int, default=3000)
+    parser.add_argument("--fit-updates", type=int, default=256)
+    parser.add_argument("--parity-only", action="store_true", help="Stop after initial forward/training parity; no offline fitting.")
     parser.add_argument("--pairs", type=int, default=12)
     parser.add_argument("--minimum-pairs", type=int, default=8)
     parser.add_argument("--gradient-pairs", type=int, default=2)
@@ -95,7 +107,7 @@ def arguments(argv=None):
     parser.add_argument("--upstream-cache", type=Path, default=Path("local/upstream_ts") / COMMIT)
     parser.add_argument("--output", type=Path, default=Path("runs") / datetime.now(timezone.utc).strftime("action_conditioning_%Y%m%d_%H%M%S"))
     args = parser.parse_args(argv)
-    if (min(args.expert_updates, args.pairs, args.minimum_pairs, args.gradient_pairs, args.stride) < 1
+    if (min(args.expert_updates, args.pairs, args.minimum_pairs, args.gradient_pairs, args.stride) < 1 or args.fit_updates < 0
             or not args.gradient_pairs <= args.minimum_pairs <= args.pairs or args.seed < 0 or args.stride * 7 >= 500
             or len(set(args.models)) != len(args.models)
             or any(not np.isfinite(t) or t <= 0 for t in args.goal_tolerance)):
@@ -134,11 +146,17 @@ def run_model(name, args, output, result, bank, source, persist):
             result["upstream"] = {}
             with readout_mode(model):
                 result["upstream"]["initial"] = parity(model, source, encoded["history"], encoded["past"], encoded["actions"][None])
-            if result["upstream"]["initial"]["status"] != "PASS":
+                latent = torch.cat((encoded["history"], encoded["future"][:1, :1]), dim=1)
+                actions = torch.cat((encoded["past"], encoded["actions"][:1, :1]), dim=1)
+                result["upstream"]["training"] = training_parity(model, source, latent, actions)
+            if any(v["status"] != "PASS" for v in result["upstream"].values()):
                 raise ValueError("Initial upstream mismatch; stopped before spending the offline training budget.")
         if initial != tensor_digest(model.state_dict()):
             raise RuntimeError("Pre-fit probes mutated weights/buffers.")
         persist()
+        if args.parity_only:
+            result["status"] = "COMPLETE"
+            return bank
         pretrain(config, adapter, args, output, result, model=model)
     frozen = tensor_digest(model.state_dict())
     result["cases"] = []
@@ -153,6 +171,10 @@ def run_model(name, args, output, result, bank, source, persist):
     result["frozen_state_sha256"] = tensor_digest(model.state_dict())
     if frozen != result["frozen_state_sha256"]:
         raise RuntimeError("Post-fit probes mutated weights/buffers.")
+    if args.fit_updates:
+        result["fit_control"] = fit_control(model, bank, size, args.fit_updates)
+        if tensor_digest(model.state_dict()) != frozen:
+            raise RuntimeError("Copy-only fitting control changed original model tensors.")
     result["status"] = ("MISMATCH" if any(x["status"] != "PASS" for x in result.get("upstream", {}).values()) else "COMPLETE")
     return bank
 
@@ -170,7 +192,7 @@ def main():
     source = sources(args.upstream_cache) if "temporal_straightening" in args.models else None
     args.output.mkdir(parents=True, exist_ok=False)
     files = [Path(__file__).with_name(name) for name in
-             ("diagnose_action_conditioning.py", "action_conditioning_support.py", "upstream_ts_probe.py", "planner_recipe_support.py")]
+             ("diagnose_action_conditioning.py", "action_conditioning_support.py", "upstream_ts_probe.py", "planner_recipe_support.py", "predictor_fit_control.py")]
     report = {"experiment": "action_conditioning", "implementation_sha256": implementation_sha256(),
               "diagnostic_sha256": hashlib.sha256(b"".join(p.read_bytes() for p in files)).hexdigest(),
               "settings": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},

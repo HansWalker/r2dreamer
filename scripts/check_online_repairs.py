@@ -60,7 +60,7 @@ class OnlineRepairsTest(unittest.TestCase):
     def test_native_goal_gradient_uses_only_terminal_latent_and_detached_goal(self):
         for reduction, expected in (("sum", .08), ("mean", .04)):
             model = SimpleNamespace(
-                goal_reduction=reduction,
+                goal_reduction=reduction, planner={"objective": "last"},
                 rollout=lambda history, past, actions: actions,
             )
             actions = torch.full((2, 3, 4, 2), .2, requires_grad=True)

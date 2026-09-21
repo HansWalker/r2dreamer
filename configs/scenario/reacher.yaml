@@ -5,6 +5,8 @@ dataset: reacher_easy
 planning_horizon: 10
 goal_observation:
   elbow_sign: 1  # Fixed IK branch reaching this episode's target; no live joint input.
+goal_alternatives:
+  - {elbow_sign: -1}
 state_fields:
   position: [0, 1]
   to_target: [0, 1]
