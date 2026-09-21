@@ -1258,6 +1258,43 @@ At each measurement, `native.pt` saves native weights, optimizer state and confi
 reusable diagnostic snapshots, **not exact online-resume checkpoints**: training replay
 and live simulator state are not stored. The short test still defaults to no checkpoints.
 
+### True-State Closed-Loop Controller
+
+```bash
+bash scripts/run_physical_oracle_check.sh \
+  --source-report runs/physical_learning_curve_20260921_170135/report.json
+```
+
+Tests the two physical controllers using **true simulator states and futures**, with
+the cost, horizon, solver budgets, warm starts, per-call seeds and controlled starts
+from the saved report. Only this report is needed: no dataset, checkpoint loading,
+head fitting, training, calibration or previous diagnostic sweep runs. The default
+is the source test's 100 agent steps and 12 cases, once per solver, not every snapshot.
+No production model or objective changes are made.
+
+The existing LeWM CEM and TS Adam/tanh action optimizers are reused. MuJoCo is not
+autograd-differentiable: TS gets central finite-difference simulator-state derivatives
+(action epsilon 0.001), composed with the existing physical cost's analytic gradient.
+This is an approximate-gradient oracle, not a bitwise-equivalent neural rollout.
+Private physics copies restore full integration state including warmstarts; the
+physics-only path is tested against the normal environment wrapper. See
+[MuJoCo state handling](https://mujoco.readthedocs.io/en/stable/programming/simulation.html#integration-state).
+
+MuJoCo rollouts run on CPU. The default `--device cuda:0` keeps the source planner's
+tensor/RNG backend; `--device cpu` is also supported but changes random draws.
+This is a control-quality isolation, not a speed comparison. `--models leworldmodel`
+or `--models temporal_straightening` selects a solver; `--policy-steps` can shorten
+debug runs but then returns are not directly comparable with the saved longer tests.
+
+Outputs: `runs/physical_oracle_<timestamp>/summary.txt`, `report.json`, and one
+`policy_metrics.jsonl` per solver with every action, true state, reward and success.
+The summary compares against the saved offline/online physical-controller endpoints.
+`COMPLETE` means execution, not balancing success. If the true-state controller fails,
+cost/horizon/solver limitations remain unresolved; if it works, learned state/dynamics
+errors become the next target. Native image-goal planning is not evaluated by this test.
+
+Local contracts: `python -m scripts.check_physical_oracle`.
+
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening
