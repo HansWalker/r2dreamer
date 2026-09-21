@@ -1123,6 +1123,40 @@ Historical endpoint-only objective, horizon and optimizer diagnostics retain `ob
 explicitly so their scores do not silently change. Use this paired test for the new MPC/goal-set
 comparison. Local checks: `MUJOCO_GL=egl python -m scripts.check_planner_fixes`.
 
+### Native Planner Learning Curve
+
+```bash
+bash scripts/run_planner_learning_curve.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision
+```
+
+Trains each small Cartpole planner **once from scratch for 5,000 offline updates**, measuring
+at 1,000, 3,000 and 5,000. LeWM's cosine schedule spans all 5,000 updates; TS keeps its native
+constant rates. Measurements preserve training RNG, model buffers and planner caches. Only
+native objectives are used: LeWM terminal distance and TS upstream MPC weighting, with one
+physical-rendered goal and no physical-head planning.
+
+Each model then continues from the same weights and optimizer moments for **4,096 environment
+steps** in fresh online replay: 262 updates under the unchanged 80,000-step/10,000-update
+production schedule, including the usual warmup. This is not a compressed online schedule.
+The auxiliary head retains its normal independent expert mixture. No checkpoint is read or
+written. Both models run sequentially; this is still a small-model diagnostic, not convergence
+training or a full-size benchmark.
+
+All four measurements reuse 16 held-out expert windows and 12 controlled simulator starts.
+Reports include one-step/recursive latent errors, persistence baselines, latent spread,
+action-candidate rankings, short policy returns, and original-unit physical-state RMSE.
+Validation data never enter training. Raw latent MSE can change with encoder scale and is
+not directly comparable across models. `COMPLETE` means execution, not successful learning.
+
+Outputs are `runs/planner_learning_curve_<timestamp>/report.json`, `summary.txt`, per-model
+`offline_metrics.jsonl`/`online_metrics.jsonl`, and each snapshot's `policy_metrics.jsonl`.
+Progress is throttled; the final summary contains every measurement. No parity checks,
+planner sweeps, predictor-copy fitting, timing calibration or dataset audit are repeated.
+Use `--online-steps 0` for offline only, `--models leworldmodel` for one model, or
+`--eval-updates 1000 3000 10000` to change the measurement points and total offline budget.
+Local checks: `MUJOCO_GL=egl python -m scripts.check_planner_learning_curve`.
+
 ### Short Online Check From Expert Checkpoints
 
 Before repeating long online runs, test the Cartpole LeWorldModel and Temporal Straightening
