@@ -6,6 +6,11 @@ model_family: temporal_straightening
 logdir: logdir/temporal_straightening_dmc_vision/${scenario.name}/seed_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 jepa_model:
+  # Existing runs retain patch curvature; aggregation is an explicit paper-recipe arm.
+  curvature_mode: patch
+  aggregation:
+    hidden_dim: 512
+    output_dim: 128
   # Preserve the visual coefficient of the former mean over 208 visual + 10 proprio channels.
   prediction_weight: 0.9541284403669725
   encoder:

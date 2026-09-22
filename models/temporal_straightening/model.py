@@ -113,7 +113,7 @@ class ResidualBlock(nn.Module):
 
 
 class SensoryEncoder(nn.Module):
-    def __init__(self, model_io, config):
+    def __init__(self, model_io, config, aggregation=None):
         super().__init__()
         self.key, (height, width, channels) = image_spec(model_io)
         self.keys = (self.key,)
@@ -132,6 +132,28 @@ class SensoryEncoder(nn.Module):
         self.norm = nn.LayerNorm(self.visual_dim)
         self.grid = (height // 16, width // 16)
         self.num_tokens = math.prod(self.grid)
+        if aggregation is not None:
+            hidden = int(aggregation.get("hidden_dim", 512))
+            output = int(aggregation.get("output_dim", 128))
+            if hidden < 1 or output < 1:
+                raise ValueError("Aggregation dimensions must be positive.")
+            # Restore upstream spatial pooling without changing common model weights
+            # or the RNG stream in paired patch/aggregation experiments.
+            with torch.random.fork_rng(devices=[]):
+                self.agg_mlp = nn.Sequential(
+                    nn.Linear(self.num_tokens * self.visual_dim, hidden),
+                    nn.ReLU(),
+                    nn.Linear(hidden, hidden),
+                    nn.ReLU(),
+                    nn.Linear(hidden, output),
+                )
+                self.agg_post_norm = nn.LayerNorm(output)
+
+    def agg(self, tokens):
+        """Upstream pooling of states; prediction and planning retain spatial tokens."""
+        if not hasattr(self, "agg_mlp"):
+            raise ValueError("Spatial aggregation requires curvature_mode='agg'.")
+        return self.agg_post_norm(self.agg_mlp(tokens.reshape(tokens.shape[0], -1)))
 
     def forward(self, obs):
         pixels, prefix = channel_first(obs[self.key])
@@ -196,7 +218,12 @@ class TemporalStraightening(LatentPlanner):
     def __init__(self, config, model_io):
         settings = config.jepa_model
         observations, action_shape, _ = parse_model_io(model_io)
-        encoder = SensoryEncoder(model_io, settings.encoder)
+        # Missing fields retain the objective and checkpoint shape of older configs.
+        curvature_mode = str(settings.get("curvature_mode", "patch"))
+        if curvature_mode not in {"patch", "agg"}:
+            raise ValueError(f"Unknown curvature mode: {curvature_mode}")
+        aggregation = settings.get("aggregation", {}) if curvature_mode == "agg" else None
+        encoder = SensoryEncoder(model_io, settings.encoder, aggregation=aggregation)
         latent_dim = encoder.out_dim
         action_embedding_dim = int(settings.predictor.action_embedding_dim)
         super().__init__(
@@ -223,7 +250,7 @@ class TemporalStraightening(LatentPlanner):
         weight_decay = float(settings.optim.weight_decay)
         self.optimizers = {
             "encoder": optim.Adam(
-                [*self.encoder.backbone.parameters(), *self.encoder.norm.parameters()],
+                self.encoder.parameters(),
                 lr=float(settings.optim.encoder_lr),
             ),
             "predictor": optim.AdamW(
@@ -240,6 +267,7 @@ class TemporalStraightening(LatentPlanner):
         if self.decoder is not None:
             self.optimizers["decoder"] = optim.Adam(self.decoder.parameters(), lr=float(settings.optim.decoder_lr))
         self.curvature_weight = float(settings.curvature_weight)
+        self.curvature_mode = curvature_mode
         self.prediction_weight = float(settings.prediction_weight)
         self.decoder_weight = float(settings.decoder.weight)
 
@@ -247,8 +275,15 @@ class TemporalStraightening(LatentPlanner):
         prediction = self.predict(latent[:, :-1], action)
         target = latent[:, 1:].detach()
         prediction_loss = F.mse_loss(prediction, target)
-        # Upstream `cos` straightens each patch, not a motion-weighted whole image.
-        velocity = latent[:, 1:] - latent[:, :-1]
+        curvature_features = latent
+        if self.curvature_mode == "agg":
+            batch, frames, patches, channels = latent.shape
+            # The upstream code aggregates states BEFORE differencing. For this
+            # nonlinear head, aggregating displacements would be a different loss.
+            curvature_features = self.encoder.agg(latent.reshape(batch * frames, patches, channels))
+            curvature_features = curvature_features.reshape(batch, frames, -1)
+        # The legacy `patch` mode corresponds to upstream `cos`.
+        velocity = curvature_features[:, 1:] - curvature_features[:, :-1]
         previous, current = velocity[:, :-1], velocity[:, 1:]
         curvature = 1 - F.cosine_similarity(previous, current, dim=-1, eps=1e-6)
         moving = (previous.norm(dim=-1) > 1e-6) & (current.norm(dim=-1) > 1e-6)
@@ -259,6 +294,13 @@ class TemporalStraightening(LatentPlanner):
             "visual_prediction_loss": prediction_loss,
             "curvature_loss": curvature_loss,
         }
+        if self.curvature_mode == "agg":
+            with torch.no_grad():
+                metrics.update(
+                    spatial_spread=latent.detach().flatten(2).var(dim=(0, 1), unbiased=False).mean().sqrt(),
+                    aggregate_spread=curvature_features.detach().var(dim=(0, 1), unbiased=False).mean().sqrt(),
+                    curvature_moving_fraction=moving.float().mean(),
+                )
         if self.decoder is not None:
             image = self.encoder.target(obs)
             with self.amp_context():

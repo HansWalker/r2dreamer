@@ -109,7 +109,93 @@ stability is established. Reports include individual-coordinate errors and short
 Use `--scenario reacher` or `--scenario ball_in_cup`, `--device cuda:0`, `--offline-updates`,
 `--online-updates`, or `--output` as needed. Existing output directories are never overwritten.
 
-For a **roughly one-hour GPU training diagnostic**, use the expert dataset and both small planners
+For the **offline paper-recipe and action-coverage comparison**, targeting about one hour total:
+
+```bash
+bash scripts/run_paper_faithful_check.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision --minutes 60
+```
+
+This runs six arms sequentially: TS patchwise curvature at 0.1 and 0.01, TS upstream-style
+aggregation at 0.1, that aggregation variant with additional intervention data, and LeWM
+with/without intervention data. The coverage arms replace half the offline expert windows
+with shared action branches. **There is no online training, online retention change, or online
+schedule change.** Native objectives, optimizers, spatial goal scoring, and action bounds are
+preserved. Production defaults remain patchwise TS until experiment results justify promotion.
+
+The default uses full comparison-model widths and production planning budgets. TS aggregation
+adds 2,033,024 active parameters (about 7.229M total versus 5.196M for patchwise TS); it is an
+explicit capacity-unmatched restoration control. `--profile small` and `--profile tiny` are
+optional size adaptations, not automatic fallbacks or full-size convergence tests.
+
+Before fitting, the runner checks hash-pinned upstream components, collects a common simulator
+branch bank with disjoint training/validation/test anchors, and profiles disposable models.
+It chooses one fixed update count for all six arms, reserving time for measurements. Calibration
+weights are discarded. `--updates N` fixes the common count instead; timing is still reported.
+`--minutes` is an estimate, not a deadline: the run does not truncate slower arms and give them
+less training. If the estimated budget cannot fit `--min-updates` (default 100), it stops with
+an explicit insufficient-budget report before the comparison fits.
+
+Measurements compare the exact native cost on real versus predicted future images, matched/
+shuffled/zero actions, persistence, feature spread, source versus production search budgets,
+and the actual optimizer-selected sequence. Default policy screening uses three controlled
+starts for 100 decisions per arm. This is not the full 50-episode benchmark or a stability
+claim; use `--policy-steps 497` for longer controlled trials (two decisions build the real
+observation prefix), and expand independent seeds/ordinary-reset evaluation after screening.
+
+Outputs include `report.json`, `summary.txt`, the reusable `branches.pt`, six native checkpoints,
+and per-update/per-policy JSONL traces. `COMPLETE` means the experiment executed; lower loss
+alone is not evidence that control is repaired. All outputs go to a new directory under `runs/`
+unless `--output` is supplied. Existing datasets and checkpoints are read-only.
+
+Pinned source downloads are small and verified against recorded SHA-256 hashes. Use
+`--reference-cache PATH --no-reference-download` for an already populated offline cache.
+`--skip-reference` is an explicit smoke-test bypass recorded as `NOT_RUN`, never as a parity pass.
+These checks execute upstream component code on matched tensors; **they do not reproduce an
+original paper task**. Original-task reference execution requires the separately installed
+official runtime, original dataset, and released checkpoint.
+
+The separate original-task launcher verifies the released LeWM PushT checkpoint and invokes
+the pinned official evaluator. Preflight records missing prerequisites; add `--run` to execute
+the original 50-case evaluation once they are available. Its runtime is separate from the
+one-hour DMC comparison:
+
+```bash
+python -m scripts.run_upstream_reference --prepare-code \
+  --python /path/to/official-env/bin/python \
+  --checkpoint-dir /data/lewm-pusht --dataset-root /data/stable-wm \
+  --output runs/upstream_pusht_preflight
+```
+
+The dataset root must contain `datasets/pusht_expert_train.h5`. The launcher downloads only
+small pinned source files when `--prepare-code` is supplied; it records setup details in
+`manifest.json` and requires the runtime, dataset, and checkpoint to be provisioned separately.
+Use a fresh output directory for each preflight or evaluation.
+
+Saved native checkpoints can also be evaluated without fitting:
+
+```bash
+bash scripts/run_paper_faithful_check.sh --device cuda:0 \
+  --checkpoint runs/previous/temporal_straightening/offline_24000/native.pt \
+  --checkpoint runs/previous/leworldmodel/offline_24000/native.pt
+```
+
+The loader supports latent-planner archives and diagnostic `training_config` snapshots, records
+source hashes, and uses the current TS/LeWM native score while preserving the saved architecture.
+It records any score override and never resumes optimizer/replay state. The new scorer retains
+TS observed-prefix/time weighting; older terminal-only diagnostic CLIs keep their historical scope.
+Checkpoint-only mode performs branch scoring; it does not run the policy or solver trials.
+
+CPU contracts and simulator checks:
+
+```bash
+MUJOCO_GL=egl python -m scripts.check_ts_aggregation
+MUJOCO_GL=egl python -m scripts.check_paper_faithful_support
+MUJOCO_GL=egl python -m scripts.check_paper_faithful_check
+PAPER_REFERENCE_CACHE=runs/reference_cache python -m scripts.check_paper_faithful_reference
+```
+
+For the earlier **roughly one-hour offline-plus-online diagnostic**, use both small planners
 on one scenario (Cartpole by default):
 
 ```bash
@@ -1321,6 +1407,38 @@ cost/horizon/solver limitations remain unresolved; if it works, learned state/dy
 errors become the next target. Native image-goal planning is not evaluated by this test.
 
 Local contracts: `python -m scripts.check_physical_oracle`.
+
+### Feedback Reference and Planner Cost Comparison
+
+When the true-state planner fails, compare it with a simulator-feedback positive
+control before another training run:
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 MUJOCO_GL=egl \
+python -m scripts.diagnose_controller_reference \
+  --source-report runs/physical_learning_curve_20260921_170135/report.json \
+  --output runs/controller_reference --device cpu --horizons 5 25 50
+```
+
+This evaluates a bounded local feedback controller on the source report's saved
+starts for its original policy length. At each fresh initial anchor, it then
+scores feedback-generated and solver-selected action sequences using the same
+true futures and physical cost. CEM uses its executed elite-mean sequence; the
+gradient planner uses its selected final restart. Each solver plans only once
+per horizon, so this is shorter than repeating the closed-loop horizon sweep.
+The default horizon list is just `5`.
+
+A lower-cost feedback sequence identifies a missed feasible plan at that anchor.
+The opposite ordering shows that the tested cost can prefer a different sequence;
+it does not establish global optimality or explain an entire closed-loop failure.
+The feedback baseline uses privileged simulator state and a different control
+objective, so it is a diagnostic reference, not an image-model benchmark result.
+CPU/CUDA candidate draws differ even with the same seed.
+
+Outputs include `report.json`, `summary.txt`, feedback traces, complete compared
+sequences, source hashes, and package versions. No images, checkpoints, training,
+or dataset samples are used. The output directory must be new.
+Local contracts: `python -m scripts.check_controller_reference`.
 
 ### Short Online Check From Expert Checkpoints
 
