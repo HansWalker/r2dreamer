@@ -63,6 +63,8 @@ class OnlineRepairsTest(unittest.TestCase):
                 goal_reduction=reduction, planner={"objective": "last"},
                 rollout=lambda history, past, actions: actions,
             )
+            for name in ("planning_cost", "_aggregate_goal_weight"):
+                setattr(model, name, getattr(LatentPlanner, name).__get__(model))
             actions = torch.full((2, 3, 4, 2), .2, requires_grad=True)
             goal = torch.zeros(2, 2, requires_grad=True)
             cost = LatentPlanner._goal_cost(model, torch.zeros(2, 1, 2), None, actions, goal)

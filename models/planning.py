@@ -48,6 +48,8 @@ class LatentPlanner(nn.Module):
         self.goal_reduction = "sum" if str(config.model_family) == "leworldmodel" else "mean"
 
         self.encoder = encoder
+        self.model_family = str(config.model_family)
+        self._aggregate_goal_weight()  # Reject invalid opt-in configs before fitting.
         self.action_encoder = action_encoder
         self.predictor = predictor
         self.state_head = PhysicalStateHead(
@@ -200,11 +202,51 @@ class LatentPlanner(nn.Module):
 
     def _goal_cost(self, history, past_action, candidates, goal):
         prediction = self.rollout(history, past_action, candidates)
-        return latent_goal_cost(
-            prediction, goal, reduction=self.goal_reduction,
-            mode=self.planner.get("objective", "last"), history=history,
-            tail_steps=int(self.planner.get("tail_steps", 3)),
-        )
+        return self.planning_cost(prediction, goal, history=history)
+
+    def _aggregate_goal_weight(self):
+        weight = float(self.planner.get("aggregate_goal_weight", 0.))
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError("aggregate_goal_weight must be finite and nonnegative.")
+        if weight and (self.model_family != "temporal_straightening"
+                       or not callable(getattr(self.encoder, "agg", None))
+                       or not hasattr(self.encoder, "agg_mlp")
+                       or not hasattr(self.encoder, "agg_post_norm")):
+            raise ValueError("A nonzero aggregate_goal_weight requires the existing TS aggregation head; load a trained agg checkpoint.")
+        return weight
+
+    def planning_cost(self, prediction, goal, *, history=None):
+        """Native spatial cost plus an optional existing TS aggregate-head cost.
+
+        The zero/absent weight uses the exact legacy scorer. The opt-in term pools
+        each state before applying the same coordinate/time reductions. Multiple
+        goal alternatives remain coherent across both terms. This never creates
+        or fits a head; callers enabling it must load a trained aggregation head.
+        """
+        weight = self._aggregate_goal_weight()
+        settings = {"reduction": self.goal_reduction, "mode": self.planner.get("objective", "last"),
+                    "tail_steps": int(self.planner.get("tail_steps", 3))}
+        if not weight:
+            return latent_goal_cost(prediction, goal, history=history, **settings)
+        spatial = latent_goal_cost(prediction, goal, history=history, return_per_goal=True, **settings)
+        if prediction.ndim != 5:
+            raise ValueError("Aggregate goal scoring requires TS spatial states [batch, candidates, time, patches, channels].")
+        goals = goal[:, None] if goal.ndim == prediction.ndim - 2 else goal
+
+        def aggregate(value):
+            pooled = self.encoder.agg(value.float().reshape(-1, *value.shape[-2:]))
+            return pooled.reshape(*value.shape[:-2], pooled.shape[-1])
+
+        # Native TS curvature trains this head in FP32; costs and action gradients
+        # retain that precision independently of the neural rollout's autocast.
+        with torch.autocast(device_type=prediction.device.type, enabled=False):
+            pooled_prediction = aggregate(prediction)
+            with torch.no_grad():
+                pooled_goal = aggregate(goals)
+                pooled_history = aggregate(history) if history is not None else None
+            pooled = latent_goal_cost(pooled_prediction, pooled_goal, history=pooled_history,
+                                      return_per_goal=True, **settings)
+        return (spatial + weight * pooled).min(-1).values
 
     def _first_mask(self, first, batch):
         return (

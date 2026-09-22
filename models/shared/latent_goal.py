@@ -3,7 +3,8 @@
 import torch
 
 
-def latent_goal_cost(prediction, goal, *, reduction, mode="last", history=None, tail_steps=3):
+def latent_goal_cost(prediction, goal, *, reduction, mode="last", history=None, tail_steps=3,
+                     return_per_goal=False):
     """Score [B, candidates, future, ...] against [B, ...] or [B, goals, ...]."""
     if mode not in {"last", "ts_mpc", "tail"}:
         raise ValueError(f"Unknown latent goal objective: {mode}")
@@ -36,5 +37,6 @@ def latent_goal_cost(prediction, goal, *, reduction, mode="last", history=None, 
         error = (path.float() - target.float()[:, None, None]).square().flatten(3)
         error = error.sum(-1) if reduction == "sum" else error.mean(-1)
         costs.append((error if weights is None else error * weights).mean(-1))
-    # Min AFTER temporal aggregation: a candidate must aim for one coherent goal.
-    return torch.stack(costs, dim=-1).min(-1).values
+    # A caller combining several metrics must combine per-goal terms before min.
+    costs = torch.stack(costs, dim=-1)
+    return costs if return_per_goal else costs.min(-1).values

@@ -92,6 +92,8 @@ class LatentGoalTest(unittest.TestCase):
                 prediction = torch.randn(2, 5, 7, *shape, requires_grad=True)
                 goal = torch.randn(2, *shape, requires_grad=True)
                 model = SimpleNamespace(goal_reduction=reduction, planner={"objective": "last"}, rollout=lambda *args: prediction)
+                for name in ("planning_cost", "_aggregate_goal_weight"):
+                    setattr(model, name, getattr(LatentPlanner, name).__get__(model))
                 cost = LatentPlanner._goal_cost(model, None, None, None, goal)
                 expected = torch.stack([
                     getattr((prediction[b, :, -1] - goal[b]).square().flatten(1), reduction)(1)

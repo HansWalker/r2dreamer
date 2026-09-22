@@ -242,6 +242,50 @@ MUJOCO_GL=egl python -m scripts.check_paper_faithful_followup_eval
 MUJOCO_GL=egl python -m scripts.check_paper_faithful_followup
 ```
 
+For the **frozen-checkpoint planning comparison** after the larger coverage follow-up:
+
+```bash
+bash scripts/run_paper_faithful_planning.sh \
+  --source-run runs/paper_faithful_followup_20260922_092521
+```
+
+The source directory must contain its `report.json`, `branches.pt`, and the final
+TS-aggregation/LeWM `native.pt` checkpoints for seeds 1, 2, and 3. No expert dataset
+is needed. Add `--dry-run` to validate the saved artifacts and print the matrix
+without a GPU or simulator evaluation. `--source-run` may also point to a downloaded
+copy under `local/reports/`.
+
+The six conditions per seed are TS spatial cost at H5/H15, TS spatial plus
+`0.1 * aggregate` cost at H5/H15, and LeWM's existing terminal cost at H5/H15.
+The aggregate term uses the already-trained TS head. Both terms retain the current
+TS MPC temporal weighting and coordinate reduction; their sum uses one coherent
+goal. This implements the combined-cost formula reported in the
+[TS paper's long-horizon experiment](https://arxiv.org/html/2603.12231v3), not a new
+training loss or a claim of original-task reproduction. The default model cost
+remains spatial-only (`aggregate_goal_weight: 0.0`).
+
+All 18 evaluations use frozen final weights, the same 12 validation starts, 200
+decisions per trial, and unchanged source solver budgets. H5/H15 candidate scoring
+uses all 18 source validation anchors. Zero-action and privileged state-feedback
+controls are recomputed for the longer trial. Training and test splits are checked
+for artifact integrity but are not evaluated. Select settings on these validation
+results, then confirm on fresh held-out starts. This is an evaluation workload,
+with no training or fixed six-hour timer; per-condition runtimes are recorded.
+
+Outputs under `runs/paper_faithful_planning_<timestamp>/` include `summary.txt`,
+`report.json`, control traces, checkpoint/source hashes, resolved planner settings,
+and per-seed/per-condition policy traces. Source artifacts are read-only. Checkpoint
+and branch hashes, saved configurations, and simulator compatibility are validated
+before evaluation. Partial failures are recorded; existing output directories are
+never overwritten.
+
+Planning comparison checks:
+
+```bash
+MUJOCO_GL=egl python -m scripts.check_paper_faithful_planning_cost
+MUJOCO_GL=egl python -m scripts.check_paper_faithful_planning
+```
+
 For the earlier **roughly one-hour offline-plus-online diagnostic**, use both small planners
 on one scenario (Cartpole by default):
 

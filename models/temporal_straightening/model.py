@@ -150,7 +150,7 @@ class SensoryEncoder(nn.Module):
                 self.agg_post_norm = nn.LayerNorm(output)
 
     def agg(self, tokens):
-        """Upstream pooling of states; prediction and planning retain spatial tokens."""
+        """Upstream state pooling for curvature and the optional aggregate goal cost."""
         if not hasattr(self, "agg_mlp"):
             raise ValueError("Spatial aggregation requires curvature_mode='agg'.")
         return self.agg_post_norm(self.agg_mlp(tokens.reshape(tokens.shape[0], -1)))

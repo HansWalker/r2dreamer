@@ -17,7 +17,6 @@ from omegaconf import OmegaConf
 
 import tools
 from envs.dmc import make_env
-from models.shared.latent_goal import latent_goal_cost
 from models.shared.physical_state import readout_mode
 from scripts.diagnose_goal_objective import cart_state, feedback_gain, set_cart_state
 from scripts.diagnose_planner_oracle import rank_correlation, selection, simulator_branch
@@ -331,8 +330,7 @@ def score_branches(model, cases, horizons=(1, 5), encode_batch_size=32):
                           "persistence_mse": persistence}
                 costs = []
                 for future in (predicted, actual):
-                    costs.append(latent_goal_cost(future[None, :, :h], goal, reduction=model.goal_reduction,
-                        mode=mode, history=history, tail_steps=int(model.planner.get("tail_steps", 3)))[0].cpu().numpy())
+                    costs.append(model.planning_cost(future[None, :, :h], goal, history=history)[0].cpu().numpy())
                 rewards = case["rewards"][:, :h].sum(1).cpu().numpy()
                 pred_choice, actual_choice = selection(costs[0], rewards), selection(costs[1], rewards)
                 response = (predicted[:, h - 1] - zero[:, h - 1]).flatten(1)
@@ -386,7 +384,8 @@ def score_branches(model, cases, horizons=(1, 5), encode_batch_size=32):
                     total, squared, count = (sum(parts) for parts in zip(*statistics, strict=True))
                     summary["target_latent_rms_std"] = float((squared / count - (total / count).square()).clamp_min(0).mean().sqrt())
                 destination[cohort][h] = summary
-    result = {"objective": mode, "goal_reduction": model.goal_reduction, "horizons": list(horizons),
+    result = {"objective": mode, "goal_reduction": model.goal_reduction,
+              "aggregate_goal_weight": float(model.planner.get("aggregate_goal_weight", 0.)), "horizons": list(horizons),
               "error_definition": "endpoint latent MSE; fixed actual image targets; shuffled whole candidate plans",
               "spread_definition": "per-case std spans candidates; aggregate target std spans all anchors and candidates in that cohort",
               "action_response_definition": "Actual response requires an observed zero-action candidate at this horizon; otherwise true response, ratio, and response MSE are unavailable",
