@@ -195,6 +195,53 @@ MUJOCO_GL=egl python -m scripts.check_paper_faithful_check
 PAPER_REFERENCE_CACHE=runs/reference_cache python -m scripts.check_paper_faithful_reference
 ```
 
+For the **coverage follow-up with broader starts and intermediate evaluations**:
+
+```bash
+bash scripts/run_paper_faithful_followup.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision --minutes 60
+```
+
+This compares TS patch curvature 0.1 + coverage, TS aggregation 0.1 + coverage, and
+LeWM + coverage, each at training seeds 1 and 2. All six fits use 50% expert and 50%
+intervention windows, full model widths, the native loss/optimizer recipes, and one
+matched update budget. There is no online training or online schedule change.
+
+The common bank has 32 training, nine validation, and nine test anchors sampled over
+broader continuous position/angle/velocity ranges, with disjoint seeds and states.
+Each anchor has 12 action branches of 25 decisions. Forecasts and native goal costs
+are measured at horizons **1, 5, 15, and 25**. **Policy planning stays at horizon 5**
+with production solver budgets; the longer forecasts do not silently change control.
+
+Validation forecasts are recorded before training, halfway through, and at the end.
+The two trained validation checkpoints also run the same three starts for 25 decisions,
+giving a paired control learning curve. Final testing uses separate held-out anchors
+and six policy starts for 100 decisions. Zero-action and privileged state-feedback
+controls use the identical starts and durations. Test results do not select training
+budgets or checkpoints. Intermediate evaluation preserves model/optimizer state and RNG.
+
+Collection and long-horizon evaluation are included in runtime calibration. The shared
+update count can be smaller than the previous 1,693-update screen because this run spends
+more time evaluating. `--minutes 90` provides a larger total budget; `--updates N` explicitly
+fixes the update count and can exceed the time target. If even `--min-updates` (256) does
+not fit the estimated runtime, the runner stops before fitting. Models are never silently
+shrunk and individual fits are never cut short to meet a deadline.
+
+Outputs under `runs/paper_faithful_followup_<timestamp>/` include `summary.txt`,
+`report.json`, `branches.pt`, baseline-control traces, and per-seed/per-arm training logs,
+intermediate/final checkpoints, and policy traces. Compare validation learning curves
+at equal update counts; final-test return has a different duration and separate starts.
+This is a controlled-start screening test, not the full ordinary-reset benchmark or an
+original-paper task reproduction. Previous run scripts and defaults remain available.
+
+Follow-up CPU/simulator checks:
+
+```bash
+MUJOCO_GL=egl python -m scripts.check_paper_faithful_followup_support
+MUJOCO_GL=egl python -m scripts.check_paper_faithful_followup_eval
+MUJOCO_GL=egl python -m scripts.check_paper_faithful_followup
+```
+
 For the earlier **roughly one-hour offline-plus-online diagnostic**, use both small planners
 on one scenario (Cartpole by default):
 
