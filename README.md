@@ -286,6 +286,57 @@ MUJOCO_GL=egl python -m scripts.check_paper_faithful_planning_cost
 MUJOCO_GL=egl python -m scripts.check_paper_faithful_planning
 ```
 
+For the **goal-maintenance comparison using the completed duration checkpoints**:
+
+```bash
+bash scripts/run_goal_maintenance.sh \
+  --source-run runs/paper_faithful_duration_20260923_020814
+```
+
+This freezes the saved TS and LeWM models and evaluates three planning conditions
+on the same six validation starts for 200 decisions each: the saved native planner,
+the native score with a longer lookahead, and the existing latent tail score over
+the final portion of that longer lookahead. There is no retraining, expert-dataset
+dependency, online updating, timing calibration, or clock cutoff.
+
+The shared rule averages distance to the same goal image over the final predicted
+window, allowing an approach before that window. This is an explicit planning
+adaptation, not the original paper objective or a guarantee of stable control.
+Native model architectures, losses and planner search settings are retained.
+The defaults request at least **0.5 s lookahead** and **0.3 s holding window**,
+rounded up using the simulator timestep and action repeat. A saved longer horizon
+is preserved. For Cartpole these resolve to H25 and a 15-decision tail, compared
+with the saved native H5. When the saved horizon already covers the requested
+lookahead, the duplicate native condition is omitted.
+
+`--tasks cartpole_balance_sparse reacher ball_in_cup` uses the same rule for all
+three tasks when the source run contains their completed checkpoints and banks.
+The supplied `020814` run contains only Cartpole. Requested horizons must fit the
+saved branches. `--lookahead-seconds` and `--hold-seconds` explicitly change the
+time windows; no settings are chosen from evaluation outcomes.
+
+Add `--dry-run` to validate artifacts and print the resolved matrix without model
+evaluation or output writes. Add `--score-only` to score the saved candidate
+futures without policy execution. Branch scoring always uses the same longer
+forecast horizon across conditions; the report distinguishes this from the
+shorter horizon used by `native_saved` when acting. Actual-image and predicted
+scores are compared against real task occupancy during the same final window,
+with ties averaged and uninformative anchors reported separately. Actual-image
+scoring still depends on the learned encoder.
+
+Outputs are in `runs/goal_maintenance_<timestamp>/`: report and summary, matched
+zero-action controls, policy traces, and selected-plan diagnostics. Only validation
+starts are evaluated. Source checkpoints/banks are read-only; file hashes and
+before/after model tensor digests are recorded. Every handled completion, failure
+or interrupt prints `Run | <name> | status=<status>`. The runner records partial
+results but does not resume them; use a new output directory for a repeat.
+
+CPU/simulator implementation checks (both model families, all three tasks):
+
+```bash
+MUJOCO_GL=egl python -m scripts.check_goal_maintenance
+```
+
 For the **four-hour Cartpole training-duration comparison**:
 
 ```bash
