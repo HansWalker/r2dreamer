@@ -286,6 +286,60 @@ MUJOCO_GL=egl python -m scripts.check_paper_faithful_planning_cost
 MUJOCO_GL=egl python -m scripts.check_paper_faithful_planning
 ```
 
+For the **roughly five-hour Cartpole forecast/online experiment**, continuing the
+two completed TS and LeWM checkpoints:
+
+```bash
+bash scripts/run_forecast_online.sh \
+  --source-run runs/paper_faithful_duration_20260923_020814
+```
+
+Use the same A100 environment and original expert dataset. If that dataset moved,
+add `--dataset-root /path/to/dmc_expert_vision`; its identity must match the source.
+The source's resolved dataset path is used otherwise. No offline retraining is
+performed. The goal-maintenance run is not a checkpoint source: it saved only
+evaluations of the duration checkpoints.
+
+Both models use their original goal scores at H25 throughout collection and
+evaluation. Each collects **16,384 raw steps / 8,192 agent transitions** in 16
+environments and performs **1,839 native online updates**. This stops partway
+through the unchanged 80,000-step/10,000-update schedule, including its 1,024
+transition warmup. Native training uses only fresh online replay; the existing
+detached physical readout retains its configured 50% expert data. No reward
+learner, physical-state controller, new loss or neural module is added.
+
+Before training, at 8,192 raw steps (788 updates), and at the endpoint, evaluate
+the same six validation starts for 200 decisions. Save current selected-plan
+replays and rescore the **same initial plans** at every checkpoint. Compare
+recursive predictions with one-step predictions supplied the real recent
+observations. Real future observations remain diagnostic inputs only. Goal
+scores on actual versus predicted futures separate preference errors from
+forecast errors. Persistence-normalized errors and feature spread help avoid
+mistaking a shrinking latent representation for improved prediction.
+
+The five-hour target is a rough A100 estimate from the previous H25 evaluations,
+allowing extra cost for 16-environment online planning. Most time is collection
+and evaluation, not gradient updates. Work counts are fixed; there is no timing
+calibration, budget feasibility gate or clock cutoff. Runtime depends on hardware.
+This is a one-seed diagnostic of online changes, not a completed online benchmark
+or proof of a repair. No settings are selected automatically from its results.
+
+Results go to `runs/forecast_online_<timestamp>/`: report/summary, zero-action
+control, per-model online metrics, before/midpoint/after traces and plan tensors,
+milestone checkpoints, and periodic `latest.pt` weights/optimizer snapshots.
+These snapshots do not include exact simulator/replay resumption; this runner
+has no resume mode. The run name and handled status print at the end, including
+failures and interrupts. Original inputs are never overwritten.
+
+```bash
+MUJOCO_GL=egl python -m scripts.check_forecast_online
+```
+
+`--dry-run` checks source artifacts and resolved budgets without writing outputs
+or accessing expert data. A real launch validates expert identity before expensive
+evaluation. `--task` also supports Reacher and Ball-in-cup when a matching duration
+source exists; the default and current source are Cartpole only.
+
 For the **goal-maintenance comparison using the completed duration checkpoints**:
 
 ```bash
