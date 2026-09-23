@@ -380,6 +380,7 @@ def main(argv=None):
         report["seconds"] = time.monotonic() - started
         persist(args.output, report)
         print(summary(report), end="", flush=True)
+        print(f"Run | {args.output.name} | status={report['status']}", flush=True)
         print(f"Reports | {args.output.resolve()}", flush=True)
     return 0 if report["status"] == "COMPLETE" else 1
 

@@ -54,7 +54,7 @@ def synchronize(device):
 
 def build_config(arm, args):
     family, mode, weight, _ = ARMS[arm]
-    overrides = [f"device={args.device}", f"seed={args.seed}", "scenario=cartpole_balance_sparse",
+    overrides = [f"device={args.device}", f"seed={args.seed}", f"scenario={getattr(args, 'scenario', 'cartpole_balance_sparse')}",
                  f"env.dataset_root={json.dumps(str(args.dataset_root.resolve()))}",
                  f"replay.batch_size={args.batch_size}", f"replay.episodes_per_batch={args.sources}"]
     if args.profile == "small":
@@ -79,7 +79,8 @@ def build_config(arm, args):
         config.jepa_model.aggregation = {"hidden_dim": 512, "output_dim": 128}
     # Head size is upstream even in small-model diagnostics; label model widths separately.
     config.state_head.samples_per_update = min(int(config.state_head.samples_per_update), 2 * args.batch_size)
-    config.jepa_model.planner.horizon = args.horizon
+    if args.horizon is not None:
+        config.jepa_model.planner.horizon = args.horizon
     config.training.expert.batch_size = args.batch_size
     OmegaConf.resolve(config)
     return config
@@ -556,6 +557,7 @@ def main(argv=None):
         report["seconds"] = time.monotonic() - started
         persist(args.output, report)
         print(summary(report), end="", flush=True)
+        print(f"Run | {args.output.name} | status={report['status']}", flush=True)
         print(f"Reports | {args.output.resolve()}", flush=True)
     return 0 if report["status"] == "COMPLETE" else 1
 

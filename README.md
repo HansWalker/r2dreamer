@@ -286,6 +286,58 @@ MUJOCO_GL=egl python -m scripts.check_paper_faithful_planning_cost
 MUJOCO_GL=egl python -m scripts.check_paper_faithful_planning
 ```
 
+For the **four-hour training-duration comparison across all three tasks**:
+
+```bash
+bash scripts/run_paper_faithful_duration.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision --minutes 240
+```
+
+This runs six fresh fits: native-default TS and LeWM on Cartpole, Reacher, and
+Ball-in-Cup, with one seed each. It preserves the full configured widths, native
+losses, goal-image costs, and scenario horizons (5/10/25). No new controller
+modules or RL objectives are introduced. TS uses the existing patch-curvature
+default, with aggregate planning disabled. Offline batches remain 50% expert and
+50% task-specific intervention windows. The new intervention banks use normal
+resets and prescribed random roll-ins, so this is a new experiment, not a direct
+continuation of the earlier Cartpole fits.
+
+The four-hour target covers all six fits, collection, profiling and evaluation.
+Disposable profiling fixes one common update count before fitting, with a minimum
+of 8,192 updates per fit and a maximum of 100,000. Insufficient estimated time
+stops before comparison training instead of shrinking models or shortening their
+budgets. Runtime is approximate, not a hard cutoff. `--updates N` explicitly
+overrides the runtime calculation. `--dry-run` prints the six resolved setups
+without collecting data, training, or creating an output directory.
+
+Validation forecasts are measured at initialization, halfway, and completion;
+validation control uses the same two starts for 100 decisions at the two trained
+milestones. Final tests use three separate starts for 200 decisions. These small
+samples and one seed are a duration screen, not a task-success confirmation.
+Simulator snapshots preserve episode targets, integration state, task RNG and
+episode counters. Saved plan probes include the full chosen action sequence,
+predicted/actual native costs, real future images, and diagnostic alternatives.
+Simulator physical values and rewards never enter the native controller.
+
+Each fit writes complete training checkpoints every 1,000 updates and at validation
+milestones. Resume on the same machine/runtime with unchanged code and datasets:
+
+```bash
+bash scripts/run_paper_faithful_duration.sh \
+  --resume runs/paper_faithful_duration_<timestamp>
+```
+
+Resume keeps the original update budget, learning-rate schedule, optimizer state,
+both data samplers and random states. It does not extend a finished schedule.
+Earlier `paper_faithful_offline_v1` evaluation snapshots are not accepted as exact
+resumes. Outputs include `summary.txt`, `report.json`, banks, policy traces, plan
+probes and per-fit checkpoints. The run name and report directory print at the end,
+including handled failures and interrupts. This run performs no online updates.
+
+```bash
+MUJOCO_GL=egl python -m scripts.check_paper_faithful_duration
+```
+
 For the earlier **roughly one-hour offline-plus-online diagnostic**, use both small planners
 on one scenario (Cartpole by default):
 
