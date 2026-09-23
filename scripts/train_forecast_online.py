@@ -9,6 +9,7 @@ import json
 import math
 import time
 import traceback
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from envs import close_envs, make_envs
 from scripts.diagnose_fresh_readout import tensor_digest
 from scripts.evaluate_goal_maintenance import branch_maintenance, load_source, validate_payload
 from scripts.forecast_online_support import forecast_errors, probe_cases, summarize_probes
+from scripts.offline_online_replay import OfflineOnlineSession, original_replay, replay_settings
 from scripts.paper_faithful_duration_support import evaluate, policy_trial
 from scripts.paper_faithful_followup_eval import preserve_training_state
 from scripts.paper_faithful_support import _digest, score_branches
@@ -40,7 +42,9 @@ FORMAT = "forecast_online_v1"
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-run", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=Path("runs") / datetime.now(timezone.utc).strftime("forecast_online_%Y%m%d_%H%M%S"))
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--retain-offline", action="store_true",
+                        help="Start native updates with 50%% original data, linearly tapering to 0%% by this run's final update")
     parser.add_argument("--dataset-root", type=Path, help="Override the source's expert-data path; identity must still match")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--task", choices=TASKS, default="cartpole_balance_sparse")
@@ -60,6 +64,9 @@ def arguments(argv=None):
             or args.hold_seconds > args.lookahead_seconds):
         parser.error("Use positive finite budgets/windows, hold <= lookahead and nonnegative seeds")
     args.models, args.tasks = list(MODELS), [args.task]
+    if args.output is None:
+        prefix = "offline_online_decay" if args.retain_offline else "forecast_online"
+        args.output = Path("runs") / datetime.now(timezone.utc).strftime(prefix + "_%Y%m%d_%H%M%S")
     return args
 
 
@@ -92,6 +99,13 @@ def configure(record, bank, args):
     bank_seeds = {case["seed"] for cases in bank["splits"].values() for case in cases}
     if online_seeds & bank_seeds:
         raise ValueError("Online reset seeds overlap stored diagnostic/training bank seeds")
+    replay = {"mode": "online_only" if not config.training.online.get("expert_fraction", 0.) else "expert_mixture"}
+    if args.retain_offline:
+        # Growing new-data pool for the whole experiment; original HDF5/branches
+        # remain separate, read-only sources and are never evicted.
+        config.replay.max_size = max(int(config.replay.max_size), args.online_steps // int(config.env.action_repeat))
+        replay = replay_settings(config, bank, record["row"].get("coverage_fraction"),
+                                 online_update_target(config, args.online_steps))
     return config, condition, {
         "raw_steps": args.online_steps, "agent_transitions": args.online_steps // int(config.env.action_repeat),
         "vector_collections": args.online_steps // quantum, "environments": int(config.env.env_num),
@@ -99,7 +113,8 @@ def configure(record, bank, args):
         "updates": online_update_target(config, args.online_steps),
         "schedule_steps": int(config.training.online.steps), "schedule_updates": int(config.training.online.updates),
         "warmup_transitions": int(config.training.online.warmup_transitions),
-        "native_expert_fraction": float(config.training.online.get("expert_fraction", 0.)),
+        "native_expert_fraction": None if args.retain_offline else float(config.training.online.get("expert_fraction", 0.)),
+        "native_branch_fraction": None if args.retain_offline else 0., "native_replay": replay,
         "readout_expert_fraction": float(config.state_head.online.expert_fraction),
         "planner": OmegaConf.to_container(config.jepa_model.planner, resolve=True),
     }
@@ -133,13 +148,21 @@ def summary(report):
              f"Run: {report['run_name']} | Status: {report['status']}"]
     for row in report["runs"]:
         lines.append(f"{row['model']} | {row['status']} | raw steps={row.get('raw_steps', 0)} | online updates={row.get('updates', 0)}")
+        replay = row.get("budget", {}).get("native_replay", {})
+        if replay.get("mode") == "offline_plus_online":
+            lines.append(f"  Replay: original share {replay['offline_start_fraction']:.0%} -> 0% linearly "
+                         f"over {replay['decay_updates']} native updates; uniform windows within each pool.")
+            if "replay_sampling" in row.get("online", {}):
+                lines.append(f"  Total native samples: {row['online']['replay_sampling']['total_samples']}")
         for snapshot in row["snapshots"]:
             p = snapshot["evaluation"]["summary"]["policy"]
             lines.append(f"  {snapshot['name']} @{snapshot['updates']}: return {p['return_mean']:.2f}/{p['maximum_return']} | "
                          f"maintained {round(p['maintenance_rate'] * p['cases'])}/{p['cases']}")
     lines += ["Same validation starts, goal scores, horizon and search settings before/midpoint/after.",
               "Fixed initial plans never enter training. Real-history predictions are diagnostics only.",
-              "Online replay is fresh; the saved full learning-rate/update schedule is not compressed.",
+              ("Native batches hand over from 50/50 original/online to all online; the diagnostic readout mixture is unchanged."
+               if report.get("settings", {}).get("retain_offline") else "Online replay starts empty."),
+              "The saved full learning-rate/update schedule is not compressed.",
               "Raw latent MSE changes can reflect encoder changes: inspect normalized errors, feature spread and real control too.",
               "COMPLETE means execution, not a repair. One seed per model; this is a prefix, not the full online protocol.",
               "Checkpoints save weights and optimizers for inspection; exact simulator/replay resume is not supported."]
@@ -155,6 +178,7 @@ def save_weights(folder, model, config, record, row, *, milestone=False):
                "resume_supported": False, "phase": "online", "training_config": OmegaConf.to_container(config, resolve=True),
                "source_checkpoint_sha256": record["file_sha256"], "dataset_identity": record["dataset_identity"],
                "bank_sha256": record["bank_sha256"], "env_steps": row["raw_steps"], "updates": row["updates"],
+               "native_replay": row.get("budget", {}).get("native_replay", {}),
                "rng_state": tools.get_rng_state(),
                "counters": {name: getattr(model, name) for name in ("_gradient_updates", "_clipped_updates")}}
     path = folder / "latest.pt"
@@ -165,6 +189,20 @@ def save_weights(folder, model, config, record, row, *, milestone=False):
         atomic_save(payload, path)
         row.setdefault("checkpoints", []).append({"file": path.name, "raw_steps": row["raw_steps"],
                                                   "updates": row["updates"], "sha256": file_hash(path)})
+
+
+def save_online_data(folder, session, record, row):
+    """Persist the newly added data separately from immutable original sources."""
+    path = folder / "online_data.pt"
+    windows = session.original.inventory(session.replay)
+    atomic_save({"format": "offline_online_data_v1", "task": record["task"], "model": record["model"],
+                 "dataset_identity": record["dataset_identity"], "bank_sha256": record["bank_sha256"],
+                 "raw_steps": row["raw_steps"], "updates": row["updates"], "replay": session.replay.state_dict(),
+                 "sampling_generator_state": session.original.generator.get_state(),
+                 "sampling_updates": session.updates, "native_replay": row["budget"]["native_replay"],
+                 "total_samples": dict(session.original.total_samples), "windows": windows}, path)
+    row["online_data"] = {"file": path.name, "raw_steps": row["raw_steps"], "rows": session.replay.count(),
+                          "online_windows": windows["online"], "sha256": file_hash(path)}
 
 
 def snapshot(config, model, bank, condition, args, folder, row, name, fixed):
@@ -210,17 +248,22 @@ def train_one(config, model, family, record, bank, condition, args, output, repo
     fixed = snapshot(config, model, bank, condition, args, folder, row, "before", None)
     persist(output, report)
     tools.configure_randomness(args.online_seed, bool(config.deterministic_run))
-    envs = None
+    envs, session = None, None
     try:
-        with online_readout(config, family, model, expected_dataset=record["dataset_identity"]):
+        retained = (original_replay(config, family, bank, row["budget"]["native_replay"], record["dataset_identity"])
+                    if args.retain_offline else nullcontext(None))
+        with online_readout(config, family, model, expected_dataset=record["dataset_identity"]), retained as original:
             if hasattr(model, "configure_online"):
                 model.configure_online(int(config.training.online.updates), resumed=False)
             model.train()
             envs = make_envs(config.env, seed=args.online_seed)
-            session = family.OnlineSession(config, model, envs)
+            session = (OfflineOnlineSession(config, model, envs, original)
+                       if args.retain_offline else family.OnlineSession(config, model, envs))
             session.start()
             if session.replay.count():
                 raise RuntimeError("Online replay must start empty")
+            if original is not None:
+                row["budget"]["native_replay"]["initial_windows"] = original.inventory(session.replay)
             initial_head_updates = int(model.state_head.updates)
             initial_native_updates = model._gradient_updates
             save_weights(folder, model, config, record, row, milestone=True)
@@ -256,6 +299,8 @@ def train_one(config, model, family, record, bank, condition, args, output, repo
                     milestone = row["raw_steps"] in (args.online_steps // 2, args.online_steps)
                     if milestone or row["raw_steps"] >= next_save:
                         save_weights(folder, model, config, record, row, milestone=milestone)
+                        if args.retain_offline:
+                            save_online_data(folder, session, record, row)
                         next_save = (row["raw_steps"] // args.save_every + 1) * args.save_every
                         persist(output, report)
                     if milestone:
@@ -269,12 +314,20 @@ def train_one(config, model, family, record, bank, condition, args, output, repo
                              "partial_episode_returns": session.returns.cpu().tolist(),
                              "partial_episode_lengths": session.lengths.cpu().tolist(),
                              "head_updates_before": initial_head_updates, "head_updates_after": int(model.state_head.updates)}
+            if original is not None:
+                row["online"]["replay_sampling"] = {"total_samples": dict(original.total_samples),
+                                                      "final_windows": original.inventory(session.replay)}
             if row["updates"] != online_update_target(config, args.online_steps):
                 raise RuntimeError("Did not complete the scheduled online prefix")
             if not all(torch.isfinite(value).all() for value in model.state_dict().values()):
                 raise ValueError("Non-finite model tensors after online training")
     finally:
-        close_envs(envs)
+        try:
+            if (args.retain_offline and session is not None and session.replay.count()
+                    and row.get("online_data", {}).get("raw_steps") != row["raw_steps"]):
+                save_online_data(folder, session, record, row)
+        finally:
+            close_envs(envs)
 
 
 def main(argv=None):
@@ -305,7 +358,7 @@ def main(argv=None):
         # Fail for absent/wrong expert data before any expensive evaluation. The
         # default native learner uses none; its detached readout retains 50%.
         for record, config, _, _ in prepared:
-            if config.state_head.online.expert_fraction or config.training.online.get("expert_fraction", 0.):
+            if args.retain_offline or config.state_head.online.expert_fraction or config.training.online.get("expert_fraction", 0.):
                 with load_model_family(config.model_family).build_replay(config) as replay:
                     if dataset_identity(replay.metadata) != record["dataset_identity"]:
                         raise ValueError("Expert dataset identity differs from the source checkpoint")
@@ -316,7 +369,7 @@ def main(argv=None):
         report.update(status="RUNNING", versions=versions, implementation_sha256=implementation_sha256(),
                       source_report_sha256=file_hash(args.source_run / "report.json"), source_helpers=source_hashes(),
                       runner_hashes={name: file_hash(Path(__file__).with_name(name)) for name in
-                                     ("train_forecast_online.py", "forecast_online_support.py", "evaluate_goal_maintenance.py")},
+                                     ("train_forecast_online.py", "forecast_online_support.py", "offline_online_replay.py", "evaluate_goal_maintenance.py")},
                       source_banks=source["banks"],
                       checkpoints=[{key: str(record[key]) if isinstance(record[key], Path) else record[key]
                                     for key in ("task", "model", "path", "file_sha256", "updates", "model_state_sha256")}

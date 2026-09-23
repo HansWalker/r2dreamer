@@ -13,6 +13,7 @@ import torch
 from omegaconf import OmegaConf
 
 import tools
+from buffer import SequenceBuffer
 from dmc_expert.storage import dataset_identity
 from scripts.check_goal_maintenance import source_fixture
 from scripts.check_paper_faithful_duration import write_fixture
@@ -23,6 +24,7 @@ from scripts.paper_faithful_duration_support import TaskBranchReplay
 from scripts.paper_faithful_followup_eval import _equal
 from scripts.train_forecast_online import arguments, configure, load_training, main, snapshot
 from scripts.train_paper_faithful_duration import file_hash
+from training.planning import OnlineSession
 
 
 def online_fixture(family, task):
@@ -164,6 +166,74 @@ class ForecastOnlineTests(unittest.TestCase):
             changed, _, _ = configure(record, banks[record["task"]], override)
             self.assertEqual(changed.training.expert.data_path, str(override.dataset_root / str(config.scenario.dataset)))
 
+    def test_decaying_original_share_preserves_training_and_readout_budgets(self):
+        log = io.StringIO()
+        with redirect_stdout(log):
+            status = main(self.command("retained", "--retain-offline"))
+        self.assertEqual(status, 0, log.getvalue())
+        output = self.root / "retained"
+        report = json.loads((output / "report.json").read_text())
+        self.assertEqual(report["status"], "COMPLETE")
+        for row in report["runs"]:
+            self.assertEqual((row["raw_steps"], row["updates"]), (48, 4))
+            sampling = row["online"]["replay_sampling"]
+            self.assertEqual(sum(sampling["total_samples"].values()), 4 * 4)
+            specification = row["budget"]["native_replay"]
+            self.assertEqual(specification["sampling"], "linear_offline_decay")
+            self.assertEqual(specification["decay_updates"], 4)
+            self.assertEqual(specification["offline_start_fraction"], .5)
+            self.assertEqual(specification["offline_end_fraction"], 0.)
+            self.assertEqual(row["budget"]["schedule_updates"], 12)
+            self.assertFalse(specification["fixed_source_fractions"])
+            self.assertEqual(specification["initial_windows"]["online"], 0)
+            self.assertEqual(sampling["final_windows"]["online"], 18)
+            folder = output / row["task"] / row["model"]
+            entries = [json.loads(line) for line in (folder / "online_metrics.jsonl").read_text().splitlines()]
+            initial_examples = int(torch.load(folder / "step_0.pt", weights_only=False)["model_state_dict"]["state_head.examples"])
+            totals = dict.fromkeys(("expert", "branch", "online"), 0)
+            last_updates = 0
+            for entry in entries:
+                metrics = entry["metrics"]
+                if not metrics:
+                    continue
+                self.assertEqual(sum(metrics[f"native/{name}_sequences"] for name in totals), 4)
+                self.assertEqual(metrics["state/examples"], initial_examples + 4 * entry["updates"])
+                self.assertEqual(metrics["state/expert_examples"], 2)
+                original_rows = {1: 2, 2: 1, 3: 1, 4: 0}[entry["updates"]]
+                self.assertEqual(metrics["native/offline_sequences"], original_rows)
+                self.assertEqual(metrics["native/online_sequences"], 4 - original_rows)
+                self.assertEqual(metrics["replay/sampling_update"], entry["updates"])
+                original_windows = metrics["replay/expert_windows"] + metrics["replay/branch_windows"]
+                current = {name: metrics[f"native/{name}_sequences_total"] for name in totals}
+                self.assertEqual(sum(current.values()) - sum(totals.values()), (entry["updates"] - last_updates) * 4)
+                totals, last_updates = current, entry["updates"]
+                self.assertEqual(metrics["replay/online_fraction"], 1 - original_rows / 4)
+                for name in ("expert", "branch"):
+                    self.assertAlmostEqual(metrics[f"replay/{name}_fraction"],
+                                           original_rows / 4 * metrics[f"replay/{name}_windows"] / original_windows)
+            self.assertEqual(totals["expert"] + totals["branch"], 4)
+            self.assertEqual(totals["online"], 12)
+            final_update = next(entry["metrics"] for entry in reversed(entries) if entry["metrics"])
+            self.assertEqual(final_update["replay/offline_target_fraction"], 0.)
+            self.assertEqual(totals, sampling["total_samples"])
+            saved = torch.load(folder / "latest.pt", weights_only=False)
+            self.assertEqual(saved["native_replay"], specification)
+            data = torch.load(folder / "online_data.pt", weights_only=False)
+            self.assertEqual(data["windows"], sampling["final_windows"])
+            self.assertEqual(data["total_samples"], sampling["total_samples"])
+            self.assertEqual(data["sampling_updates"], 4)
+            self.assertEqual(data["native_replay"], specification)
+            self.assertEqual(row["online_data"]["rows"], 24)
+            self.assertEqual(row["online_data"]["sha256"], file_hash(folder / "online_data.pt"))
+            restored = SequenceBuffer(OmegaConf.create(row["config"]["replay"]))
+            restored.load_state_dict(data["replay"])
+            self.assertEqual(restored.count(), 24)
+            self.assertEqual(sum(len(ep) - 3 for ep in restored.episodes(4)), 18)
+            self.assertEqual(len(row["snapshots"]), 3)
+            self.assertTrue(all(s["evaluation"]["result"]["training_state_preserved"] for s in row["snapshots"]))
+        self.assertIn("Run | retained | status=COMPLETE", log.getvalue())
+        self.assertEqual(self.hashes, {str(p.relative_to(self.source)): file_hash(p) for p in self.source.rglob("*") if p.is_file()})
+
     def test_full_snapshot_leaves_the_next_training_update_unchanged(self):
         args, banks, records = self.prepared("isolation")
         for record in records:
@@ -212,27 +282,44 @@ class ForecastOnlineTests(unittest.TestCase):
         self.assertEqual(result["observed_history_persistence_mse_by_step"], [4., 8.5, 5.])
 
     def test_dry_run_and_invalid_budgets_write_no_outputs(self):
+        defaults = arguments(["--source-run", str(self.source), "--retain-offline"])
+        self.assertTrue(defaults.output.name.startswith("offline_online_decay_"))
         for name, extra, expected in (("dry", ["--dry-run"], 0),
+                                      ("retained_dry", ["--retain-offline", "--dry-run"], 0),
                                       ("fractional", ["--online-steps", "47"], 1),
                                       ("overlap", ["--online-seed", "71000000"], 1),
                                       ("warmup", ["--online-steps", "16"], 1),
-                                      ("missing_expert", ["--dataset-root", str(self.root / "missing")], 1)):
+                                      ("missing_expert", ["--dataset-root", str(self.root / "missing")], 1),
+                                      ("retained_missing", ["--retain-offline", "--dataset-root", str(self.root / "missing")], 1)):
             with redirect_stdout(io.StringIO()):
                 code = main(self.command(name, *extra))
             self.assertEqual(code, expected)
             self.assertFalse((self.root / name).exists())
 
     def test_failure_and_interrupt_keep_partial_results_and_print_run_name(self):
+        collect = OnlineSession.collect
         for name, error, code, status in (("failed", RuntimeError("injected collection error"), 1, "FAIL"),
                                           ("interrupted", KeyboardInterrupt(), 130, "INTERRUPTED")):
+            def collect_then_fail(session):
+                if session.replay.count() >= 6:
+                    raise error
+                return collect(session)
+
             log = io.StringIO()
-            with patch("training.planning.OnlineSession.collect", side_effect=error), redirect_stdout(log):
-                result = main(self.command(name))
+            with patch("training.planning.OnlineSession.collect", autospec=True, side_effect=collect_then_fail), redirect_stdout(log):
+                result = main(self.command(name, "--retain-offline"))
             self.assertEqual(result, code)
             report = json.loads((self.root / name / "report.json").read_text())
             self.assertEqual(report["status"], status)
             self.assertEqual(len(report["runs"][0]["snapshots"]), 1)
             self.assertTrue((self.root / name / "cartpole_balance_sparse/temporal_straightening/latest.pt").is_file())
+            row = report["runs"][0]
+            self.assertEqual(row["raw_steps"], 12)
+            self.assertEqual(row["online_data"]["rows"], 6)
+            data = torch.load(self.root / name / row["task"] / row["model"] / "online_data.pt", weights_only=False)
+            restored = SequenceBuffer(OmegaConf.create(row["config"]["replay"]))
+            restored.load_state_dict(data["replay"])
+            self.assertEqual(restored.count(), 6)
             self.assertIn(f"Run | {name} | status={status}", log.getvalue())
 
 

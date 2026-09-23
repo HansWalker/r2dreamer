@@ -294,17 +294,57 @@ bash scripts/run_forecast_online.sh \
   --source-run runs/paper_faithful_duration_20260923_020814
 ```
 
+To test **a gradual handover from original data to accumulated online experience**, use:
+
+```bash
+bash scripts/run_forecast_online.sh \
+  --source-run runs/paper_faithful_duration_20260923_020814 \
+  --retain-offline
+```
+
+This keeps the same two models, Cartpole task, update counts, planners and
+before/midpoint/after evaluations. Native batches start at **50% original / 50%
+online** after the existing collection warmup. The original share decreases
+linearly with update count, reaching **0% original / 100% online on this run's
+final update**. The taper spans the requested 1,839 updates, even though this
+experiment is a prefix of the longer learning-rate schedule. At 128 sequences
+per batch, first/middle/last update allocations are 64/64, 32/96 and 0/128.
+Counts round to the nearest whole sequence.
+
+Windows are uniform within each pool. The original pool includes expert training
+episodes and the original **training** action branches, weighted by their usable
+window counts. This retains the previous implementation's within-original
+weighting, not the offline fit's earlier fixed 50/50 expert/branch allocation.
+Online experience accumulates throughout the run. Episode boundaries and held-out
+splits remain protected. Logs distinguish pool sizes, scheduled/rounded source
+shares, and cumulative draws. The separate diagnostic readout keeps its previous
+label budget and 50% expert mix, including at the native all-online endpoint.
+Native objectives, architectures and learning-rate schedules are unchanged.
+
+Outputs use `runs/offline_online_decay_<timestamp>/`. The newly collected trajectories
+are also saved as each model's `online_data.pt`, refreshed with checkpoints and
+on handled early exit. Original data files remain read-only. All online data
+from this experiment stays available; capacity is increased if needed. The same
+rough five-hour allowance applies, with additional original-data reads; there
+is no clock enforcement or calibration. The final terminal lines print the run
+name and status. Use `--retain-offline --dry-run` to check source compatibility.
+
+```bash
+MUJOCO_GL=egl python -m scripts.check_offline_online_replay
+MUJOCO_GL=egl python -m scripts.check_forecast_online
+```
+
 Use the same A100 environment and original expert dataset. If that dataset moved,
 add `--dataset-root /path/to/dmc_expert_vision`; its identity must match the source.
-The source's resolved dataset path is used otherwise. No offline retraining is
-performed. The goal-maintenance run is not a checkpoint source: it saved only
+The source's resolved dataset path is used otherwise. No separate offline
+pretraining stage is performed. The goal-maintenance run is not a checkpoint source: it saved only
 evaluations of the duration checkpoints.
 
 Both models use their original goal scores at H25 throughout collection and
 evaluation. Each collects **16,384 raw steps / 8,192 agent transitions** in 16
 environments and performs **1,839 native online updates**. This stops partway
 through the unchanged 80,000-step/10,000-update schedule, including its 1,024
-transition warmup. Native training uses only fresh online replay; the existing
+transition warmup. Without `--retain-offline`, native training uses only fresh online replay; the existing
 detached physical readout retains its configured 50% expert data. No reward
 learner, physical-state controller, new loss or neural module is added.
 
@@ -324,7 +364,8 @@ calibration, budget feasibility gate or clock cutoff. Runtime depends on hardwar
 This is a one-seed diagnostic of online changes, not a completed online benchmark
 or proof of a repair. No settings are selected automatically from its results.
 
-Results go to `runs/forecast_online_<timestamp>/`: report/summary, zero-action
+Results go to `runs/forecast_online_<timestamp>/` (or `runs/offline_online_decay_<timestamp>/`
+with `--retain-offline`): report/summary, zero-action
 control, per-model online metrics, before/midpoint/after traces and plan tensors,
 milestone checkpoints, and periodic `latest.pt` weights/optimizer snapshots.
 These snapshots do not include exact simulator/replay resumption; this runner
