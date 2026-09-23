@@ -1,4 +1,4 @@
-"""Simulator isolation, exact resume, and six-fit CPU integration checks."""
+"""Equal-time allocation, simulator isolation, and exact checkpoint recovery checks."""
 
 import copy
 import io
@@ -26,7 +26,7 @@ from scripts.paper_faithful_support import _digest
 from scripts.train_paper_faithful_check import new_model, update
 from scripts.train_paper_faithful_duration import (
     FORMAT, TASKS, MODELS, BudgetInfeasible, arguments, atomic_save, budget_estimate,
-    branch_replay, build_config, choose_budget, file_hash, main, reuse_bank,
+    branch_replay, build_config, choose_budget, file_hash, fixed_budget, main, reuse_bank,
     restore_checkpoint, runtime_versions, save_checkpoint, source_hashes,
 )
 from training import load_model_family
@@ -104,8 +104,23 @@ class BudgetTests(unittest.TestCase):
                          (.5595676046, 1226.5173989), (.1862940176, 702.2119759),
                          (.6142636819, 2890.9772884), (.1929666520, 1611.6906522)))))
 
-    def test_recorded_failure_and_realistic_retry_budget(self):
+    def test_fixed_defaults_and_explicit_counts_ignore_runtime(self):
         args = arguments([])
+        self.assertEqual(args.budget_mode, "fixed")
+        budget = fixed_budget(args)
+        entries = list(budget["fit_budgets"].values())
+        self.assertEqual([entry["updates"] for entry in entries], [24000, 28000])
+        self.assertEqual(entries[0]["milestones"], [0, 6000, 12000, 18000, 24000])
+        self.assertEqual(entries[1]["milestones"], [0, 7000, 14000, 21000, 28000])
+        self.assertFalse(budget["hard_deadline"])
+        args.minutes = .001
+        self.assertEqual(fixed_budget(args)["fit_budgets"], budget["fit_budgets"])
+        args = arguments(["--budget-mode", "equal-time", "--updates", "2"])
+        self.assertEqual(args.budget_mode, "fixed")
+        self.assertEqual({entry["updates"] for entry in fixed_budget(args)["fit_budgets"].values()}, {2})
+
+    def test_recorded_failure_and_realistic_retry_budget(self):
+        args = arguments(["--budget-mode", "equal-updates"])
         estimate = budget_estimate(args, self.rates, 1844.3905)
         self.assertEqual(estimate["permitted_updates"], 1544)
         self.assertFalse(estimate["fits_target"])
@@ -118,6 +133,40 @@ class BudgetTests(unittest.TestCase):
         args.minutes, args.updates = 1, 8192
         self.assertFalse(budget_estimate(args, self.rates, 0)["fits_target"])
         self.assertEqual(choose_budget(args, self.rates, 0)["common_updates"], 8192)
+
+    def test_equal_time_includes_preparation_and_each_models_evaluations(self):
+        args = arguments(["--budget-mode", "equal-time"])
+        # Deliberately reserve considerably more evaluation time than the old
+        # Cartpole run: four trained milestones and more policy cases now.
+        rates = {"cartpole_balance_sparse/temporal_straightening": {"update_seconds": .214, "overhead_seconds": 2000},
+                 "cartpole_balance_sparse/leworldmodel": {"update_seconds": .189, "overhead_seconds": 1500}}
+        budget = choose_budget(args, rates, 600)
+        self.assertIsNone(budget["common_updates"])
+        self.assertEqual(budget["mode"], "equal-time")
+        counts = []
+        for key, entry in budget["fit_budgets"].items():
+            counts.append(entry["updates"])
+            self.assertEqual(entry["allocation_seconds"], 7200)
+            self.assertEqual(entry["preparation_seconds"], 300)
+            self.assertEqual(len(entry["milestones"]), 5)
+            self.assertGreater(entry["updates"], 16000)
+            reserved = (entry["preparation_seconds"] + 1.2 * entry["estimated_nontraining_seconds"] +
+                        1.15 * entry["estimated_training_seconds"] + 30)
+            self.assertLessEqual(reserved, 7200)
+            self.assertGreater(reserved + 1.15 * rates[key]["update_seconds"], 7200)
+        self.assertGreater(counts[1], counts[0])
+        self.assertLess(budget["estimated_remaining_seconds"] + 600, 14400)
+        rates[next(iter(rates))]["update_seconds"] = 2.
+        with self.assertRaises(BudgetInfeasible):
+            choose_budget(args, rates, 600)
+
+    def test_equal_time_does_not_borrow_from_the_faster_model(self):
+        args = arguments(["--budget-mode", "equal-time"])
+        rates = {"slow": {"update_seconds": .8, "overhead_seconds": 100},
+                 "fast": {"update_seconds": .05, "overhead_seconds": 100}}
+        self.assertFalse(budget_estimate(args, rates, 300)["fits_target"])
+        args.budget_mode = "equal-updates"
+        self.assertTrue(budget_estimate(args, rates, 300)["fits_target"])
 
     def test_saved_estimate_is_read_only_and_needs_no_gpu(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -138,6 +187,13 @@ class BudgetTests(unittest.TestCase):
             self.assertFalse(estimate["including_recorded_preparation"]["fits_target"])
             self.assertEqual(file_hash(path), before)
             self.assertEqual(list(source.iterdir()), [path])
+            with redirect_stdout(io.StringIO()) as captured:
+                self.assertEqual(main(["--estimate-from", folder, "--tasks", "cartpole_balance_sparse",
+                                       "--budget-mode", "equal-time", "--minutes", "240"]), 0)
+            subset = json.loads(captured.getvalue())
+            self.assertEqual(len(subset["selected_fits"]), 2)
+            self.assertEqual(subset["saved_evaluation_settings"]["validation_fractions"], [.5])
+            self.assertEqual({row["allocation_seconds"] for row in subset["future_work_excluding_preparation"]["fit_estimates"].values()}, {7200})
 
 
 class DurationTests(unittest.TestCase):
@@ -211,6 +267,12 @@ class DurationTests(unittest.TestCase):
     def test_default_recipes_and_budget(self):
         args = arguments([])
         self.assertEqual((args.minutes, args.seed), (240, 1))
+        self.assertEqual(args.tasks, ["cartpole_balance_sparse"])
+        self.assertEqual(args.models, list(MODELS))
+        self.assertEqual(args.budget_mode, "fixed")
+        self.assertEqual((args.ts_updates, args.lewm_updates), (24000, 28000))
+        self.assertEqual(args.validation_fractions, [.25, .5, .75])
+        self.assertEqual((args.validation_policy_cases, args.policy_cases), (4, 6))
         for task, h in zip(TASKS, (5, 10, 25), strict=True):
             for name in MODELS:
                 config = build_config(name, task, args)
@@ -221,6 +283,7 @@ class DurationTests(unittest.TestCase):
                     self.assertEqual(config.jepa_model.curvature_mode, "patch")
                     self.assertEqual(config.jepa_model.planner.aggregate_goal_weight, 0.)
         rates = {str(i): {"update_seconds": .17, "overhead_seconds": 100} for i in range(6)}
+        args.budget_mode = "equal-updates"
         budget = choose_budget(args, rates, 300)
         self.assertGreater(budget["common_updates"], 6822)
         self.assertLess(budget["estimated_remaining_seconds"] + 300, 240 * 60)
@@ -228,7 +291,8 @@ class DurationTests(unittest.TestCase):
             choose_budget(args, rates, 240 * 60)
         with redirect_stdout(io.StringIO()), patch("sys.stderr", new=io.StringIO()):
             for bad in (["--minutes", "nan"], ["--sources", "3"], ["--models", "leworldmodel", "leworldmodel"],
-                        ["--resume", "/tmp/run", "--updates", "5"]):
+                        ["--resume", "/tmp/run", "--updates", "5"], ["--validation-fractions", "nan"],
+                        ["--validation-fractions", "1"], ["--validation-fractions", ".5", ".5"]):
                 with self.assertRaises(SystemExit):
                     arguments(bad)
 
@@ -310,6 +374,7 @@ class DurationTests(unittest.TestCase):
         source, source_report = self.bank_source("reused_banks")
         source_hash = file_hash(source / "report.json")
         argv = ["--dataset-root", str(self.root), "--output", str(output), "--device", "cpu", "--profile", "tiny",
+                "--tasks", *TASKS, "--budget-mode", "equal-updates",
                 "--reuse-banks", str(source),
                 "--batch-size", "4", "--sources", "2", "--updates", "2", "--calibration-updates", "1",
                 "--train-anchors", "2", "--validation-anchors", "1", "--test-anchors", "1", "--candidates", "6",
@@ -344,6 +409,7 @@ class DurationTests(unittest.TestCase):
         source, _ = self.bank_source("infeasible_source")
         output = self.root / "infeasible"
         argv = ["--dataset-root", str(self.root), "--output", str(output), "--reuse-banks", str(source),
+                "--budget-mode", "equal-time",
                 "--device", "cpu", "--profile", "tiny", "--tasks", "reacher", "--models", "leworldmodel",
                 "--minutes", "1", "--batch-size", "4", "--sources", "2", "--train-anchors", "2",
                 "--validation-anchors", "1", "--test-anchors", "1", "--candidates", "6",
@@ -364,6 +430,71 @@ class DurationTests(unittest.TestCase):
         self.assertTrue((output / "reacher_bank.pt").is_file())
         self.assertIn("status=BUDGET_INFEASIBLE", captured.getvalue())
         self.assertIn("training", (output / "summary.txt").read_text())
+
+    def test_cartpole_pair_uses_separate_schedules_and_resumes_without_rebudgeting(self):
+        source, _ = self.bank_source("cartpole_source")
+        output = self.root / "cartpole_pair"
+        argv = ["--dataset-root", str(self.root), "--output", str(output), "--reuse-banks", str(source),
+                "--device", "cpu", "--profile", "tiny", "--minutes", ".001", "--ts-updates", "3", "--lewm-updates", "6",
+                "--batch-size", "4", "--sources", "2", "--train-anchors", "2", "--validation-anchors", "1",
+                "--test-anchors", "1", "--candidates", "6", "--forecast-horizons", "1", "3",
+                "--validation-policy-cases", "1", "--validation-policy-steps", "1", "--policy-cases", "1",
+                "--policy-steps", "1", "--save-every", "1", "--skip-reference"]
+
+        def cartpole_config(model, task, args):
+            self.assertEqual(task, "cartpole_balance_sparse")
+            return fixture_config(model, task, args)
+
+        def interrupt(model, dataset, branch, fraction, step, seed):
+            if model.model_family == "leworldmodel" and step == 3:
+                raise KeyboardInterrupt()
+            return update(model, dataset, branch, fraction, step, seed)
+
+        def resumed_update(model, *args):
+            self.assertEqual(model.model_family, "leworldmodel", "Completed TS was trained again")
+            return update(model, *args)
+
+        # Real updates/evaluation exceed the deliberately tiny runtime label.
+        # Neither initial training nor resume may calibrate or apply a time gate.
+        with patch("scripts.train_paper_faithful_duration.build_config", side_effect=cartpole_config), \
+             patch("scripts.train_paper_faithful_duration.collect_bank", side_effect=AssertionError("Bank recollected")), \
+             patch("scripts.train_paper_faithful_duration.calibrate", side_effect=AssertionError("Timing calibration called")), \
+             patch("scripts.train_paper_faithful_duration.budget_estimate", side_effect=AssertionError("Runtime estimated")), \
+             patch("scripts.train_paper_faithful_duration.choose_budget", side_effect=AssertionError("Runtime enforced")), \
+             patch("training.planning.OnlineSession", side_effect=AssertionError("Online training called")), \
+             redirect_stdout(io.StringIO()) as captured:
+            with patch("scripts.train_paper_faithful_duration.update", side_effect=interrupt):
+                self.assertEqual(main(argv), 1)
+            initial = json.loads((output / "report.json").read_text())
+            self.assertEqual(initial["status"], "INTERRUPTED", initial.get("traceback"))
+            ts_path = output / "cartpole_balance_sparse/temporal_straightening/latest.pt"
+            ts_digest = file_hash(ts_path)
+            with patch("scripts.train_paper_faithful_duration.update", side_effect=resumed_update):
+                self.assertEqual(main(["--resume", str(output)]), 0)
+        report = json.loads((output / "report.json").read_text())
+        self.assertEqual(report["budget"], initial["budget"])
+        self.assertEqual(file_hash(ts_path), ts_digest)
+        self.assertEqual(set(report["datasets"]), {"cartpole_balance_sparse"})
+        self.assertEqual(set(report["banks"]), {"cartpole_balance_sparse"})
+        self.assertEqual([row["updates"] for row in report["runs"]], [3, 6])
+        self.assertEqual(report["calibration"], {})
+        self.assertEqual(report["calibration_status"], "SKIPPED_FIXED_UPDATES")
+        self.assertNotIn("budget_estimate", report)
+        self.assertNotIn("Calibrate |", captured.getvalue())
+        self.assertIn("Run | cartpole_pair | status=COMPLETE", captured.getvalue())
+        for row in report["runs"]:
+            planned = report["budget"]["fit_budgets"][row["key"]]
+            self.assertIsNone(planned["allocation_seconds"])
+            self.assertEqual([point["updates"] for point in row["validation"]], planned["milestones"])
+            checkpoint = torch.load(output / row["key"] / "latest.pt", map_location="cpu", weights_only=False)
+            self.assertEqual(checkpoint["total_updates"], planned["updates"])
+            self.assertEqual(checkpoint["training_config"]["training"]["expert"]["updates"], planned["updates"])
+            logs = [json.loads(line)["update"] for line in (output / row["key"] / "metrics.jsonl").read_text().splitlines()]
+            self.assertEqual(logs, list(range(1, planned["updates"] + 1)))
+            if row["model"] == "leworldmodel":
+                scheduler = checkpoint["optimizer_state_dict"]["scheduler"]
+                self.assertEqual(scheduler["last_epoch"], 6)
+                self.assertTrue(all(lr == 0. for lr in scheduler["_last_lr"]))
 
     def test_interrupted_fit_resumes_from_atomic_progress(self):
         output = self.root / "interrupted"

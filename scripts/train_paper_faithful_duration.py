@@ -1,6 +1,6 @@
-"""Runtime-budgeted, six-fit native TS/LeWM learning curves across three DMC tasks.
+"""Fixed-length Cartpole comparison: roughly four hours for native TS and LeWM.
 
-Offline only. Each fit gets the same predeclared update count and its own complete
+Offline only. Each fit gets a predeclared update count and its own complete
 optimizer/sampler/RNG checkpoint. No controller modules or training losses are added.
 """
 
@@ -77,16 +77,20 @@ def arguments(argv=None):
     parser.add_argument("--dataset-root", type=Path, default=Path("data/dmc_expert_vision"))
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", type=Path, help="Resume this runner's existing run directory and fixed budget")
-    parser.add_argument("--reuse-banks", type=Path, help="Copy validated simulator banks into a NEW run; recalibrate and train from scratch")
+    parser.add_argument("--reuse-banks", type=Path, help="Copy validated simulator banks into a NEW run and train from scratch")
     parser.add_argument("--estimate-from", type=Path, help="Read saved timings and print budget estimates only; no GPU, data collection or training")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
+    parser.add_argument("--tasks", nargs="+", choices=TASKS, default=["cartpole_balance_sparse"])
     parser.add_argument("--models", nargs="+", choices=tuple(MODELS), default=list(MODELS))
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--data-seed", type=int, default=60_000_000)
-    parser.add_argument("--minutes", type=float, default=240.)
-    parser.add_argument("--updates", type=int, help="Explicit updates per fit, overriding the time estimate")
+    parser.add_argument("--minutes", type=float, default=240., help="Rough runtime label in fixed mode; target for legacy timing modes")
+    parser.add_argument("--budget-mode", choices=("fixed", "equal-time", "equal-updates"), default="fixed",
+                        help="Fixed counts without calibration (default); legacy timing modes are opt-in")
+    parser.add_argument("--ts-updates", type=int, default=24000, help="TS updates in fixed mode")
+    parser.add_argument("--lewm-updates", type=int, default=28000, help="LeWM updates in fixed mode")
+    parser.add_argument("--updates", type=int, help="Explicit common updates; selects fixed mode and skips timing calibration")
     parser.add_argument("--min-updates", type=int, default=8192)
     parser.add_argument("--max-updates", type=int, default=100000)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -96,9 +100,11 @@ def arguments(argv=None):
     parser.add_argument("--test-anchors", type=int, default=6)
     parser.add_argument("--candidates", type=int, default=12)
     parser.add_argument("--forecast-horizons", nargs="+", type=int, default=[1, 5, 15, 25])
-    parser.add_argument("--validation-policy-cases", type=int, default=2)
+    parser.add_argument("--validation-fractions", nargs="*", type=float, default=[.25, .5, .75],
+                        help="Intermediate update fractions; initialization and final validation are always included")
+    parser.add_argument("--validation-policy-cases", type=int, default=4)
     parser.add_argument("--validation-policy-steps", type=int, default=100)
-    parser.add_argument("--policy-cases", type=int, default=3)
+    parser.add_argument("--policy-cases", type=int, default=6)
     parser.add_argument("--policy-steps", type=int, default=200)
     parser.add_argument("--calibration-updates", type=int, default=12)
     parser.add_argument("--save-every", type=int, default=1000)
@@ -113,10 +119,16 @@ def arguments(argv=None):
         if any(token.split("=")[0] not in allowed for token in raw if token.startswith("--")):
             parser.error("--resume restores saved settings; only --dry-run may accompany it")
     if args.estimate_from:
-        allowed = {"--estimate-from", "--minutes", "--updates", "--min-updates", "--max-updates"}
+        allowed = {"--estimate-from", "--minutes", "--updates", "--min-updates", "--max-updates",
+                   "--tasks", "--models", "--budget-mode"}
         if any(token.split("=")[0] not in allowed for token in raw if token.startswith("--")):
-            parser.error("--estimate-from only accepts runtime/update budget overrides")
+            parser.error("--estimate-from only accepts budget overrides and task/model subsets; saved evaluation settings apply")
+        if "--budget-mode=fixed" in raw or any(raw[i:i + 2] == ["--budget-mode", "fixed"] for i in range(len(raw))):
+            parser.error("--estimate-from inspects legacy timing modes; fixed counts do not need a time estimate")
+    elif args.updates is not None:
+        args.budget_mode = "fixed"
     positive = (args.minutes, args.min_updates, args.max_updates, args.batch_size, args.sources,
+                args.ts_updates, args.lewm_updates,
                 args.train_anchors, args.validation_anchors, args.test_anchors, args.candidates,
                 args.validation_policy_cases, args.validation_policy_steps, args.policy_cases,
                 args.policy_steps, args.calibration_updates, args.save_every, *args.forecast_horizons)
@@ -133,7 +145,29 @@ def arguments(argv=None):
         parser.error("Policy cases must fit inside their corresponding split")
     if max(args.policy_steps, args.validation_policy_steps) + max(25, *args.forecast_horizons) + 63 >= 500:
         parser.error("Trials and diagnostic plans must fit after the longest roll-in")
+    if (any(not math.isfinite(value) or not 0 < value < 1 for value in args.validation_fractions) or
+            len(set(args.validation_fractions)) != len(args.validation_fractions)):
+        parser.error("Validation fractions must be unique and strictly between zero and one")
+    args.validation_fractions.sort()
     return args
+
+
+def fixed_budget(args):
+    """Finish the declared counts regardless of elapsed time; no timing probes."""
+    counts = {"temporal_straightening": args.ts_updates, "leworldmodel": args.lewm_updates}
+    fits = {}
+    for task in args.tasks:
+        for model in args.models:
+            count = args.updates if args.updates is not None else counts[model]
+            fits[f"{task}/{model}"] = {
+                "updates": count, "milestones": milestone_updates(count, args.validation_fractions),
+                "allocation_seconds": None, "adjacent_targets": count * args.batch_size * 3,
+                "expert_target_presentations": count * (args.batch_size // 2) * 3,
+                "intervention_target_presentations": count * (args.batch_size // 2) * 3,
+            }
+    return {"mode": "fixed", "common_updates": args.updates, "fits": len(fits), "fit_budgets": fits,
+            "fixed_before_training": True, "hard_deadline": False, "rough_target_minutes": args.minutes,
+            "scope": "Declared update counts; no timing calibration, runtime feasibility gate or clock cutoff"}
 
 
 def branch_replay(bank, args):
@@ -238,7 +272,12 @@ def summary(report):
             ratios = ", ".join(f"H{k}={v['all'].get('matched_over_persistence')}" for k, v in h.items())
             lines.append(f"  validation @{snapshot['updates']}: return={p.get('return_mean')}; prediction/persistence {ratios}")
     if "budget" in report:
-        lines.append(f"Budget per fit: {report['budget']['common_updates']} updates; target {report['settings']['minutes']} minutes total")
+        label = "rough runtime only; no time limit" if report["budget"]["mode"] == "fixed" else "runtime target"
+        lines.append(f"Budget: {report['budget']['mode']}; {report['settings']['minutes']} minutes total ({label})")
+        for key, entry in report["budget"]["fit_budgets"].items():
+            allocation = entry.get("allocation_seconds")
+            label = f"; {allocation/60:g} minutes including preparation share" if allocation is not None else ""
+            lines.append(f"  {key}: {entry['updates']} updates{label}")
     if "budget_estimate" in report:
         estimate = report["budget_estimate"]
         lines.append(f"Timing at {estimate['required_updates']} updates/fit: "
@@ -247,6 +286,8 @@ def summary(report):
                      f"evaluation/setup {estimate['nontraining_seconds']/60:.1f} min; "
                      f"total {estimate['required_total_seconds']/3600:.2f} h "
                      f"({estimate['required_total_with_margin_seconds']/3600:.2f} h with margin)")
+        if estimate["mode"] == "equal-time":
+            lines.append(f"Minimum target with equal time allocations and margins: {estimate['minimum_target_seconds']/3600:.2f} h")
     lines += ["Validation curves use fixed starts/duration. Final test starts are separate.",
               "One seed per model/task; not a multi-seed confirmation or full paper reproduction.",
               "Snapshots contain full training state. Resume preserves the original budget and learning-rate schedule.",
@@ -292,15 +333,21 @@ def calibrate(config, args, bank):
             test_shape = policy_trial(config, model, profile_cases, 3, args.data_seed + 500_000)
         def policy_seconds(result, steps):
             return result["setup_seconds"] + result["acting_seconds"] / result["steps"] * steps + result["diagnostic_seconds"]
-        # Initialization forecasts, midpoint/final validation, then final held-out test.
+        # All declared validation milestones, then the separate final held-out test.
         forecast = validation["forecast_seconds"]
-        overhead = (setup + forecast * (3 + args.test_anchors / args.validation_anchors) +
-                    2 * policy_seconds(validation["policy"], args.validation_policy_steps) +
+        validation_points = (len(milestone_updates(args.updates, args.validation_fractions)) if args.updates is not None
+                             else len(args.validation_fractions) + 2)
+        overhead = (setup + forecast * (validation_points + args.test_anchors / args.validation_anchors) +
+                    (validation_points - 1) * policy_seconds(validation["policy"], args.validation_policy_steps) +
                     policy_seconds(test_shape, args.policy_steps) + 60.)
         result = {"update_seconds": statistics.median(rates), "overhead_seconds": overhead,
                   "setup_seconds": setup, "forecast_seconds": forecast,
                   "validation_acting_seconds_per_decision": validation["policy"]["acting_seconds"] / 3,
                   "test_acting_seconds_per_decision": test_shape["acting_seconds"] / 3,
+                  "validation_points": validation_points,
+                  "validation_policy_cases": args.validation_policy_cases, "test_policy_cases": args.policy_cases,
+                  "validation_policy_seconds": policy_seconds(validation["policy"], args.validation_policy_steps),
+                  "test_policy_seconds": policy_seconds(test_shape, args.policy_steps),
                   "scope": "Disposable model; validation-only timing; no test scores retained"}
         del model
     if torch.device(args.device).type == "cuda":
@@ -321,12 +368,28 @@ def budget_estimate(args, calibration, elapsed):
     available = args.minutes * 60 - elapsed - 1.2 * overhead - 60
     permitted = max(0, min(args.max_updates, math.floor(available / (1.15 * rate))))
     required = args.updates if args.updates is not None else args.min_updates
-    return {"target_seconds": args.minutes * 60, "preparation_seconds": elapsed,
+    fit_estimates = {}
+    for key, row in calibration.items():
+        allocation = args.minutes * 60 / len(calibration)
+        preparation = elapsed / len(calibration)
+        remaining = allocation - preparation - 1.2 * row["overhead_seconds"] - 60 / len(calibration)
+        fit_permitted = (max(0, min(args.max_updates, math.floor(remaining / (1.15 * row["update_seconds"]))))
+                         if args.budget_mode == "equal-time" else permitted)
+        fit_estimates[key] = {"allocation_seconds": allocation if args.budget_mode == "equal-time" else None,
+                              "preparation_seconds": preparation, "permitted_updates": fit_permitted,
+                              "required_with_margin_seconds": preparation + 1.2 * row["overhead_seconds"] +
+                              1.15 * required * row["update_seconds"] + 60 / len(calibration)}
+    if args.budget_mode == "equal-time":
+        permitted = min(row["permitted_updates"] for row in fit_estimates.values())
+    minimum_target = (max(row["required_with_margin_seconds"] for row in fit_estimates.values()) * len(calibration)
+                      if args.budget_mode == "equal-time" else elapsed + 1.2 * overhead + 1.15 * required * rate + 60)
+    return {"mode": args.budget_mode, "target_seconds": args.minutes * 60, "preparation_seconds": elapsed,
             "nontraining_seconds": overhead, "seconds_per_common_update": rate,
             "permitted_updates": permitted, "required_updates": required,
             "required_training_seconds": required * rate,
             "required_total_seconds": elapsed + overhead + required * rate,
             "required_total_with_margin_seconds": elapsed + 1.2 * overhead + 1.15 * required * rate + 60,
+            "minimum_target_seconds": minimum_target, "fit_estimates": fit_estimates,
             "fits_target": required <= permitted, "explicit_updates_override": args.updates is not None,
             "scope": "Timing estimate, not a convergence threshold or a hard deadline"}
 
@@ -336,17 +399,26 @@ def choose_budget(args, calibration, elapsed):
     count = args.updates if args.updates is not None else estimate["permitted_updates"]
     if args.updates is None and not estimate["fits_target"]:
         raise BudgetInfeasible(
-            f"The {args.minutes:g}-minute target permits {count} updates per fit, below --min-updates {args.min_updates}. "
+            f"The {args.minutes:g}-minute target permits only {count} updates in the limiting fit "
+            f"under {args.budget_mode}, below --min-updates {args.min_updates}. "
             f"At that minimum, measured speeds imply {estimate['required_total_seconds']/3600:.2f} hours total "
-            f"({estimate['required_total_with_margin_seconds']/3600:.2f} with timing margins). "
+            f"(target at least {estimate['minimum_target_seconds']/3600:.2f} hours with timing margins and this allocation). "
             "No comparison fits started. Saved banks can be reused with --reuse-banks in a new run. "
             "Use --estimate-from to inspect saved timings without starting another experiment.")
-    return {"common_updates": count, "milestones": milestone_updates(count, [.5]), "fits": len(calibration),
-            "estimated_remaining_seconds": count * estimate["seconds_per_common_update"] + estimate["nontraining_seconds"],
-            "fixed_before_training": True,
-            "hard_deadline": False, "adjacent_targets_per_fit": count * args.batch_size * 3,
-            "expert_target_presentations_per_fit": count * (args.batch_size // 2) * 3,
-            "intervention_target_presentations_per_fit": count * (args.batch_size // 2) * 3}
+    fits = {}
+    for key, entry in estimate["fit_estimates"].items():
+        updates = args.updates if args.updates is not None else entry["permitted_updates"]
+        fits[key] = {"updates": updates, "milestones": milestone_updates(updates, args.validation_fractions),
+                     "allocation_seconds": entry["allocation_seconds"], "preparation_seconds": entry["preparation_seconds"],
+                     "estimated_training_seconds": updates * calibration[key]["update_seconds"],
+                     "estimated_nontraining_seconds": calibration[key]["overhead_seconds"],
+                     "adjacent_targets": updates * args.batch_size * 3,
+                     "expert_target_presentations": updates * (args.batch_size // 2) * 3,
+                     "intervention_target_presentations": updates * (args.batch_size // 2) * 3}
+    return {"mode": args.budget_mode, "common_updates": count if args.budget_mode == "equal-updates" else None,
+            "fit_budgets": fits, "fits": len(fits), "fixed_before_training": True, "hard_deadline": False,
+            "estimated_remaining_seconds": sum(row["estimated_training_seconds"] + row["estimated_nontraining_seconds"]
+                                               for row in fits.values())}
 
 
 def print_saved_estimate(args, argv):
@@ -355,24 +427,31 @@ def print_saved_estimate(args, argv):
     if previous.get("format") != FORMAT:
         raise ValueError("Expected a duration-run report")
     saved = previous["settings"]
-    expected = {f"{task}/{model}" for task in saved["tasks"] for model in saved["models"]}
-    if set(previous.get("calibration", {})) != expected:
-        raise ValueError("Saved calibration is incomplete; cannot estimate all fits")
     raw = sys.argv[1:] if argv is None else argv
     supplied = {token.split("=")[0] for token in raw if token.startswith("--")}
-    for key in ("minutes", "updates", "min_updates", "max_updates"):
+    for key in ("minutes", "updates", "min_updates", "max_updates", "tasks", "models", "budget_mode"):
         if "--" + key.replace("_", "-") not in supplied:
-            setattr(args, key, saved[key])
+            setattr(args, key, saved.get(key, "equal-updates" if key == "budget_mode" else getattr(args, key)))
+    expected = {f"{task}/{model}" for task in args.tasks for model in args.models}
+    if not expected.issubset(previous.get("calibration", {})):
+        raise ValueError("Saved calibration is incomplete for the requested task/model subset")
+    calibration = {key: previous["calibration"][key] for key in sorted(expected)}
     if args.min_updates > args.max_updates:
         raise ValueError("Minimum updates exceeds maximum after applying saved settings")
     result = {"source_run": previous["run_name"], "read_only": True,
-              "future_work_excluding_preparation": budget_estimate(args, previous["calibration"], 0),
-              "caveat": "Historical device/load timings only. A retry repeats checks and profiling; allow extra time for those. No accuracy results or training weights are reused."}
+              "selected_fits": sorted(expected),
+              "saved_evaluation_settings": {key: saved.get(key, [.5] if key == "validation_fractions" else None) for key in
+                                            ("validation_fractions", "validation_policy_cases", "validation_policy_steps",
+                                             "policy_cases", "policy_steps")},
+              "future_work_excluding_preparation": budget_estimate(args, calibration, 0),
+              "caveat": "Historical timings and SAVED evaluation settings only, not the expanded current defaults. A new run recalibrates its actual evaluations and repeats preparation. This does not select its update budgets."}
     preparation = previous.get("preparation_seconds")
     if preparation is None and not previous.get("runs"):
         preparation = previous.get("seconds")
     if preparation is not None:
-        result["including_recorded_preparation"] = budget_estimate(args, previous["calibration"], preparation)
+        # The old report may not break preparation down by task; retaining ALL of
+        # it is conservative when inspecting a subset, never claim it was timed separately.
+        result["including_recorded_preparation"] = budget_estimate(args, calibration, preparation)
     print(json.dumps(result, indent=2))
     return 0
 
@@ -394,7 +473,8 @@ def trim_log(path, updates):
 def fit(config, args, bank, report, key):
     folder = args.output / key
     folder.mkdir(parents=True, exist_ok=True)
-    count = report["budget"]["common_updates"]
+    fit_budget = report["budget"]["fit_budgets"][key]
+    count, milestones = fit_budget["updates"], fit_budget["milestones"]
     config.training.expert.updates = count
     with load_model_family(config.model_family).build_replay(config) as dataset:
         identity = dataset_identity(dataset.metadata)
@@ -404,6 +484,7 @@ def fit(config, args, bank, report, key):
         branch = branch_replay(bank, args)
         row = {"key": key, "task": str(config.scenario.name), "model": str(config.model_family),
                "seed": args.seed, "status": "RUNNING", "updates": 0, "training_seconds": 0.,
+               "budget": copy.deepcopy(fit_budget),
                "config": OmegaConf.to_container(config, resolve=True), "validation": [], "coverage_fraction": .5}
         checkpoint = folder / "latest.pt"
         if checkpoint.exists():
@@ -439,7 +520,7 @@ def fit(config, args, bank, report, key):
             save()
 
         measured = {snapshot["updates"] for snapshot in row["validation"]}
-        if row["updates"] in report["budget"]["milestones"] and row["updates"] not in measured:
+        if row["updates"] in milestones and row["updates"] not in measured:
             measure(row["updates"])
         progress = Progress(key, count)
         with log_path.open("a", buffering=1) as log:
@@ -452,9 +533,9 @@ def fit(config, args, bank, report, key):
                 row["updates"] = step
                 log.write(json.dumps({"update": step, **values}, allow_nan=False) + "\n")
                 progress.update(step, f"prediction={values['prediction_loss']:.4g}", force=step == count)
-                if step % args.save_every == 0 or step in report["budget"]["milestones"]:
+                if step % args.save_every == 0 or step in milestones:
                     save()  # Safe recovery point even if the following measurement is interrupted.
-                if step in report["budget"]["milestones"]:
+                if step in milestones:
                     measure(step)
         print(f"Final test | {key}", flush=True)
         result = evaluate(config, model, bank["splits"]["test"], steps=args.policy_steps,
@@ -477,7 +558,7 @@ def main(argv=None):
         output = args.resume.absolute()
         report = json.loads((output / "report.json").read_text())
         if report.get("format") != FORMAT or "budget" not in report:
-            raise ValueError("Resume requires this runner's calibrated run; old evaluation snapshots are unsupported")
+            raise ValueError("Resume requires this runner's prepared run with saved update counts; old evaluation snapshots are unsupported")
         if report["implementation_sha256"] != implementation_sha256() or report["source_hashes"] != source_hashes():
             raise ValueError("Code differs from the saved run; refusing to label a changed experiment an exact resume")
         dry_run = args.dry_run
@@ -489,7 +570,14 @@ def main(argv=None):
         args.output = Path("runs") / datetime.now(timezone.utc).strftime("paper_faithful_duration_%Y%m%d_%H%M%S")
     configs = {f"{task}/{model}": build_config(model, task, args) for task in args.tasks for model in args.models}
     if args.dry_run:
+        fixed = fixed_budget(args) if args.budget_mode == "fixed" else None
         print(json.dumps({"target_minutes": args.minutes, "offline_only": True, "seed": args.seed,
+                          "budget_mode": args.budget_mode,
+                          "timing_calibration": fixed is None, "hard_deadline": False,
+                          "fixed_updates": {key: entry["updates"] for key, entry in fixed["fit_budgets"].items()} if fixed else None,
+                          "minutes_per_fit_including_preparation": args.minutes / len(configs) if args.budget_mode == "equal-time" else None,
+                          "validation_fractions": args.validation_fractions,
+                          "validation_policy_cases": args.validation_policy_cases, "test_policy_cases": args.policy_cases,
                           "resume": bool(args.resume), "fits": {key: {
                               "horizon": int(config.jepa_model.planner.horizon), "objective": str(config.jepa_model.planner.objective),
                               "samples": int(config.jepa_model.planner.samples), "iterations": int(config.jepa_model.planner.iterations),
@@ -534,7 +622,7 @@ def main(argv=None):
                     bank = reuse_bank(args.reuse_banks, config, args, report["datasets"][task]["identity"], report["versions"])
                     report["bank_source"] = {"directory": str(args.reuse_banks.absolute()),
                                              "report_sha256": file_hash(args.reuse_banks / "report.json"),
-                                             "scope": "Simulator banks only; fresh weights, checks, controls and timing calibration"}
+                                             "scope": "Simulator banks only; fresh weights, reference checks and controls"}
                 else:
                     spec = bank_spec(config, args)
                     bank = collect_bank(config, **{k: v for k, v in spec.items() if k != "task"},
@@ -555,15 +643,20 @@ def main(argv=None):
                         report["controls"][task][split] = {k: v for k, v in control.items() if k not in ("traces", "probes")}
                 del model
                 persist(args.output, report)
-            for key, config in configs.items():
-                print(f"Calibrate | {key}", flush=True)
-                report["calibration"][key] = calibrate(config, args, banks[str(config.scenario.name)])
+            if args.budget_mode == "fixed":
+                report["preparation_seconds"] = time.monotonic() - started
+                report["budget"] = fixed_budget(args)
+                report["calibration_status"] = "SKIPPED_FIXED_UPDATES"
+            else:
+                for key, config in configs.items():
+                    print(f"Calibrate | {key}", flush=True)
+                    report["calibration"][key] = calibrate(config, args, banks[str(config.scenario.name)])
+                    persist(args.output, report)
+                report["preparation_seconds"] = time.monotonic() - started
+                report["budget_estimate"] = budget_estimate(args, report["calibration"], report["preparation_seconds"])
+                # Keep the breakdown even when a legacy timing target is infeasible.
                 persist(args.output, report)
-            report["preparation_seconds"] = time.monotonic() - started
-            report["budget_estimate"] = budget_estimate(args, report["calibration"], report["preparation_seconds"])
-            # Keep the breakdown even when the target is infeasible.
-            persist(args.output, report)
-            report["budget"] = choose_budget(args, report["calibration"], report["preparation_seconds"])
+                report["budget"] = choose_budget(args, report["calibration"], report["preparation_seconds"])
             persist(args.output, report)
         else:
             for task, entry in report["banks"].items():
@@ -572,10 +665,20 @@ def main(argv=None):
                     raise ValueError("Saved bank file changed")
                 banks[task] = torch.load(path, map_location="cpu", weights_only=False)
                 validate_bank(banks[task])
-        print(f"Budget | {len(configs)} fits x {report['budget']['common_updates']} updates | "
-              f"target {args.minutes:g} minutes total", flush=True)
+        label = "rough runtime; no time cutoff" if args.budget_mode == "fixed" else "runtime target"
+        print(f"Budget | {len(configs)} fits | {args.budget_mode} | {args.minutes:g} minutes total ({label})", flush=True)
+        for key, entry in report["budget"]["fit_budgets"].items():
+            allocation = entry["allocation_seconds"]
+            label = f" | {allocation/60:g} minutes including preparation share" if allocation is not None else ""
+            print(f"Budget | {key} | {entry['updates']} updates{label}", flush=True)
         for key, config in configs.items():
-            fit(config, args, banks[str(config.scenario.name)], report, key)
+            tick = time.monotonic()
+            try:
+                fit(config, args, banks[str(config.scenario.name)], report, key)
+            finally:
+                timings = report.setdefault("fit_seconds", {})
+                timings[key] = timings.get(key, 0.) + time.monotonic() - tick
+                persist(args.output, report)
         report["status"] = "COMPLETE"
     except KeyboardInterrupt:
         report["status"] = "INTERRUPTED"

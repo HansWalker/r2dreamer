@@ -286,64 +286,56 @@ MUJOCO_GL=egl python -m scripts.check_paper_faithful_planning_cost
 MUJOCO_GL=egl python -m scripts.check_paper_faithful_planning
 ```
 
-For the **training-duration comparison across all three tasks**:
-
-```bash
-bash scripts/run_paper_faithful_duration.sh \
-  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision --minutes 510
-```
-
-This runs six fresh fits: native-default TS and LeWM on Cartpole, Reacher, and
-Ball-in-Cup, with one seed each. It preserves the full configured widths, native
-losses, goal-image costs, and scenario horizons (5/10/25). No new controller
-modules or RL objectives are introduced. TS uses the existing patch-curvature
-default, with aggregate planning disabled. Offline batches remain 50% expert and
-50% task-specific intervention windows. The new intervention banks use normal
-resets and prescribed random roll-ins, so this is a new experiment, not a direct
-continuation of the earlier Cartpole fits.
-
-The target covers all six fits, collection, profiling and evaluation.
-The first A100 run (`paper_faithful_duration_20260923_002626`) rejected the original
-four-hour target before fitting: its measured speeds implied 267 minutes of
-training at the 8,192-update minimum, 125 minutes of evaluation/setup and 31
-minutes of preparation. That is about seven hours, or 8.15 hours with timing
-margins. The command above allows 8.5 hours for a fresh run; this is an estimate,
-not a GPU-validated completion time. The CLI default remains 240 minutes and is
-insufficient at those measured speeds.
-Disposable profiling fixes one common update count before fitting, with a minimum
-of 8,192 updates per fit and a maximum of 100,000. Insufficient estimated time
-stops before comparison training instead of shrinking models or shortening their
-budgets. Runtime is approximate, not a hard cutoff. `--updates N` explicitly
-overrides the runtime calculation. `--dry-run` prints the six resolved setups
-without collecting data, training, or creating an output directory.
-
-Inspect the saved timing estimate without using a GPU or starting another run:
-
-```bash
-bash scripts/run_paper_faithful_duration.sh \
-  --estimate-from runs/paper_faithful_duration_20260923_002626 --minutes 480
-```
-
-To retry using the already collected banks, allow approximately eight hours:
+For the **four-hour Cartpole training-duration comparison**:
 
 ```bash
 bash scripts/run_paper_faithful_duration.sh \
   --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision \
-  --reuse-banks runs/paper_faithful_duration_20260923_002626 --minutes 480
+  --reuse-banks runs/paper_faithful_duration_20260923_002626 \
+  --ts-updates 24000 --lewm-updates 28000
 ```
 
-This creates a new run and copies the banks after validating collection settings,
-file/content hashes, dataset identity, simulator versions and collection code.
-It reruns checks, zero-action controls and profiling, then trains fresh models.
-The source run stays unchanged. This is data reuse, not checkpoint resume.
-Changed budget/reporting code is allowed; changed bank-producing helpers are not.
-Insufficient targets now report `BUDGET_INFEASIBLE`, retain their timing breakdown,
-and still exit nonzero. The minimum is never silently reduced.
+This runs **two fresh fits on Cartpole balance sparse**, one TS and one LeWM,
+with one training seed each. The defaults are **24,000 TS updates and 28,000 LeWM
+updates**. Both finish those counts; there is **no timing calibration, runtime
+feasibility check or clock cutoff**. Earlier Cartpole measurements put training
+at about 86 and 88 minutes. Allowing roughly another hour across the pair for
+setup and evaluation gives an approximate four-hour run, about two hours each.
+The expanded evaluation has not been timed on the GPU, so this is a rough estimate.
+The model widths, native losses, goal-image costs, five-decision
+planning horizon and original solver settings remain unchanged. TS retains patch
+curvature with no aggregate planning cost. There are no new controller modules or
+RL objectives; this experiment remains offline-only.
 
-Validation forecasts are measured at initialization, halfway, and completion;
-validation control uses the same two starts for 100 decisions at the two trained
-milestones. Final tests use three separate starts for 200 decisions. These small
-samples and one seed are a duration screen, not a task-success confirmation.
+Each learning-rate schedule uses its declared count from the start, and resume
+keeps it unchanged. `--updates N` selects a common fixed count and also skips
+calibration. `--minutes` is only a descriptive runtime label in the default fixed
+mode; changing it does not shorten or extend training. `--dry-run` prints the two
+resolved setups, fixed counts and evaluation settings without starting the run.
+
+The bank-source command above reuses the failed run's Cartpole data; Reacher and
+Ball-in-Cup data are not needed. Use `local/reports/...` if using the downloaded
+copy, or omit `--reuse-banks` to collect Cartpole data afresh. Bank settings,
+file/content hashes, dataset identity, simulator versions and collection code are
+validated before reuse. The new run stores its own copy and source provenance;
+the source stays unchanged. Reference checks and zero-action controls run again.
+Offline batches remain 50% expert and 50% intervention
+windows from the prescribed reset/random-roll-in bank.
+
+Forecasts are measured at initialization and at 25%, 50%, 75% and 100% of each
+model's update budget. Native control uses the same **four validation starts** for
+100 decisions at all four trained milestones. The final test uses **all six
+separate test starts**, 200 decisions each. Zero-action controls use matching starts
+and durations. Both models see the same evaluation cases; update counts and elapsed
+times are recorded. This compares roughly similar time, not identical updates or
+strictly equal runtime.
+These samples and one seed do not establish robustness across training seeds.
+
+The earlier six-fit attempt stopped at its runtime-budget check. The current
+fixed-count test does not use that check. Legacy timing modes remain available
+only when explicitly selected with `--budget-mode equal-time` or `equal-updates`;
+neither is used by the command above.
+
 Simulator snapshots preserve episode targets, integration state, task RNG and
 episode counters. Saved plan probes include the full chosen action sequence,
 predicted/actual native costs, real future images, and diagnostic alternatives.
