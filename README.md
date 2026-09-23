@@ -286,11 +286,11 @@ MUJOCO_GL=egl python -m scripts.check_paper_faithful_planning_cost
 MUJOCO_GL=egl python -m scripts.check_paper_faithful_planning
 ```
 
-For the **four-hour training-duration comparison across all three tasks**:
+For the **training-duration comparison across all three tasks**:
 
 ```bash
 bash scripts/run_paper_faithful_duration.sh \
-  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision --minutes 240
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision --minutes 510
 ```
 
 This runs six fresh fits: native-default TS and LeWM on Cartpole, Reacher, and
@@ -302,13 +302,43 @@ default, with aggregate planning disabled. Offline batches remain 50% expert and
 resets and prescribed random roll-ins, so this is a new experiment, not a direct
 continuation of the earlier Cartpole fits.
 
-The four-hour target covers all six fits, collection, profiling and evaluation.
+The target covers all six fits, collection, profiling and evaluation.
+The first A100 run (`paper_faithful_duration_20260923_002626`) rejected the original
+four-hour target before fitting: its measured speeds implied 267 minutes of
+training at the 8,192-update minimum, 125 minutes of evaluation/setup and 31
+minutes of preparation. That is about seven hours, or 8.15 hours with timing
+margins. The command above allows 8.5 hours for a fresh run; this is an estimate,
+not a GPU-validated completion time. The CLI default remains 240 minutes and is
+insufficient at those measured speeds.
 Disposable profiling fixes one common update count before fitting, with a minimum
 of 8,192 updates per fit and a maximum of 100,000. Insufficient estimated time
 stops before comparison training instead of shrinking models or shortening their
 budgets. Runtime is approximate, not a hard cutoff. `--updates N` explicitly
 overrides the runtime calculation. `--dry-run` prints the six resolved setups
 without collecting data, training, or creating an output directory.
+
+Inspect the saved timing estimate without using a GPU or starting another run:
+
+```bash
+bash scripts/run_paper_faithful_duration.sh \
+  --estimate-from runs/paper_faithful_duration_20260923_002626 --minutes 480
+```
+
+To retry using the already collected banks, allow approximately eight hours:
+
+```bash
+bash scripts/run_paper_faithful_duration.sh \
+  --dataset-root /home/ubuntu/DMC/data/dmc_expert_vision \
+  --reuse-banks runs/paper_faithful_duration_20260923_002626 --minutes 480
+```
+
+This creates a new run and copies the banks after validating collection settings,
+file/content hashes, dataset identity, simulator versions and collection code.
+It reruns checks, zero-action controls and profiling, then trains fresh models.
+The source run stays unchanged. This is data reuse, not checkpoint resume.
+Changed budget/reporting code is allowed; changed bank-producing helpers are not.
+Insufficient targets now report `BUDGET_INFEASIBLE`, retain their timing breakdown,
+and still exit nonzero. The minimum is never silently reduced.
 
 Validation forecasts are measured at initialization, halfway, and completion;
 validation control uses the same two starts for 100 decisions at the two trained

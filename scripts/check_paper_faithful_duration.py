@@ -25,10 +25,12 @@ from scripts.paper_faithful_followup_eval import _equal
 from scripts.paper_faithful_support import _digest
 from scripts.train_paper_faithful_check import new_model, update
 from scripts.train_paper_faithful_duration import (
-    TASKS, MODELS, arguments, branch_replay, build_config, choose_budget, main,
-    restore_checkpoint, save_checkpoint,
+    FORMAT, TASKS, MODELS, BudgetInfeasible, arguments, atomic_save, budget_estimate,
+    branch_replay, build_config, choose_budget, file_hash, main, reuse_bank,
+    restore_checkpoint, runtime_versions, save_checkpoint, source_hashes,
 )
 from training import load_model_family
+from training.protocol import implementation_sha256
 
 
 def fixture_config(model, task, args):
@@ -93,6 +95,51 @@ def write_fixture(config):
         env.close()
 
 
+class BudgetTests(unittest.TestCase):
+    # A100 timings from paper_faithful_duration_20260923_002626. No ignored report
+    # dependency: this regression must also run in a clean checkout.
+    rates = dict(zip((f"{task}/{model}" for task in TASKS for model in MODELS),
+                     ({"update_seconds": rate, "overhead_seconds": overhead} for rate, overhead in (
+                         (.2139900905, 659.4088323), (.1886162360, 427.5546154),
+                         (.5595676046, 1226.5173989), (.1862940176, 702.2119759),
+                         (.6142636819, 2890.9772884), (.1929666520, 1611.6906522)))))
+
+    def test_recorded_failure_and_realistic_retry_budget(self):
+        args = arguments([])
+        estimate = budget_estimate(args, self.rates, 1844.3905)
+        self.assertEqual(estimate["permitted_updates"], 1544)
+        self.assertFalse(estimate["fits_target"])
+        self.assertAlmostEqual(estimate["required_total_seconds"] / 3600, 7.05106, places=4)
+        self.assertAlmostEqual(estimate["required_total_with_margin_seconds"] / 3600, 8.15296, places=4)
+        with self.assertRaisesRegex(BudgetInfeasible, "240-minute target.*1544"):
+            choose_budget(args, self.rates, 1844.3905)
+        args.minutes = 480
+        self.assertGreaterEqual(choose_budget(args, self.rates, 300)["common_updates"], 8192)
+        args.minutes, args.updates = 1, 8192
+        self.assertFalse(budget_estimate(args, self.rates, 0)["fits_target"])
+        self.assertEqual(choose_budget(args, self.rates, 0)["common_updates"], 8192)
+
+    def test_saved_estimate_is_read_only_and_needs_no_gpu(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder)
+            report = {"format": FORMAT, "run_name": "failed_fixture", "settings": {
+                "tasks": list(TASKS), "models": list(MODELS), "minutes": 240, "updates": None,
+                "min_updates": 8192, "max_updates": 100000},
+                "calibration": self.rates, "runs": [], "seconds": 1844.3905}
+            path = source / "report.json"
+            path.write_text(json.dumps(report))
+            before = file_hash(path)
+            with patch("torch.cuda.is_available", side_effect=AssertionError("GPU inspected")), \
+                 patch("scripts.train_paper_faithful_duration.build_config", side_effect=AssertionError("Model configured")), \
+                 redirect_stdout(io.StringIO()) as captured:
+                self.assertEqual(main(["--estimate-from", folder, "--minutes", "480"]), 0)
+            estimate = json.loads(captured.getvalue())
+            self.assertTrue(estimate["future_work_excluding_preparation"]["fits_target"])
+            self.assertFalse(estimate["including_recorded_preparation"]["fits_target"])
+            self.assertEqual(file_hash(path), before)
+            self.assertEqual(list(source.iterdir()), [path])
+
+
 class DurationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -106,11 +153,60 @@ class DurationTests(unittest.TestCase):
             config = fixture_config("leworldmodel", task, cls.args)
             write_fixture(config)
             cls.banks[task] = collect_bank(config, counts={"train": 2, "validation": 1, "test": 1},
-                                          candidates=6, horizon=3, seed=80_000_000 + TASKS.index(task) * 100)
+                                          candidates=6, horizon=3, seed=cls.args.data_seed + TASKS.index(task) * 1_000_000)
 
     @classmethod
     def tearDownClass(cls):
         cls.temporary.cleanup()
+
+    def bank_source(self, name):
+        folder = self.root / name
+        folder.mkdir()
+        report = {"format": FORMAT, "implementation_sha256": implementation_sha256(),
+                  "source_hashes": source_hashes(), "versions": runtime_versions("cpu"),
+                  "datasets": {}, "banks": {}}
+        report["source_hashes"]["train_paper_faithful_duration.py"] = "older-budget-runner"
+        for task, bank in self.banks.items():
+            path = folder / f"{task}_bank.pt"
+            atomic_save(bank, path)
+            report["banks"][task] = {"file": path.name, "file_sha256": file_hash(path),
+                                      "sha256": bank["sha256"], "metadata": bank["metadata"]}
+            config = fixture_config("leworldmodel", task, self.args)
+            metadata = json.loads((Path(config.training.expert.data_path) / "metadata.json").read_text())
+            report["datasets"][task] = {"identity": dataset_identity(metadata)}
+        (folder / "report.json").write_text(json.dumps(report))
+        return folder, report
+
+    def test_reused_banks_reject_incompatible_or_changed_data(self):
+        folder, report = self.bank_source("bank_checks")
+        args = copy.copy(self.args)
+        args.train_anchors, args.validation_anchors, args.test_anchors = 2, 1, 1
+        args.candidates, args.forecast_horizons = 6, [1, 3]
+        task = "reacher"
+        config = fixture_config("leworldmodel", task, args)
+        identity = report["datasets"][task]["identity"]
+        def reuse():
+            return reuse_bank(folder, config, args, identity, runtime_versions("cpu"))
+        self.assertEqual(reuse()["sha256"], self.banks[task]["sha256"])
+        args.data_seed += 1
+        with self.assertRaisesRegex(ValueError, "collection settings"):
+            reuse()
+        args.data_seed -= 1
+        path = folder / "report.json"
+        for key, value, message in (
+            ("implementation_sha256", "changed", "implementation"),
+            ("versions", {**report["versions"], "mujoco": "changed"}, "runtime"),
+            ("datasets", {}, "identity"),
+            ("source_hashes", {}, "helper"),
+        ):
+            path.write_text(json.dumps({**report, key: value}))
+            with self.assertRaisesRegex(ValueError, message):
+                reuse()
+        path.write_text(json.dumps(report))
+        with (folder / report["banks"][task]["file"]).open("ab") as handle:
+            handle.write(b"damaged")
+        with self.assertRaisesRegex(ValueError, "file changed"):
+            reuse()
 
     def test_default_recipes_and_budget(self):
         args = arguments([])
@@ -211,12 +307,16 @@ class DurationTests(unittest.TestCase):
 
     def test_six_fits_and_completed_resume(self):
         output = self.root / "run"
+        source, source_report = self.bank_source("reused_banks")
+        source_hash = file_hash(source / "report.json")
         argv = ["--dataset-root", str(self.root), "--output", str(output), "--device", "cpu", "--profile", "tiny",
+                "--reuse-banks", str(source),
                 "--batch-size", "4", "--sources", "2", "--updates", "2", "--calibration-updates", "1",
                 "--train-anchors", "2", "--validation-anchors", "1", "--test-anchors", "1", "--candidates", "6",
                 "--forecast-horizons", "1", "3", "--validation-policy-cases", "1", "--validation-policy-steps", "2",
                 "--policy-cases", "1", "--policy-steps", "3", "--save-every", "1", "--skip-reference"]
         with patch("scripts.train_paper_faithful_duration.build_config", side_effect=fixture_config), \
+             patch("scripts.train_paper_faithful_duration.collect_bank", side_effect=AssertionError("Recollected saved banks")), \
              patch("training.planning.OnlineSession", side_effect=AssertionError("Online training called")), \
              redirect_stdout(io.StringIO()) as captured:
             code = main(argv)
@@ -225,6 +325,10 @@ class DurationTests(unittest.TestCase):
             self.assertIn("Run | run | status=COMPLETE", captured.getvalue())
             self.assertEqual(len(report["runs"]), 6)
             self.assertEqual(report["online_updates"], 0)
+            self.assertEqual(file_hash(source / "report.json"), source_hash)
+            self.assertEqual(report["bank_source"]["report_sha256"], source_hash)
+            for task in TASKS:
+                self.assertEqual(report["banks"][task]["sha256"], source_report["banks"][task]["sha256"])
             for row in report["runs"]:
                 self.assertEqual([v["updates"] for v in row["validation"]], [0, 1, 2])
                 self.assertEqual(row["test"]["result"]["policy"]["case_ids"], report["controls"][row["task"]]["test"]["case_ids"])
@@ -235,6 +339,31 @@ class DurationTests(unittest.TestCase):
             with patch("scripts.train_paper_faithful_duration.update", side_effect=AssertionError("Completed fit retrained")), \
                  patch("scripts.train_paper_faithful_duration.evaluate", side_effect=AssertionError("Completed fit reevaluated")):
                 self.assertEqual(main(["--resume", str(output)]), 0)
+
+    def test_budget_rejection_keeps_preparation_and_explains_status(self):
+        source, _ = self.bank_source("infeasible_source")
+        output = self.root / "infeasible"
+        argv = ["--dataset-root", str(self.root), "--output", str(output), "--reuse-banks", str(source),
+                "--device", "cpu", "--profile", "tiny", "--tasks", "reacher", "--models", "leworldmodel",
+                "--minutes", "1", "--batch-size", "4", "--sources", "2", "--train-anchors", "2",
+                "--validation-anchors", "1", "--test-anchors", "1", "--candidates", "6",
+                "--forecast-horizons", "1", "3", "--validation-policy-cases", "1", "--validation-policy-steps", "1",
+                "--policy-cases", "1", "--policy-steps", "1", "--skip-reference"]
+        with patch("scripts.train_paper_faithful_duration.build_config", side_effect=fixture_config), \
+             patch("scripts.train_paper_faithful_duration.calibrate", return_value={"update_seconds": .2, "overhead_seconds": 100}), \
+             patch("scripts.train_paper_faithful_duration.fit", side_effect=AssertionError("Started an infeasible fit")), \
+             redirect_stdout(io.StringIO()) as captured:
+            self.assertEqual(main(argv), 1)
+        report = json.loads((output / "report.json").read_text())
+        self.assertEqual(report["status"], "BUDGET_INFEASIBLE")
+        self.assertEqual(report["runs"], [])
+        self.assertIn("budget_estimate", report)
+        self.assertIn("calibration", report)
+        self.assertNotIn("budget", report)
+        self.assertNotIn("traceback", report)
+        self.assertTrue((output / "reacher_bank.pt").is_file())
+        self.assertIn("status=BUDGET_INFEASIBLE", captured.getvalue())
+        self.assertIn("training", (output / "summary.txt").read_text())
 
     def test_interrupted_fit_resumes_from_atomic_progress(self):
         output = self.root / "interrupted"

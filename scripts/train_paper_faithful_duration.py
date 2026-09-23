@@ -1,4 +1,4 @@
-"""Four-hour, six-fit native TS/LeWM learning curves across all three DMC tasks.
+"""Runtime-budgeted, six-fit native TS/LeWM learning curves across three DMC tasks.
 
 Offline only. Each fit gets the same predeclared update count and its own complete
 optimizer/sampler/RNG checkpoint. No controller modules or training losses are added.
@@ -77,6 +77,8 @@ def arguments(argv=None):
     parser.add_argument("--dataset-root", type=Path, default=Path("data/dmc_expert_vision"))
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", type=Path, help="Resume this runner's existing run directory and fixed budget")
+    parser.add_argument("--reuse-banks", type=Path, help="Copy validated simulator banks into a NEW run; recalibrate and train from scratch")
+    parser.add_argument("--estimate-from", type=Path, help="Read saved timings and print budget estimates only; no GPU, data collection or training")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
@@ -110,6 +112,10 @@ def arguments(argv=None):
         allowed = {"--resume", "--dry-run"}
         if any(token.split("=")[0] not in allowed for token in raw if token.startswith("--")):
             parser.error("--resume restores saved settings; only --dry-run may accompany it")
+    if args.estimate_from:
+        allowed = {"--estimate-from", "--minutes", "--updates", "--min-updates", "--max-updates"}
+        if any(token.split("=")[0] not in allowed for token in raw if token.startswith("--")):
+            parser.error("--estimate-from only accepts runtime/update budget overrides")
     positive = (args.minutes, args.min_updates, args.max_updates, args.batch_size, args.sources,
                 args.train_anchors, args.validation_anchors, args.test_anchors, args.candidates,
                 args.validation_policy_cases, args.validation_policy_steps, args.policy_cases,
@@ -133,6 +139,43 @@ def arguments(argv=None):
 def branch_replay(bank, args):
     return TaskBranchReplay(bank, batch_size=args.batch_size // 2, sequence_length=4,
                             episodes_per_batch=args.sources // 2, seed=args.seed + 12345)
+
+
+def bank_spec(config, args):
+    task = str(config.scenario.name)
+    return {"task": task, "counts": {"train": args.train_anchors, "validation": args.validation_anchors,
+                                     "test": args.test_anchors},
+            "candidates": args.candidates,
+            "horizon": max(*args.forecast_horizons, int(config.jepa_model.planner.horizon)),
+            "seed": args.data_seed + TASKS.index(task) * 1_000_000}
+
+
+def reuse_bank(source, config, args, identity, versions):
+    """Only data reuse, never weight/timing reuse or a changed-code exact resume."""
+    previous = json.loads((source / "report.json").read_text())
+    if previous.get("format") != FORMAT or previous.get("implementation_sha256") != implementation_sha256():
+        raise ValueError("Bank source has a different format or model/environment implementation")
+    # This runner may change its budget/reporting; all bank-producing helpers must match.
+    for name, digest in source_hashes().items():
+        if name != Path(__file__).name and previous.get("source_hashes", {}).get(name) != digest:
+            raise ValueError(f"Bank source helper changed: {name}")
+    for name in ("dm-control", "mujoco", "numpy"):
+        if previous.get("versions", {}).get(name) != versions[name]:
+            raise ValueError(f"Bank source simulator runtime changed: {name}")
+    task = str(config.scenario.name)
+    if previous.get("datasets", {}).get(task, {}).get("identity") != identity:
+        raise ValueError(f"Bank source expert dataset identity changed: {task}")
+    entry = previous["banks"][task]
+    if any(entry["metadata"].get(key) != value for key, value in bank_spec(config, args).items()):
+        raise ValueError(f"Bank source collection settings differ: {task}")
+    path = source / entry["file"]
+    if file_hash(path) != entry["file_sha256"]:
+        raise ValueError(f"Bank source file changed: {task}")
+    bank = torch.load(path, map_location="cpu", weights_only=False)
+    validate_bank(bank)
+    if bank["sha256"] != entry["sha256"] or bank["metadata"] != entry["metadata"]:
+        raise ValueError(f"Bank source manifest mismatch: {task}")
+    return bank
 
 
 def save_checkpoint(path, model, dataset, branch, row, total_updates, identity, bank_hash):
@@ -196,6 +239,14 @@ def summary(report):
             lines.append(f"  validation @{snapshot['updates']}: return={p.get('return_mean')}; prediction/persistence {ratios}")
     if "budget" in report:
         lines.append(f"Budget per fit: {report['budget']['common_updates']} updates; target {report['settings']['minutes']} minutes total")
+    if "budget_estimate" in report:
+        estimate = report["budget_estimate"]
+        lines.append(f"Timing at {estimate['required_updates']} updates/fit: "
+                     f"preparation {estimate['preparation_seconds']/60:.1f} min; "
+                     f"training {estimate['required_training_seconds']/60:.1f} min; "
+                     f"evaluation/setup {estimate['nontraining_seconds']/60:.1f} min; "
+                     f"total {estimate['required_total_seconds']/3600:.2f} h "
+                     f"({estimate['required_total_with_margin_seconds']/3600:.2f} h with margin)")
     lines += ["Validation curves use fixed starts/duration. Final test starts are separate.",
               "One seed per model/task; not a multi-seed confirmation or full paper reproduction.",
               "Snapshots contain full training state. Resume preserves the original budget and learning-rate schedule.",
@@ -257,19 +308,73 @@ def calibrate(config, args, bank):
     return result
 
 
-def choose_budget(args, calibration, elapsed):
+class BudgetInfeasible(ValueError):
+    """An expected scheduling outcome, not a model/training exception."""
+
+
+def budget_estimate(args, calibration, elapsed):
+    if not calibration or any(not math.isfinite(row[key]) or row[key] <= 0
+                              for row in calibration.values() for key in ("overhead_seconds", "update_seconds")):
+        raise ValueError("Budget estimation requires finite positive timings for every fit")
     overhead = sum(row["overhead_seconds"] for row in calibration.values())
     rate = sum(row["update_seconds"] for row in calibration.values())
     available = args.minutes * 60 - elapsed - 1.2 * overhead - 60
-    count = args.updates if args.updates is not None else min(args.max_updates, math.floor(available / (1.15 * rate)))
-    if count < (1 if args.updates is not None else args.min_updates):
-        raise ValueError(f"Four-hour estimate permits {count} updates per fit, below --min-updates {args.min_updates}. "
-                         "No comparison fits started. Increase --minutes or explicitly lower the minimum; models are not shrunk.")
+    permitted = max(0, min(args.max_updates, math.floor(available / (1.15 * rate))))
+    required = args.updates if args.updates is not None else args.min_updates
+    return {"target_seconds": args.minutes * 60, "preparation_seconds": elapsed,
+            "nontraining_seconds": overhead, "seconds_per_common_update": rate,
+            "permitted_updates": permitted, "required_updates": required,
+            "required_training_seconds": required * rate,
+            "required_total_seconds": elapsed + overhead + required * rate,
+            "required_total_with_margin_seconds": elapsed + 1.2 * overhead + 1.15 * required * rate + 60,
+            "fits_target": required <= permitted, "explicit_updates_override": args.updates is not None,
+            "scope": "Timing estimate, not a convergence threshold or a hard deadline"}
+
+
+def choose_budget(args, calibration, elapsed):
+    estimate = budget_estimate(args, calibration, elapsed)
+    count = args.updates if args.updates is not None else estimate["permitted_updates"]
+    if args.updates is None and not estimate["fits_target"]:
+        raise BudgetInfeasible(
+            f"The {args.minutes:g}-minute target permits {count} updates per fit, below --min-updates {args.min_updates}. "
+            f"At that minimum, measured speeds imply {estimate['required_total_seconds']/3600:.2f} hours total "
+            f"({estimate['required_total_with_margin_seconds']/3600:.2f} with timing margins). "
+            "No comparison fits started. Saved banks can be reused with --reuse-banks in a new run. "
+            "Use --estimate-from to inspect saved timings without starting another experiment.")
     return {"common_updates": count, "milestones": milestone_updates(count, [.5]), "fits": len(calibration),
-            "estimated_remaining_seconds": count * rate + overhead, "fixed_before_training": True,
+            "estimated_remaining_seconds": count * estimate["seconds_per_common_update"] + estimate["nontraining_seconds"],
+            "fixed_before_training": True,
             "hard_deadline": False, "adjacent_targets_per_fit": count * args.batch_size * 3,
             "expert_target_presentations_per_fit": count * (args.batch_size // 2) * 3,
             "intervention_target_presentations_per_fit": count * (args.batch_size // 2) * 3}
+
+
+def print_saved_estimate(args, argv):
+    """Inspect historical measurements without initializing models or a CUDA device."""
+    previous = json.loads((args.estimate_from / "report.json").read_text())
+    if previous.get("format") != FORMAT:
+        raise ValueError("Expected a duration-run report")
+    saved = previous["settings"]
+    expected = {f"{task}/{model}" for task in saved["tasks"] for model in saved["models"]}
+    if set(previous.get("calibration", {})) != expected:
+        raise ValueError("Saved calibration is incomplete; cannot estimate all fits")
+    raw = sys.argv[1:] if argv is None else argv
+    supplied = {token.split("=")[0] for token in raw if token.startswith("--")}
+    for key in ("minutes", "updates", "min_updates", "max_updates"):
+        if "--" + key.replace("_", "-") not in supplied:
+            setattr(args, key, saved[key])
+    if args.min_updates > args.max_updates:
+        raise ValueError("Minimum updates exceeds maximum after applying saved settings")
+    result = {"source_run": previous["run_name"], "read_only": True,
+              "future_work_excluding_preparation": budget_estimate(args, previous["calibration"], 0),
+              "caveat": "Historical device/load timings only. A retry repeats checks and profiling; allow extra time for those. No accuracy results or training weights are reused."}
+    preparation = previous.get("preparation_seconds")
+    if preparation is None and not previous.get("runs"):
+        preparation = previous.get("seconds")
+    if preparation is not None:
+        result["including_recorded_preparation"] = budget_estimate(args, previous["calibration"], preparation)
+    print(json.dumps(result, indent=2))
+    return 0
 
 
 def trim_log(path, updates):
@@ -365,6 +470,8 @@ def fit(config, args, bank, report, key):
 
 def main(argv=None):
     args = arguments(argv)
+    if args.estimate_from:
+        return print_saved_estimate(args, argv)
     report = None
     if args.resume:
         output = args.resume.absolute()
@@ -389,7 +496,7 @@ def main(argv=None):
                               "data": str(config.training.expert.data_path)} for key, config in configs.items()}}, indent=2))
         return 0
     if torch.device(args.device).type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA is unavailable; run the four-hour command on the GPU host")
+        raise RuntimeError("CUDA is unavailable; run training on the GPU host (or use --estimate-from for saved timings)")
     started = time.monotonic()
     if report is None:
         args.output.mkdir(parents=True, exist_ok=False)
@@ -422,11 +529,16 @@ def main(argv=None):
                 raise RuntimeError("Pinned upstream component parity failed")
             for task in args.tasks:
                 config = configs[f"{task}/{args.models[0]}"]
-                bank = collect_bank(config, counts={"train": args.train_anchors, "validation": args.validation_anchors,
-                                                    "test": args.test_anchors}, candidates=args.candidates,
-                                    horizon=max(*args.forecast_horizons, int(config.jepa_model.planner.horizon)),
-                                    seed=args.data_seed + TASKS.index(task) * 1_000_000,
-                                    progress=lambda n, total: print(f"Bank | {task} {n}/{total}", flush=True))
+                if args.reuse_banks:
+                    print(f"Reuse bank | {task} | {args.reuse_banks}", flush=True)
+                    bank = reuse_bank(args.reuse_banks, config, args, report["datasets"][task]["identity"], report["versions"])
+                    report["bank_source"] = {"directory": str(args.reuse_banks.absolute()),
+                                             "report_sha256": file_hash(args.reuse_banks / "report.json"),
+                                             "scope": "Simulator banks only; fresh weights, checks, controls and timing calibration"}
+                else:
+                    spec = bank_spec(config, args)
+                    bank = collect_bank(config, **{k: v for k, v in spec.items() if k != "task"},
+                                        progress=lambda n, total: print(f"Bank | {task} {n}/{total}", flush=True))
                 path = args.output / f"{task}_bank.pt"
                 atomic_save(bank, path)
                 report["banks"][task] = {"file": path.name, "file_sha256": file_hash(path), "sha256": bank["sha256"],
@@ -447,7 +559,11 @@ def main(argv=None):
                 print(f"Calibrate | {key}", flush=True)
                 report["calibration"][key] = calibrate(config, args, banks[str(config.scenario.name)])
                 persist(args.output, report)
-            report["budget"] = choose_budget(args, report["calibration"], time.monotonic() - started)
+            report["preparation_seconds"] = time.monotonic() - started
+            report["budget_estimate"] = budget_estimate(args, report["calibration"], report["preparation_seconds"])
+            # Keep the breakdown even when the target is infeasible.
+            persist(args.output, report)
+            report["budget"] = choose_budget(args, report["calibration"], report["preparation_seconds"])
             persist(args.output, report)
         else:
             for task, entry in report["banks"].items():
@@ -464,6 +580,9 @@ def main(argv=None):
     except KeyboardInterrupt:
         report["status"] = "INTERRUPTED"
         report["error"] = "Interrupted; resume restores the last atomic checkpoint without extending its schedule"
+    except BudgetInfeasible as error:
+        report["status"] = "BUDGET_INFEASIBLE"
+        report["error"] = str(error)
     except Exception as error:
         report["status"] = "FAILED"
         report["error"] = f"{type(error).__name__}: {error}"
