@@ -62,6 +62,8 @@ def adapt_offline(config, model, family, record, bank, folder, row, persist_repo
                      "source_checkpoint_sha256": record["file_sha256"],
                      "dataset_identity": record["dataset_identity"], "bank_sha256": record["bank_sha256"],
                      "updates": row["offline_updates"], "settings": settings, "rng_state": tools.get_rng_state(),
+                     "goal_ranking_sampler": (model._goal_ranking_source.state_dict()
+                                              if model._goal_ranking_source is not None else None),
                      "counters": {name: getattr(model, name) for name in ("_gradient_updates", "_clipped_updates")}}, path)
         row["offline_checkpoint"] = {"file": path.name, "updates": row["offline_updates"], "sha256": file_hash(path)}
         persist_report()

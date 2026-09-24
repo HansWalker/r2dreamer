@@ -294,6 +294,57 @@ bash scripts/run_forecast_online.sh \
   --source-run runs/paper_faithful_duration_20260923_020814
 ```
 
+To test the **small supervised goal-ranking penalty**, use:
+
+```bash
+bash scripts/run_goal_ranking.sh \
+  --source-run runs/paper_faithful_duration_20260923_020814
+```
+
+This runs **only TS and LeWM on Cartpole**, with the previous multi-step
+experiment's 2,000 additional offline updates, 1,839 online updates, H5 training,
+H25 planners, and original-data taper. Allow roughly **five A100 hours total**;
+there is no calibration or time cutoff. The historical comparison is
+`multistep_offline_online_20260924_033419`, using the same original offline
+checkpoints and seeds. This command does not rerun that control arm.
+
+Each update adds 32 good/bad image pairs from the existing bank's **TRAIN**
+anchors. Both images share the same episode goal. A good frame satisfies the
+task's physical goal bounds; a bad frame is at least twice the allowed distance
+away. The penalty is `0.1 * mean(max(0, 0.1 + d_good - d_bad))`, where distances
+are the existing squared image-feature distances expressed per coordinate.
+It updates the encoder/projector in their planning-time BN/dropout mode while
+preserving their running statistics. The goal is freshly encoded and detached.
+Predictor training, inference inputs, model parameters, and the planner are
+otherwise unchanged. Weight zero preserves the native update path.
+
+This is an explicit supervised extension of the papers' objectives, with extra
+physical-label access, not an exact paper reproduction. It uses no reward/value
+learner or additional neural head. The small TRAIN comparison source remains
+available even after the main replay's original-data share reaches zero.
+Existing branch banks already contain the correct goal image, including
+episode-specific Reacher targets; native replay need not store another image.
+The same geometry rule supports Cartpole, Reacher, and Ball-in-Cup, but this
+launch uses Cartpole only. A bank without eligible training or validation pairs
+fails preflight rather than silently omitting the penalty.
+
+Reports under `runs/goal_ranking_offline_online_<UTC timestamp>/` include fixed
+512-pair validation ordering/margin scores, pair-image hashes, existing forecast
+and control diagnostics, training loss components, supervision inventory, and
+sampler state in checkpoints. The pairs are drawn from held-out anchors and are
+not 512 independent trials. Both models use identical sampled pairs. The run
+name, status, and path print at exit. Lower ranking loss alone is not a repair:
+inspect held-out ordering, forecast accuracy, return, and maintenance together.
+
+Append `--dry-run` to validate saved artifacts and label availability without
+training or expert-data access. If the expert data moved, append
+`--dataset-root /path/to/dmc_expert_vision`. Keep the original duration source;
+the later online reports are comparison results, not accepted checkpoint sources.
+
+```bash
+MUJOCO_GL=egl python -m scripts.check_goal_ranking
+```
+
 To test **a gradual handover from original data to accumulated online experience**, use:
 
 ```bash

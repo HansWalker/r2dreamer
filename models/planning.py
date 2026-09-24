@@ -7,6 +7,7 @@ from torch import nn
 
 from models.shared.physical_state import STATE_KEY, PhysicalStateHead, readout_mode
 from models.shared.latent_goal import latent_goal_cost
+from models.shared.goal_ranking import goal_ranking_loss
 from models.shared.utils import parse_model_io
 
 
@@ -38,6 +39,13 @@ class LatentPlanner(nn.Module):
         self.grad_clip = float(settings.optim.grad_clip)
         self.planner = settings.planner
         self.use_amp = bool(settings.use_amp)
+        ranking = settings.get("goal_ranking", {})
+        self.goal_ranking_weight = float(ranking.get("weight", 0.))
+        self.goal_ranking_margin = float(ranking.get("margin", .1))
+        if (not math.isfinite(self.goal_ranking_weight) or self.goal_ranking_weight < 0
+                or not math.isfinite(self.goal_ranking_margin) or self.goal_ranking_margin <= 0):
+            raise ValueError("Goal ranking requires a finite nonnegative weight and positive margin")
+        self._goal_ranking_source = None
         goal = settings.goal
         self.goal_geometry = str(goal.geometry)
         if self.goal_geometry not in {"radial", "box"}:
@@ -150,13 +158,26 @@ class LatentPlanner(nn.Module):
             optimizer.load_state_dict(state[name])
         self.state_head.load_optimizer_state_dict(state["state_head"])
 
-    def update(self, batch, *, readout_batch=None):
+    def update(self, batch, *, readout_batch=None, goal_batch=None):
+        if self.goal_ranking_weight:
+            if goal_batch is None:
+                if self._goal_ranking_source is None:
+                    raise ValueError("Enabled goal ranking requires a TRAIN pair source or explicit goal_batch")
+                if self._goal_ranking_source.split != "train":
+                    raise ValueError("Only TRAIN goal pairs may enter model updates")
+                goal_batch = self._goal_ranking_source.sample()
         obs, action, *_ = batch
         obs = {key: value.to(self.device, non_blocking=True) for key, value in obs.items()}
         labels = obs.pop(STATE_KEY)
         action = action.to(self.device, non_blocking=True)
         latent = self.encode(obs)
         loss, metrics = self.representation_loss(obs, latent, action)
+        if self.goal_ranking_weight:
+            ranking_loss, ranking_metrics = goal_ranking_loss(self, goal_batch, self.goal_ranking_margin)
+            metrics.update(ranking_metrics)
+            metrics["native_loss"] = loss.detach()
+            metrics["goal_ranking/weighted_loss"] = self.goal_ranking_weight * ranking_loss.detach()
+            loss = loss + self.goal_ranking_weight * ranking_loss
         for optimizer in self.optimizers.values():
             optimizer.zero_grad(set_to_none=True)
         loss.backward()

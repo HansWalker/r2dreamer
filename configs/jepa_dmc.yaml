@@ -19,6 +19,9 @@ jepa_model:
   use_amp: true  # BF16 neural compute; FP32 losses, physical readout, and action optimization.
   history_size: 3
   training_horizon: 1  # Native one-step objective; >1 opts into recursive training.
+  goal_ranking:
+    weight: 0.0  # Opt-in simulator-supervised extension; requires an explicit TRAIN pair source.
+    margin: 0.1  # Per-coordinate squared feature distance, for either model.
   goal:
     source: physical_render_v1
     observation: ${scenario.goal_observation}

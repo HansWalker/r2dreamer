@@ -1,7 +1,8 @@
 """Two-model forecast diagnosis and native online learning, roughly five A100 hours.
 
 Continue completed TS/LeWM duration checkpoints. Fixed work counts and original
-goal scores. Recursive training/offline adaptation are explicit opt-ins.
+goal scores. Recursive training, offline adaptation and supervised goal ranking
+are explicit opt-ins.
 """
 
 import argparse
@@ -24,6 +25,7 @@ from scripts.evaluate_goal_maintenance import branch_maintenance, load_source, v
 from scripts.forecast_online_support import forecast_errors, probe_cases, summarize_probes
 from scripts.offline_online_replay import OfflineOnlineSession, original_replay, replay_settings
 from scripts.multistep_training_support import ONE_STEP_SOURCE_IMPLEMENTATION, adapt_offline, offline_settings
+from scripts.goal_ranking_support import GoalPairBank, evaluate_goal_pairs
 from scripts.paper_faithful_duration_support import evaluate, policy_trial
 from scripts.paper_faithful_followup_eval import preserve_training_state
 from scripts.paper_faithful_support import _digest, score_branches
@@ -51,6 +53,11 @@ def arguments(argv=None):
     parser.add_argument("--offline-updates", type=int, default=0,
                         help="Additional offline adaptation updates per model, before online collection")
     parser.add_argument("--offline-seed", type=int, default=73_000_000)
+    parser.add_argument("--goal-ranking-weight", type=float, default=0.,
+                        help="Opt-in supervised goal-ordering loss; 0 preserves native training")
+    parser.add_argument("--goal-ranking-margin", type=float, default=.1)
+    parser.add_argument("--goal-ranking-pairs", type=int, default=32, help="Extra TRAIN good/bad pairs per update")
+    parser.add_argument("--goal-ranking-seed", type=int, default=74_000_000)
     parser.add_argument("--dataset-root", type=Path, help="Override the source's expert-data path; identity must still match")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--task", choices=TASKS, default="cartpole_balance_sparse")
@@ -66,13 +73,16 @@ def arguments(argv=None):
     args = parser.parse_args(argv)
     if (min(args.online_steps, args.save_every, args.policy_cases, args.policy_steps) < 1
             or min(args.online_seed, args.policy_seed, args.offline_seed, args.offline_updates) < 0
-            or args.training_horizon < 1
+            or args.training_horizon < 1 or args.goal_ranking_pairs < 1 or args.goal_ranking_seed < 0
+            or not math.isfinite(args.goal_ranking_weight) or args.goal_ranking_weight < 0
+            or not math.isfinite(args.goal_ranking_margin) or args.goal_ranking_margin <= 0
             or any(not math.isfinite(v) or v <= 0 for v in (args.lookahead_seconds, args.hold_seconds))
             or args.hold_seconds > args.lookahead_seconds):
         parser.error("Use positive finite budgets/windows, hold <= lookahead and nonnegative seeds")
     args.models, args.tasks = list(MODELS), [args.task]
     if args.output is None:
-        prefix = ("multistep_offline_online" if args.training_horizon > 1
+        prefix = ("goal_ranking_offline_online" if args.goal_ranking_weight
+                  else "multistep_offline_online" if args.training_horizon > 1
                   else "offline_online_decay" if args.retain_offline else "forecast_online")
         args.output = Path("runs") / datetime.now(timezone.utc).strftime(prefix + "_%Y%m%d_%H%M%S")
     return args
@@ -90,6 +100,7 @@ def configure(record, bank, args):
     config.replay.seed = args.online_seed + 1_000_003
     with open_dict(config.jepa_model):
         config.jepa_model.training_horizon = args.training_horizon
+        config.jepa_model.goal_ranking = {"weight": args.goal_ranking_weight, "margin": args.goal_ranking_margin}
     config.replay.sequence_length = int(config.jepa_model.history_size) + args.training_horizon
     if args.offline_updates:
         config.training.expert.updates = args.offline_updates
@@ -119,7 +130,17 @@ def configure(record, bank, args):
         config.replay.max_size = max(int(config.replay.max_size), args.online_steps // int(config.env.action_repeat))
         replay = replay_settings(config, bank, record["row"].get("coverage_fraction"),
                                  online_update_target(config, args.online_steps))
+    ranking = None
+    if args.goal_ranking_weight:
+        ranking = GoalPairBank(bank["splits"]["train"], config, pairs=args.goal_ranking_pairs,
+                              seed=args.goal_ranking_seed).metadata()
+        # Validate usable held-out comparisons before any costly model work.
+        validation = GoalPairBank(bank["splits"]["validation"], config, split="validation")
+        ranking.update(weight=args.goal_ranking_weight, margin=args.goal_ranking_margin,
+                       validation=validation.metadata(), diagnostic_pairs=512,
+                       diagnostic_seed=75_000_000, architecture_changed=False, supervision="simulator goal geometry")
     return config, condition, {
+        "goal_ranking": ranking,
         "training_horizon": args.training_horizon, "sequence_length": int(config.replay.sequence_length),
         "prediction_objective": "native_one_step" if args.training_horizon == 1 else "mean_recursive_future_mse",
         "offline_adaptation": (offline_settings(config, record, bank, args.offline_updates, args.offline_seed)
@@ -161,13 +182,19 @@ def persist(output, report):
 
 
 def summary(report):
-    lines = ["Forecast diagnosis + native online learning | two models | fixed work budget",
+    label = ("supervised goal-ranking training" if report.get("settings", {}).get("goal_ranking_weight")
+             else "native online learning")
+    lines = [f"Forecast diagnosis + {label} | two models | fixed work budget",
              f"Run: {report['run_name']} | Status: {report['status']}"]
     for row in report["runs"]:
         lines.append(f"{row['model']} | {row['status']} | raw steps={row.get('raw_steps', 0)} | online updates={row.get('updates', 0)}")
         if row.get("budget", {}).get("training_horizon", 1) > 1:
             lines.append(f"  Recursive training: H{row['budget']['training_horizon']} | "
                          f"additional offline updates={row.get('offline_updates', 0)}")
+        ranking = row.get("budget", {}).get("goal_ranking")
+        if ranking:
+            lines.append(f"  Supervised goal ranking: weight={ranking['weight']}, margin={ranking['margin']}, "
+                         f"{ranking['pairs_per_update']} TRAIN pairs/update throughout both phases.")
         replay = row.get("budget", {}).get("native_replay", {})
         if replay.get("mode") == "offline_plus_online":
             lines.append(f"  Replay: original share {replay['offline_start_fraction']:.0%} -> 0% linearly "
@@ -179,11 +206,18 @@ def summary(report):
             lines.append(f"  {snapshot['name']} @online {snapshot['updates']}, offline {snapshot.get('offline_updates', 0)}: "
                          f"return {p['return_mean']:.2f}/{p['maximum_return']} | "
                          f"maintained {round(p['maintenance_rate'] * p['cases'])}/{p['cases']}")
+            ranking = snapshot["evaluation"]["result"].get("goal_ranking")
+            if ranking:
+                lines.append(f"    Held-out real-image goal ordering: "
+                             f"{ranking['goal_ranking/pair_accuracy']:.1%}; "
+                             f"margin satisfied={ranking['goal_ranking/margin_satisfied']:.1%}")
     lines += ["Same validation starts, goal scores, horizon and search settings before/midpoint/after.",
               "Fixed initial plans never enter training. Real-history predictions are diagnostics only.",
               ("Native batches hand over from 50/50 original/online to all online; the diagnostic readout mixture is unchanged."
                if report.get("settings", {}).get("retain_offline") else "Online replay starts empty."),
               "The saved full learning-rate/update schedule is not compressed.",
+              ("Goal ranking is an explicit supervised extension; TRAIN anchor comparisons remain available as native replay tapers."
+               if report.get("settings", {}).get("goal_ranking_weight") else "No goal-ranking supervision."),
               "Raw latent MSE changes can reflect encoder changes: inspect normalized errors, feature spread and real control too.",
               "COMPLETE means execution, not a repair. One seed per model; this is a prefix, not the full online protocol.",
               "Checkpoints save weights and optimizers for inspection; exact simulator/replay resume is not supported."]
@@ -203,6 +237,8 @@ def save_weights(folder, model, config, record, row, *, milestone=False):
                "native_replay": row.get("budget", {}).get("native_replay", {}),
                "rng_state": tools.get_rng_state(),
                "counters": {name: getattr(model, name) for name in ("_gradient_updates", "_clipped_updates")}}
+    if model._goal_ranking_source is not None:
+        payload["goal_ranking_sampler"] = model._goal_ranking_source.state_dict()
     path = folder / "latest.pt"
     atomic_save(payload, path)
     row["latest_checkpoint"] = {"file": path.name, "raw_steps": row["raw_steps"], "updates": row["updates"], "sha256": file_hash(path)}
@@ -256,6 +292,9 @@ def snapshot(config, model, bank, condition, args, folder, row, name, fixed):
         result["current_plan_diagnostics"]["forecast_errors"] = (
             result["fixed_initial_plans"]["forecast_errors"] if name == "before"
             else forecast_errors(model, probe_cases(probes)))
+        if model.goal_ranking_weight:
+            source = GoalPairBank(cases, config, split="validation")
+            result["goal_ranking"] = evaluate_goal_pairs(model, source)
         digest = tensor_digest(model.state_dict())
     item = {"name": name, "raw_steps": row["raw_steps"], "updates": row["updates"],
             "offline_updates": row.get("offline_updates", 0),
@@ -268,6 +307,9 @@ def snapshot(config, model, bank, condition, args, folder, row, name, fixed):
 def train_one(config, model, family, record, bank, condition, args, output, report, row):
     folder = output / record["task"] / record["model"]
     folder.mkdir(parents=True)
+    if model.goal_ranking_weight:
+        model._goal_ranking_source = GoalPairBank(bank["splits"]["train"], config,
+                                                pairs=args.goal_ranking_pairs, seed=args.goal_ranking_seed)
     fixed = snapshot(config, model, bank, condition, args, folder, row, "before", None)
     persist(output, report)
     if args.offline_updates:
@@ -367,7 +409,7 @@ def main(argv=None):
     created, started = False, time.monotonic()
     try:
         torch.set_num_threads(1)
-        compatible = (ONE_STEP_SOURCE_IMPLEMENTATION,) if args.training_horizon > 1 else ()
+        compatible = (ONE_STEP_SOURCE_IMPLEMENTATION,) if args.training_horizon > 1 or args.goal_ranking_weight else ()
         source, banks, records = load_source(args, compatible_implementations=compatible)
         prepared = [(record, *configure(record, banks[record["task"]], args)) for record in records]
         report["budgets"] = [{"model": record["model"], **budget} for record, _, _, budget in prepared]
@@ -397,13 +439,14 @@ def main(argv=None):
         report.update(status="RUNNING", versions=versions, implementation_sha256=implementation_sha256(),
                       source_implementation_sha256=source["implementation_sha256"],
                       training_adaptation={"horizon": args.training_horizon, "offline_updates": args.offline_updates,
-                                           "paper_objective_changed": args.training_horizon > 1,
-                                           "auxiliary_losses": "original formulas and weights over real encoded frames",
+                                           "paper_objective_changed": args.training_horizon > 1 or bool(args.goal_ranking_weight),
+                                           "goal_ranking_weight": args.goal_ranking_weight,
+                                           "auxiliary_losses": "native regularizers unchanged; optional supervised goal ranking recorded in budgets",
                                            "architecture_and_planning_changed": False},
                       source_report_sha256=file_hash(args.source_run / "report.json"), source_helpers=source_hashes(),
                       runner_hashes={name: file_hash(Path(__file__).with_name(name)) for name in
                                      ("train_forecast_online.py", "forecast_online_support.py", "offline_online_replay.py",
-                                      "multistep_training_support.py", "evaluate_goal_maintenance.py")},
+                                      "multistep_training_support.py", "goal_ranking_support.py", "evaluate_goal_maintenance.py")},
                       source_banks=source["banks"],
                       checkpoints=[{key: str(record[key]) if isinstance(record[key], Path) else record[key]
                                     for key in ("task", "model", "path", "file_sha256", "updates", "model_state_sha256")}
