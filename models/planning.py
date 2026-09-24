@@ -31,7 +31,10 @@ class LatentPlanner(nn.Module):
             raise ValueError("Latent planning requires continuous actions.")
         self.action_dim = math.prod(action_shape)
         self.history_size = int(settings.history_size)
-        self.sequence_length = self.history_size + 1
+        self.training_horizon = int(settings.get("training_horizon", 1))
+        if self.training_horizon < 1:
+            raise ValueError("training_horizon must be positive.")
+        self.sequence_length = self.history_size + self.training_horizon
         self.grad_clip = float(settings.optim.grad_clip)
         self.planner = settings.planner
         self.use_amp = bool(settings.use_amp)
@@ -113,6 +116,28 @@ class LatentPlanner(nn.Module):
 
     def representation_loss(self, obs, latent, action):
         raise NotImplementedError
+
+    def training_predictions(self, latent, action):
+        """Keep the native one-step recipe, or train the planner's recursive rollout.
+
+        Future real encodings supply targets only. Predictions remain attached so
+        later errors teach earlier steps, with the same fixed context as planning.
+        """
+        if latent.shape[1] != self.sequence_length or action.shape[1] != self.sequence_length - 1:
+            raise ValueError("Training windows must contain history_size + training_horizon frames and aligned actions.")
+        if self.training_horizon == 1:
+            return self.predict(latent[:, :-1], action), latent[:, 1:]
+        history = self.history_size
+        prediction = self.rollout(
+            latent[:, :history], action[:, :history - 1], action[:, None, history - 1:],
+        )[:, 0]
+        return prediction, latent[:, history:]
+
+    def prediction_metrics(self, prediction, target):
+        if self.training_horizon == 1:
+            return {}
+        errors = (prediction.detach() - target.detach()).square().flatten(2).mean(dim=(0, 2))
+        return {f"prediction_step_{step + 1}": value for step, value in enumerate(errors)}
 
     def optimizer_state_dict(self):
         return {

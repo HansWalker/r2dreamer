@@ -18,6 +18,7 @@ replay:
 jepa_model:
   use_amp: true  # BF16 neural compute; FP32 losses, physical readout, and action optimization.
   history_size: 3
+  training_horizon: 1  # Native one-step objective; >1 opts into recursive training.
   goal:
     source: physical_render_v1
     observation: ${scenario.goal_observation}

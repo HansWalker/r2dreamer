@@ -272,8 +272,8 @@ class TemporalStraightening(LatentPlanner):
         self.decoder_weight = float(settings.decoder.weight)
 
     def representation_loss(self, obs, latent, action):
-        prediction = self.predict(latent[:, :-1], action)
-        target = latent[:, 1:].detach()
+        prediction, target = self.training_predictions(latent, action)
+        target = target.detach()
         prediction_loss = F.mse_loss(prediction, target)
         curvature_features = latent
         if self.curvature_mode == "agg":
@@ -293,6 +293,7 @@ class TemporalStraightening(LatentPlanner):
             "prediction_loss": prediction_loss,
             "visual_prediction_loss": prediction_loss,
             "curvature_loss": curvature_loss,
+            **self.prediction_metrics(prediction, target),
         }
         if self.curvature_mode == "agg":
             with torch.no_grad():
@@ -307,7 +308,8 @@ class TemporalStraightening(LatentPlanner):
                 reconstruction = self.decoder(latent.detach()).float()
                 predicted_reconstruction = self.decoder(prediction.detach()).float()
             reconstruction_loss = F.mse_loss(reconstruction, image)
-            predicted_reconstruction_loss = F.mse_loss(predicted_reconstruction, image[:, 1:])
+            target_start = 1 if self.training_horizon == 1 else self.history_size
+            predicted_reconstruction_loss = F.mse_loss(predicted_reconstruction, image[:, target_start:])
             decoder_loss = reconstruction_loss + predicted_reconstruction_loss
             loss = loss + self.decoder_weight * decoder_loss
             metrics.update(

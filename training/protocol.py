@@ -324,8 +324,9 @@ def validate_training_recipe(config):
             "physical-head cost settings are obsolete; latent planners use embedding distance",
         )
         require(
-            sequence_length == int(config.jepa_model.history_size) + 1,
-            "planning-model replay length must equal history_size + 1",
+            int(config.jepa_model.get("training_horizon", 1)) >= 1
+            and sequence_length == int(config.jepa_model.history_size) + int(config.jepa_model.get("training_horizon", 1)),
+            "planning-model replay length must equal history_size + positive training_horizon",
         )
         planner = config.jepa_model.planner
         objective = str(planner.get("objective", "last"))

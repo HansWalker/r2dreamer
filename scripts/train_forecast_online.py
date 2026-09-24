@@ -1,7 +1,7 @@
 """Two-model forecast diagnosis and native online learning, roughly five A100 hours.
 
-Continue completed TS/LeWM duration checkpoints. Fixed work counts, original
-goal scores, no new training loss, no timing calibration or clock cutoff.
+Continue completed TS/LeWM duration checkpoints. Fixed work counts and original
+goal scores. Recursive training/offline adaptation are explicit opt-ins.
 """
 
 import argparse
@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 import tools
 from dmc_expert.storage import dataset_identity
@@ -23,6 +23,7 @@ from scripts.diagnose_fresh_readout import tensor_digest
 from scripts.evaluate_goal_maintenance import branch_maintenance, load_source, validate_payload
 from scripts.forecast_online_support import forecast_errors, probe_cases, summarize_probes
 from scripts.offline_online_replay import OfflineOnlineSession, original_replay, replay_settings
+from scripts.multistep_training_support import ONE_STEP_SOURCE_IMPLEMENTATION, adapt_offline, offline_settings
 from scripts.paper_faithful_duration_support import evaluate, policy_trial
 from scripts.paper_faithful_followup_eval import preserve_training_state
 from scripts.paper_faithful_support import _digest, score_branches
@@ -45,6 +46,11 @@ def arguments(argv=None):
     parser.add_argument("--output", type=Path)
     parser.add_argument("--retain-offline", action="store_true",
                         help="Start native updates with 50%% original data, linearly tapering to 0%% by this run's final update")
+    parser.add_argument("--training-horizon", type=int, default=1,
+                        help="1 keeps native next-step training; >1 learns recursive predictions in BOTH phases (try 5)")
+    parser.add_argument("--offline-updates", type=int, default=0,
+                        help="Additional offline adaptation updates per model, before online collection")
+    parser.add_argument("--offline-seed", type=int, default=73_000_000)
     parser.add_argument("--dataset-root", type=Path, help="Override the source's expert-data path; identity must still match")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--task", choices=TASKS, default="cartpole_balance_sparse")
@@ -59,13 +65,15 @@ def arguments(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="Validate source and print budgets; no expert-data access, model execution, collection or outputs")
     args = parser.parse_args(argv)
     if (min(args.online_steps, args.save_every, args.policy_cases, args.policy_steps) < 1
-            or min(args.online_seed, args.policy_seed) < 0
+            or min(args.online_seed, args.policy_seed, args.offline_seed, args.offline_updates) < 0
+            or args.training_horizon < 1
             or any(not math.isfinite(v) or v <= 0 for v in (args.lookahead_seconds, args.hold_seconds))
             or args.hold_seconds > args.lookahead_seconds):
         parser.error("Use positive finite budgets/windows, hold <= lookahead and nonnegative seeds")
     args.models, args.tasks = list(MODELS), [args.task]
     if args.output is None:
-        prefix = "offline_online_decay" if args.retain_offline else "forecast_online"
+        prefix = ("multistep_offline_online" if args.training_horizon > 1
+                  else "offline_online_decay" if args.retain_offline else "forecast_online")
         args.output = Path("runs") / datetime.now(timezone.utc).strftime(prefix + "_%Y%m%d_%H%M%S")
     return args
 
@@ -80,6 +88,11 @@ def configure(record, bank, args):
         config.training.expert.data_path = str(args.dataset_root.absolute() / str(config.scenario.dataset))
     config.env.seed = args.online_seed
     config.replay.seed = args.online_seed + 1_000_003
+    with open_dict(config.jepa_model):
+        config.jepa_model.training_horizon = args.training_horizon
+    config.replay.sequence_length = int(config.jepa_model.history_size) + args.training_horizon
+    if args.offline_updates:
+        config.training.expert.updates = args.offline_updates
     # This is the native_long condition from the frozen comparison, not tail.
     condition = next((row for row in record["conditions"] if row["name"] == "native_long"), record["conditions"][0])
     config.jepa_model.planner.horizon = condition["horizon"]
@@ -107,6 +120,10 @@ def configure(record, bank, args):
         replay = replay_settings(config, bank, record["row"].get("coverage_fraction"),
                                  online_update_target(config, args.online_steps))
     return config, condition, {
+        "training_horizon": args.training_horizon, "sequence_length": int(config.replay.sequence_length),
+        "prediction_objective": "native_one_step" if args.training_horizon == 1 else "mean_recursive_future_mse",
+        "offline_adaptation": (offline_settings(config, record, bank, args.offline_updates, args.offline_seed)
+                               if args.offline_updates else None),
         "raw_steps": args.online_steps, "agent_transitions": args.online_steps // int(config.env.action_repeat),
         "vector_collections": args.online_steps // quantum, "environments": int(config.env.env_num),
         "midpoint_raw_steps": midpoint, "midpoint_updates": online_update_target(config, midpoint),
@@ -148,6 +165,9 @@ def summary(report):
              f"Run: {report['run_name']} | Status: {report['status']}"]
     for row in report["runs"]:
         lines.append(f"{row['model']} | {row['status']} | raw steps={row.get('raw_steps', 0)} | online updates={row.get('updates', 0)}")
+        if row.get("budget", {}).get("training_horizon", 1) > 1:
+            lines.append(f"  Recursive training: H{row['budget']['training_horizon']} | "
+                         f"additional offline updates={row.get('offline_updates', 0)}")
         replay = row.get("budget", {}).get("native_replay", {})
         if replay.get("mode") == "offline_plus_online":
             lines.append(f"  Replay: original share {replay['offline_start_fraction']:.0%} -> 0% linearly "
@@ -156,7 +176,8 @@ def summary(report):
                 lines.append(f"  Total native samples: {row['online']['replay_sampling']['total_samples']}")
         for snapshot in row["snapshots"]:
             p = snapshot["evaluation"]["summary"]["policy"]
-            lines.append(f"  {snapshot['name']} @{snapshot['updates']}: return {p['return_mean']:.2f}/{p['maximum_return']} | "
+            lines.append(f"  {snapshot['name']} @online {snapshot['updates']}, offline {snapshot.get('offline_updates', 0)}: "
+                         f"return {p['return_mean']:.2f}/{p['maximum_return']} | "
                          f"maintained {round(p['maintenance_rate'] * p['cases'])}/{p['cases']}")
     lines += ["Same validation starts, goal scores, horizon and search settings before/midpoint/after.",
               "Fixed initial plans never enter training. Real-history predictions are diagnostics only.",
@@ -178,6 +199,7 @@ def save_weights(folder, model, config, record, row, *, milestone=False):
                "resume_supported": False, "phase": "online", "training_config": OmegaConf.to_container(config, resolve=True),
                "source_checkpoint_sha256": record["file_sha256"], "dataset_identity": record["dataset_identity"],
                "bank_sha256": record["bank_sha256"], "env_steps": row["raw_steps"], "updates": row["updates"],
+               "offline_updates": row.get("offline_updates", 0),
                "native_replay": row.get("budget", {}).get("native_replay", {}),
                "rng_state": tools.get_rng_state(),
                "counters": {name: getattr(model, name) for name in ("_gradient_updates", "_clipped_updates")}}
@@ -236,6 +258,7 @@ def snapshot(config, model, bank, condition, args, folder, row, name, fixed):
             else forecast_errors(model, probe_cases(probes)))
         digest = tensor_digest(model.state_dict())
     item = {"name": name, "raw_steps": row["raw_steps"], "updates": row["updates"],
+            "offline_updates": row.get("offline_updates", 0),
             "model_state_sha256": digest, "evaluation": save_evaluation(folder, name, result),
             "seconds": time.monotonic() - started}
     row["snapshots"].append(item)
@@ -247,6 +270,10 @@ def train_one(config, model, family, record, bank, condition, args, output, repo
     folder.mkdir(parents=True)
     fixed = snapshot(config, model, bank, condition, args, folder, row, "before", None)
     persist(output, report)
+    if args.offline_updates:
+        adapt_offline(config, model, family, record, bank, folder, row, lambda: persist(output, report))
+        fixed = snapshot(config, model, bank, condition, args, folder, row, "after_offline", fixed)
+        persist(output, report)
     tools.configure_randomness(args.online_seed, bool(config.deterministic_run))
     envs, session = None, None
     try:
@@ -335,12 +362,13 @@ def main(argv=None):
     output = args.output.absolute()
     report = {"format": FORMAT, "run_name": output.name, "status": "PREPARING", "runs": [],
               "settings": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
-              "split": "validation", "offline_updates": 0, "online_schedule_changed": False,
+              "split": "validation", "offline_updates": args.offline_updates, "online_schedule_changed": False,
               "runtime_target_hours": 5, "runtime_enforced": False}
     created, started = False, time.monotonic()
     try:
         torch.set_num_threads(1)
-        source, banks, records = load_source(args)
+        compatible = (ONE_STEP_SOURCE_IMPLEMENTATION,) if args.training_horizon > 1 else ()
+        source, banks, records = load_source(args, compatible_implementations=compatible)
         prepared = [(record, *configure(record, banks[record["task"]], args)) for record in records]
         report["budgets"] = [{"model": record["model"], **budget} for record, _, _, budget in prepared]
         if args.dry_run:
@@ -358,7 +386,7 @@ def main(argv=None):
         # Fail for absent/wrong expert data before any expensive evaluation. The
         # default native learner uses none; its detached readout retains 50%.
         for record, config, _, _ in prepared:
-            if args.retain_offline or config.state_head.online.expert_fraction or config.training.online.get("expert_fraction", 0.):
+            if args.offline_updates or args.retain_offline or config.state_head.online.expert_fraction or config.training.online.get("expert_fraction", 0.):
                 with load_model_family(config.model_family).build_replay(config) as replay:
                     if dataset_identity(replay.metadata) != record["dataset_identity"]:
                         raise ValueError("Expert dataset identity differs from the source checkpoint")
@@ -367,9 +395,15 @@ def main(argv=None):
         output.mkdir(parents=True, exist_ok=False)
         created = True
         report.update(status="RUNNING", versions=versions, implementation_sha256=implementation_sha256(),
+                      source_implementation_sha256=source["implementation_sha256"],
+                      training_adaptation={"horizon": args.training_horizon, "offline_updates": args.offline_updates,
+                                           "paper_objective_changed": args.training_horizon > 1,
+                                           "auxiliary_losses": "original formulas and weights over real encoded frames",
+                                           "architecture_and_planning_changed": False},
                       source_report_sha256=file_hash(args.source_run / "report.json"), source_helpers=source_hashes(),
                       runner_hashes={name: file_hash(Path(__file__).with_name(name)) for name in
-                                     ("train_forecast_online.py", "forecast_online_support.py", "offline_online_replay.py", "evaluate_goal_maintenance.py")},
+                                     ("train_forecast_online.py", "forecast_online_support.py", "offline_online_replay.py",
+                                      "multistep_training_support.py", "evaluate_goal_maintenance.py")},
                       source_banks=source["banks"],
                       checkpoints=[{key: str(record[key]) if isinstance(record[key], Path) else record[key]
                                     for key in ("task", "model", "path", "file_sha256", "updates", "model_state_sha256")}
@@ -377,6 +411,7 @@ def main(argv=None):
         persist(output, report)
         for record, config, condition, budget in prepared:
             row = {"task": record["task"], "model": record["model"], "status": "RUNNING", "raw_steps": 0, "updates": 0,
+                   "offline_updates": 0,
                    "config": OmegaConf.to_container(config, resolve=True), "budget": budget, "snapshots": []}
             report["runs"].append(row)
             tick = time.monotonic()

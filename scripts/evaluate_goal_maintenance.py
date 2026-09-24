@@ -101,13 +101,14 @@ def validate_payload(payload, row, identity, bank_hash):
         raise ValueError("Checkpoint weights must be nonempty and finite")
 
 
-def load_source(args):
+def load_source(args, *, compatible_implementations=()):
     """Read artifacts, validate provenance and resolve time windows for all tasks."""
     root = args.source_run.resolve()
     report = json.loads(source_file(root, "report.json").read_text())
     if report.get("format") != SOURCE_FORMAT or report.get("status") != "COMPLETE":
         raise ValueError("Require a completed paper_faithful_duration_v1 source run")
-    if report.get("implementation_sha256") != implementation_sha256() or report.get("source_hashes") != source_hashes():
+    if (report.get("implementation_sha256") not in (implementation_sha256(), *compatible_implementations)
+            or report.get("source_hashes") != source_hashes()):
         raise ValueError("Source model/environment or duration helpers differ from the current implementation")
     banks, records = {}, []
     for task in args.tasks:

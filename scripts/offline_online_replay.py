@@ -23,8 +23,9 @@ def replay_settings(config, bank, coverage_fraction, updates):
         raise ValueError("The original-to-online handover requires at least two updates.")
     rows, sources = int(config.replay.batch_size), int(config.replay.episodes_per_batch)
     length, history = int(config.replay.sequence_length), int(config.jepa_model.history_size)
-    if rows < 2 or sources < 1 or rows % sources or length != history + 1:
-        raise ValueError("Require whole readout source groups and the native next-step sequence length.")
+    horizon = int(config.jepa_model.get("training_horizon", 1))
+    if rows < 2 or sources < 1 or rows % sources or horizon < 1 or length != history + horizon:
+        raise ValueError("Require whole readout source groups and history_size + training_horizon frames.")
     if rows * (length - history + 1) < int(config.state_head.samples_per_update):
         raise ValueError("The full online readout batch cannot supply its unchanged label budget.")
     cases = bank["splits"]["train"]

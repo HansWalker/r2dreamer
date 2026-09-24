@@ -244,8 +244,8 @@ class LeWorldModel(LatentPlanner):
                 group["lr"] = lr
         self._scheduler_state = None
 
-    def configure_pretraining(self, total_updates):
-        self._configure_schedule(total_updates, resume=self._scheduler_state is not None)
+    def configure_pretraining(self, total_updates, *, resumed=None):
+        self._configure_schedule(total_updates, resume=self._scheduler_state is not None if resumed is None else resumed)
 
     def configure_online(self, total_updates, resumed=False):
         self._configure_schedule(total_updates, resume=resumed)
@@ -258,10 +258,11 @@ class LeWorldModel(LatentPlanner):
         return metrics
 
     def representation_loss(self, obs, latent, action):
-        prediction = self.predict(latent[:, :-1], action)
-        prediction_loss = F.mse_loss(prediction, latent[:, 1:])
+        prediction, target = self.training_predictions(latent, action)
+        prediction_loss = F.mse_loss(prediction, target)
         sigreg_loss = self.sigreg(latent.transpose(0, 1))
         return prediction_loss + self.sigreg_weight * sigreg_loss, {
             "prediction_loss": prediction_loss,
             "sigreg_loss": sigreg_loss,
+            **self.prediction_metrics(prediction, target),
         }
