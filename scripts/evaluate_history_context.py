@@ -35,6 +35,17 @@ def crop_history(observation, actions, targets, maximum, context):
     return ({k: v[:, start:] for k, v in observation.items()}, actions[:, start:], targets[:, start:])
 
 
+def fixed_input_history(model):
+    """Raw frames needed by fixed-history dynamics AND the frozen readout."""
+    from models.planning import LatentPlanner
+    from models.tdmpc2 import TDMPC2
+    if isinstance(model, TDMPC2):
+        return model.frame_stack + model.state_head.history - 1
+    if isinstance(model, LatentPlanner):
+        return max(model.history_size, model.state_head.history)
+    return None
+
+
 @torch.no_grad()
 def evaluate_batch(model, config, observation, actions, targets, *, context, horizons, samples, seed):
     from training.evaluation import latent_rollout
@@ -43,9 +54,18 @@ def evaluate_batch(model, config, observation, actions, targets, *, context, hor
     head = model.state_head
     stochastic = isinstance(model, (Dreamer, StormModel))
     samples = samples if stochastic else 1
+    fixed_context = fixed_input_history(model)
+    if fixed_context is not None:
+        if context < fixed_context:
+            raise ValueError(f"Context {context} is shorter than required raw history {fixed_context}")
+        # These models encode frames independently. Encoding unused older frames
+        # changes GPU kernel shapes/rounding without adding accessible history.
+        # Crop before encoding, preserving the endpoint, action and label alignment.
+        observation, actions, targets = crop_history(observation, actions, targets, context, fixed_context)
+        context = fixed_context
     device = next(model.parameters()).device
-    observation = {k: v.to(device) for k, v in observation.items()}
-    actions, targets = actions.to(device), targets.to(device)
+    observation = {k: v.to(device).contiguous() for k, v in observation.items()}
+    actions, targets = actions.to(device).contiguous(), targets.to(device).contiguous()
     kwargs = {"storm_context_length": int(config.storm_train.context_length)} if isinstance(model, StormModel) else {}
     sums = {}
     devices = [device.index or 0] if device.type == "cuda" else []
@@ -155,7 +175,7 @@ def evaluate_model(args, task, name, archived, windows, directory):
     family.load_checkpoint(model, payload, training=False)
     model.eval().requires_grad_(False)
     head = model.state_head
-    if min(args.contexts) < max(head.history, getattr(model, "history_size", 1), getattr(model, "frame_stack", 1)):
+    if min(args.contexts) < (fixed_input_history(model) or head.history):
         raise ValueError("Context shorter than native model/readout requirements")
     if not head.updates.item():
         raise ValueError("Untrained physical readout")
@@ -171,6 +191,7 @@ def evaluate_model(args, task, name, archived, windows, directory):
               "model_state_before": before, "physical_coordinates": coordinates,
               "physical_units": dict(head.targets.metric_units), "readout_history": head.history,
               "metric_version": "physical_rmse_wrapped_angles_v1",
+              "effective_contexts": {str(c): fixed_input_history(model) or c for c in args.contexts},
               "state_samples": args.samples if name.startswith(("dreamer/", "storm/")) else 1,
               "conditions": {}, "status": "RUNNING"}
     all_errors, data_hashes = {}, []
@@ -198,7 +219,13 @@ def evaluate_model(args, task, name, archived, windows, directory):
             delta = max(float((values[k] - reference[k]).abs().max()) for k in ("current_values", "forecast_values"))
             result["fixed_history_control_max_abs"][str(context)] = delta
             for key in ("current_values", "forecast_values"):
-                torch.testing.assert_close(values[key], reference[key], atol=2e-4, rtol=2e-4)
+                try:
+                    torch.testing.assert_close(values[key], reference[key], atol=2e-4, rtol=2e-4)
+                except AssertionError as error:
+                    raise AssertionError(
+                        f"Fixed-history control failed: {name}, context={context}, metric={key}, "
+                        f"max_abs_difference={delta:.8g}\n{error}"
+                    ) from error
     result["model_state_after"] = tensor_digest(model.state_dict())
     if before != result["model_state_after"]:
         raise RuntimeError("Frozen evaluation changed weights or buffers")
@@ -260,6 +287,7 @@ def main(argv=None):
               "settings": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
               "training_updates": 0, "source": "original 39-run experiment final checkpoints",
               "notes": ["Same forecast endpoint and future actions for every history length.",
+                        "Fixed-history models encode only their required suffix with identical tensor layouts across conditions.",
                         "Current RMSE is at the final observed frame; observed future RMSE sees real future images.",
                         "True-state hold is scoring only, never an inference input.",
                         "Stochastic models average physical predictions across native samples before scoring.",

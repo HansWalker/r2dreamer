@@ -13,7 +13,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 from scripts.analyze_world_model_capabilities import MODELS
-from scripts.evaluate_history_context import crop_history, evaluate_batch, tensor_digest, summarize, main
+from scripts.evaluate_history_context import crop_history, evaluate_batch, tensor_digest, summarize, main, fixed_input_history
 from training import load_model_family
 
 
@@ -67,10 +67,20 @@ class HistoryContextTest(unittest.TestCase):
                 actions = torch.rand(1, 88, 1) * 2 - 1
                 truth = torch.randn(1, 89, len(model.state_head.coordinates))
                 conditions = {}
+                fixed = fixed_input_history(model)
+                encoded_inputs = []
+                # Catch the GPU failure mechanism on CPU: identical native
+                # histories must reach the encoder with identical shapes/strides.
+                def capture_inputs(module, args):
+                    encoded_inputs.append({k: (v.detach().clone(), v.stride()) for k, v in args[0].items()})
+                hook = model.encoder.register_forward_pre_hook(capture_inputs) if fixed else None
+                input_calls = {}
                 for context in (4, 16, 64):
                     cropped = crop_history(obs, actions, truth, 64, context)
                     rng = torch.get_rng_state().clone()
+                    encoded_inputs.clear()
                     values = evaluate_batch(model, config, *cropped, context=context, horizons=[1, 5, 25], samples=2, seed=71)
+                    input_calls[context] = list(encoded_inputs)
                     torch.testing.assert_close(rng, torch.get_rng_state())
                     altered = {k: v.clone() for k, v in cropped[0].items()}
                     for value in altered.values():
@@ -83,7 +93,14 @@ class HistoryContextTest(unittest.TestCase):
                     conditions[context] = values
                 if family_name in ('tdmpc2', 'leworldmodel', 'temporal_straightening'):
                     for context in (4, 16):
-                        torch.testing.assert_close(conditions[context]['forecast_values'], conditions[64]['forecast_values'], atol=2e-4, rtol=2e-4)
+                        for key in conditions[context]:
+                            torch.testing.assert_close(conditions[context][key], conditions[64][key], atol=0, rtol=0)
+                        self.assertEqual(len(input_calls[context]), len(input_calls[64]))
+                        for actual, expected in zip(input_calls[context], input_calls[64]):
+                            for key in actual:
+                                torch.testing.assert_close(actual[key][0], expected[key][0], atol=0, rtol=0)
+                                self.assertEqual(actual[key][1], expected[key][1])
+                    hook.remove()
                 self.assertEqual(before, tensor_digest(model.state_dict()))
                 print(f'PASS: {name}', flush=True)
 
